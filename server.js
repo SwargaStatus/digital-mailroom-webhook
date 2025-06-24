@@ -29,6 +29,12 @@ app.post('/webhook/monday-to-instabase', async (req, res) => {
   try {
     console.log('Received webhook from Monday.com:', JSON.stringify(req.body, null, 2));
     
+    // Handle Monday.com webhook validation challenge
+    if (req.body.challenge) {
+      console.log('Responding to Monday.com challenge:', req.body.challenge);
+      return res.json({ challenge: req.body.challenge });
+    }
+    
     const { item_id, board_id, column_values } = req.body;
     
     // Extract PDF file URLs from Monday.com item
@@ -289,7 +295,7 @@ app.get('/health', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`Digital Mailroom webhook service running on port ${PORT}`);
   console.log('Endpoints:');
   console.log(`  POST /webhook/monday-to-instabase - Main webhook`);
