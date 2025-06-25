@@ -679,13 +679,13 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
       }
     }
   } catch (error) {
-    if (err.response) {
-  console.error('--- Monday error body --------------------------------');
-  console.error(JSON.stringify(err.response.data, null, 2));
-  console.error('-------------------------------------------------------');
-}
-    console.error('Error creating Monday.com items:', error);
-    throw error;
+    if (error?.response?.data) {
+      console.error('--- Monday error body --------------------------------');
+      console.error(JSON.stringify(error.response.data, null, 2));
+      console.error('-------------------------------------------------------');
+    }
+    console.error('Error creating Monday.com items:', error.message || error);
+     throw error;
   }
 }
 
