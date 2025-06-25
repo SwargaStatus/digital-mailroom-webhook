@@ -369,6 +369,25 @@ async function processFilesWithInstabase(files, sourceItemId) {
       totalDocuments: resultsResponse.data.files?.reduce((sum, file) => sum + (file.documents?.length || 0), 0) || 0
     });
     
+    // DEBUG: Log the actual extracted data structure
+    console.log('=== EXTRACTED DATA DEBUG ===');
+    resultsResponse.data.files?.forEach((file, fileIndex) => {
+      console.log(`File ${fileIndex}: ${file.original_file_name}`);
+      file.documents?.forEach((doc, docIndex) => {
+        console.log(`  Document ${docIndex}:`);
+        console.log(`    Page Type: ${doc.fields?.page_type?.value || 'none'}`);
+        console.log(`    Available fields:`, Object.keys(doc.fields || {}));
+        
+        // Log key field values
+        ['document_number', 'invoice_number', 'number', 'supplier', 'total', 'document_type', 'document_date'].forEach(fieldName => {
+          if (doc.fields?.[fieldName]) {
+            console.log(`    ${fieldName}: ${doc.fields[fieldName].value}`);
+          }
+        });
+      });
+    });
+    console.log('=== END DEBUG ===');
+    
     return resultsResponse.data.files;
     
   } catch (error) {
@@ -382,11 +401,18 @@ async function processFilesWithInstabase(files, sourceItemId) {
 
 // Group pages by invoice number to reassemble complete documents
 function groupPagesByInvoiceNumber(extractedFiles) {
+  console.log('=== GROUPING DEBUG ===');
+  console.log('Input files:', extractedFiles?.length || 0);
+  
   const documentGroups = {};
   
-  extractedFiles.forEach(file => {
-    file.documents.forEach(doc => {
+  extractedFiles.forEach((file, fileIndex) => {
+    console.log(`Processing file ${fileIndex}: ${file.original_file_name}`);
+    
+    file.documents.forEach((doc, docIndex) => {
+      console.log(`  Processing document ${docIndex}`);
       const fields = doc.fields;
+      console.log(`  Available fields:`, Object.keys(fields || {}));
       
       // Get invoice number (handle different field names)
       const invoiceNumber = 
@@ -395,10 +421,15 @@ function groupPagesByInvoiceNumber(extractedFiles) {
         fields.number?.value ||
         'unknown';
       
+      console.log(`  Extracted invoice number: "${invoiceNumber}"`);
+      
       // Skip pages without invoice numbers (continuation pages)
       if (!invoiceNumber || invoiceNumber === 'none' || invoiceNumber === 'unknown') {
+        console.log(`  Skipping document - no valid invoice number`);
         return;
       }
+      
+      console.log(`  Processing invoice: ${invoiceNumber}`);
       
       // Initialize group if it doesn't exist
       if (!documentGroups[invoiceNumber]) {
@@ -417,6 +448,7 @@ function groupPagesByInvoiceNumber(extractedFiles) {
           pages: [],
           confidence: 0
         };
+        console.log(`  Created new group for invoice: ${invoiceNumber}`);
       }
       
       // Add page data to group
@@ -429,27 +461,33 @@ function groupPagesByInvoiceNumber(extractedFiles) {
       
       // Update document-level fields from any page with the data
       if (fields.supplier?.value) {
+        console.log(`  Found supplier: ${fields.supplier.value}`);
         group.supplier_name = fields.supplier.value;
       }
       if (fields.total?.value) {
         // Clean up the total amount - remove currency symbols and convert to number
         const totalStr = String(fields.total.value).replace(/[^0-9.-]/g, '');
         group.total_amount = parseFloat(totalStr) || 0;
+        console.log(`  Found total: ${group.total_amount}`);
       }
       if (fields.tax?.value) {
         const taxStr = String(fields.tax.value).replace(/[^0-9.-]/g, '');
         group.tax_amount = parseFloat(taxStr) || 0;
+        console.log(`  Found tax: ${group.tax_amount}`);
       }
       if (fields.document_date?.value) {
         group.document_date = fields.document_date.value;
+        console.log(`  Found document date: ${group.document_date}`);
       }
       if (fields.terms?.value) {
         group.terms = fields.terms.value;
+        console.log(`  Found terms: ${group.terms}`);
       }
       
       // Handle Due Date (could be single date or table with multiple dates)
       if (fields.due_date?.value) {
         const dueDateValue = fields.due_date.value;
+        console.log(`  Found due date value:`, dueDateValue);
         
         // If it's a table/array, extract multiple dates
         if (Array.isArray(dueDateValue)) {
@@ -466,11 +504,13 @@ function groupPagesByInvoiceNumber(extractedFiles) {
           // Single date
           group.due_date = String(dueDateValue);
         }
+        console.log(`  Set due dates: ${group.due_date}, ${group.due_date_2}, ${group.due_date_3}`);
       }
       
       // Handle Items (for subitems)
       if (fields.items?.value) {
         const itemsValue = fields.items.value;
+        console.log(`  Found items value:`, itemsValue);
         
         if (Array.isArray(itemsValue)) {
           group.items = itemsValue;
@@ -483,6 +523,7 @@ function groupPagesByInvoiceNumber(extractedFiles) {
             amount: row.amount || row[3] || ''
           }));
         }
+        console.log(`  Processed ${group.items.length} items`);
       }
       
       // Calculate average confidence
@@ -495,6 +536,13 @@ function groupPagesByInvoiceNumber(extractedFiles) {
       }
     });
   });
+  
+  console.log(`=== GROUPING RESULT ===`);
+  console.log(`Found ${Object.keys(documentGroups).length} document groups:`);
+  Object.keys(documentGroups).forEach(key => {
+    console.log(`  Group "${key}": ${documentGroups[key].pages.length} pages`);
+  });
+  console.log('=== END GROUPING DEBUG ===');
   
   return Object.values(documentGroups);
 }
