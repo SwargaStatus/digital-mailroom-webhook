@@ -217,17 +217,15 @@ async function processFilesWithInstabase(files, sourceItemId) {
     console.log('Created batch:', batchId);
     
     // Step 2: Upload files to batch
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      console.log('Processing file:', JSON.stringify(file, null, 2));
-      
-      // Monday.com files have different URL structure
-      // REMOVED: let fileUrl = file.url || file.public_url;
-      // REMOVED: if (!fileUrl && file.assetId) { ... }
-      // 
-      // Instead: ALWAYS use asset API to get the real S3 URL
-      
-      if (!fileUrl && file.assetId) {
+for (let i = 0; i < files.length; i++) {
+  const file = files[i];
+  console.log('Processing file:', JSON.stringify(file, null, 2));
+  
+  // Initialize fileUrl variable
+  let fileUrl = file.url || file.public_url;
+  
+  // If no direct URL, use Monday.com assets API to get the file URL
+  if (!fileUrl && file.assetId) {
         // Use Monday.com assets API to get the file
         try {
           const assetQuery = `
