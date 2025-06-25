@@ -750,7 +750,7 @@ async function uploadPdfToMondayItem(itemId, originalFiles, columns) {
     );
     throw err;
   }
-
+}
 async function createSubitemsForLineItems(parentItemId, items) {
   try {
     for (let i = 0; i < items.length; i++) {
