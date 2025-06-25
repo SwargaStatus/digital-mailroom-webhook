@@ -13,7 +13,7 @@ const INSTABASE_CONFIG = {
   deploymentId: '0197a3fe-599d-7bac-a34b-81704cc83beb',
   headers: {
     'IB-Context': 'sturgeontire',
-    'Authorization': 'Bearer 8m91cy8nOMrZcZI5YspXpOPQtJ6p8o',
+    'Authorization': 'Bearer jEmrseIwOb9YtmJ6GzPAywtz53KnpS',
     'Content-Type': 'application/json'
   }
 };
