@@ -1,4 +1,132 @@
-const express = require('express');
+// Create items in Monday.com Extracted Documents board
+async function createMondayExtractedItems(documents, sourceItemId, originalFiles) {
+  try {
+    // First, let's get the board structure to see the actual column IDs
+    console.log('=== GETTING BOARD STRUCTURE ===');
+    const boardQuery = `
+      query {
+        boards(ids: [${MONDAY_CONFIG.extractedDocsBoardId}]) {
+          id
+          name
+          columns {
+            id
+            title
+            type
+            settings_str
+          }
+        }
+      }
+    `;
+    
+    const boardResponse = await axios.post('https://api.monday.com/v2', {
+      query: boardQuery
+    }, {
+      headers: {
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    console.log('Board structure:', JSON.stringify(boardResponse.data, null, 2));
+    
+    const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
+    console.log('Available columns:');
+    columns.forEach(col => {
+      console.log(`  ${col.title}: ID = "${col.id}", Type = ${col.type}`);
+      if (col.settings_str) {
+        console.log(`    Settings: ${col.settings_str}`);
+      }
+    });
+    
+    for (const doc of documents) {
+      console.log(`Creating Monday.com item for ${doc.document_type} ${doc.invoice_number}...`);
+      
+      // Escape strings to prevent GraphQL syntax errors
+      const escapedSupplier = (doc.supplier_name || '').replace(/"/g, '\\"');
+      const escapedInvoiceNumber = (doc.invoice_number || '').replace(/"/g, '\\"');
+      const escapedDocumentType = (doc.document_type || '').replace(/"/g, '\\"');
+      const escapedTerms = (doc.terms || '').replace(/"/g, '\\"');
+      
+      // Format dates for Monday.com (YYYY-MM-DD format)
+      const formatDate = (dateStr) => {
+        if (!dateStr) return '';
+        try {
+          const date = new Date(dateStr);
+          return date.toISOString().split('T')[0];
+        } catch (e) {
+          return String(dateStr).slice(0, 10); // Try to extract YYYY-MM-DD format
+        }
+      };
+      
+      // Map to the actual column IDs we find
+      const columnValues = {};
+      
+      // Try to map to the most likely column IDs based on your board export
+      columns.forEach(col => {
+        const title = col.title.toLowerCase();
+        const id = col.id;
+        const type = col.type;
+        
+        if (title.includes('supplier')) {
+          columnValues[id] = escapedSupplier;
+        } else if (title.includes('document number') || (title.includes('number') && !title.includes('total'))) {
+          columnValues[id] = escapedInvoiceNumber;
+        } else if (title.includes('document type') || (title.includes('type') && !title.includes('document'))) {
+          // For dropdown columns, try to use the document type if it exists
+          if (type === 'dropdown') {
+            // Parse settings to see available options
+            let settings = {};
+            try {
+              settings = JSON.parse(col.settings_str || '{}');
+            } catch (e) {
+              console.log('Could not parse dropdown settings:', col.settings_str);
+            }
+            
+            console.log(`Dropdown settings for ${title}:`, settings);
+            
+            // Try to find a matching label or use the first available option
+            if (settings.labels && settings.labels.length > 0) {
+              // Look for exact match first
+              const matchingLabel = settings.labels.find(label => 
+                label.name?.toLowerCase() === escapedDocumentType.toLowerCase()
+              );
+              
+              if (matchingLabel) {
+                columnValues[id] = { "label": matchingLabel.name };
+                console.log(`Found matching dropdown option: ${matchingLabel.name}`);
+              } else {
+                // Use first available option if no exact match
+                columnValues[id] = { "label": settings.labels[0].name };
+                console.log(`Using first available dropdown option: ${settings.labels[0].name}`);
+              }
+            } else {
+              console.log(`Skipping dropdown column "${title}" - no options configured`);
+            }
+          } else {
+            columnValues[id] = escapedDocumentType;
+          }
+        } else if (title.includes('document date') || (title.includes('date') && !title.includes('due'))) {
+          columnValues[id] = formatDate(doc.document_date);
+        } else if (title === 'due date' || title.includes('due date') && !title.includes('2') && !title.includes('3')) {
+          columnValues[id] = formatDate(doc.due_date);
+        } else if (title.includes('due date 2')) {
+          columnValues[id] = formatDate(doc.due_date_2);
+        } else if (title.includes('due date 3')) {
+          columnValues[id] = formatDate(doc.due_date_3);
+        } else if (title.includes('amount') && !title.includes('total') && !title.includes('tax')) {
+          columnValues[id] = doc.total_amount || 0;
+        } else if (title.includes('total amount')) {
+          columnValues[id] = doc.total_amount || 0;
+        } else if (title.includes('tax amount')) {
+          columnValues[id] = doc.tax_amount || 0;
+        } else if (title.includes('extraction status')) {
+          // For status columns, use a valid status ID
+          if (type === 'status') {
+            columnValues[id] = { "index": 1 }; // Use "Done" status
+          } else {
+            columnValues[id] = "Extracted";
+          }
+        } else if (title.includes('status') && !const express = require('express');
 const axios = require('axios');
 const multer = require('multer');
 const FormData = require('form-data');
@@ -100,15 +228,15 @@ async function processWebhookData(webhookData) {
     console.log(`Found ${pdfFiles.length} PDF files, sending to Instabase...`);
     
     // Process files through Instabase
-    const extractedData = await processFilesWithInstabase(pdfFiles, itemId);
+    const extractionResult = await processFilesWithInstabase(pdfFiles, itemId);
     
     // Group pages by invoice number
-    const groupedDocuments = groupPagesByInvoiceNumber(extractedData);
+    const groupedDocuments = groupPagesByInvoiceNumber(extractionResult.files);
     
     console.log(`Grouped into ${groupedDocuments.length} documents, creating Monday.com items...`);
     
     // Create items in Monday.com Extracted Documents board
-    await createMondayExtractedItems(groupedDocuments, itemId);
+    await createMondayExtractedItems(groupedDocuments, itemId, extractionResult.originalFiles);
     
     console.log('=== PROCESSING COMPLETED SUCCESSFULLY ===');
     
@@ -217,6 +345,9 @@ async function processFilesWithInstabase(files, sourceItemId) {
     const batchId = batchResponse.data.id;
     console.log('✅ Created Instabase batch:', batchId);
     
+    // Store original file data for later use
+    const originalFiles = [];
+    
     // Step 2: Upload files to batch using public_url
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
@@ -239,6 +370,14 @@ async function processFilesWithInstabase(files, sourceItemId) {
       });
       
       const fileBuffer = Buffer.from(fileResponse.data);
+      
+      // Store original file data for Monday.com upload
+      originalFiles.push({
+        name: file.name,
+        buffer: fileBuffer,
+        public_url: fileUrl,
+        asset_id: file.assetId
+      });
       
       // Validate the downloaded file
       console.log(`Downloaded ${file.name}: ${fileBuffer.length} bytes`);
@@ -413,15 +552,8 @@ async function processFilesWithInstabase(files, sourceItemId) {
       console.log(`File ${fileIndex}: ${file.original_file_name}`);
       file.documents?.forEach((doc, docIndex) => {
         console.log(`  Document ${docIndex}:`);
-        console.log(`    Page Type: ${doc.fields?.page_type?.value || 'none'}`);
+        console.log(`    Page Type: ${doc.fields?.['1']?.value || 'none'}`);
         console.log(`    Available fields:`, Object.keys(doc.fields || {}));
-        
-        // Log key field values
-        ['document_number', 'invoice_number', 'number', 'supplier', 'total', 'document_type', 'document_date'].forEach(fieldName => {
-          if (doc.fields?.[fieldName]) {
-            console.log(`    ${fieldName}: ${doc.fields[fieldName].value}`);
-          }
-        });
         
         // ALSO log the numeric fields to see what data is there
         console.log(`    Numeric field values:`);
@@ -434,7 +566,11 @@ async function processFilesWithInstabase(files, sourceItemId) {
     });
     console.log('=== END DEBUG ===');
     
-    return resultsResponse.data.files;
+    // Return both extracted data and original files for PDF handling
+    return {
+      files: resultsResponse.data.files,
+      originalFiles: originalFiles
+    };
     
   } catch (error) {
     console.error('=== INSTABASE PROCESSING ERROR ===');
@@ -562,10 +698,13 @@ function groupPagesByInvoiceNumber(extractedFiles) {
           }
         });
         
-        group.due_date = dates[0] || '';
-        group.due_date_2 = dates[1] || '';
-        group.due_date_3 = dates[2] || '';
-        console.log(`  Set due dates: ${group.due_date}, ${group.due_date_2}, ${group.due_date_3}`);
+        // Only update if we're processing the main page or if no dates exist yet
+        if (pageType === 'main' || !group.due_date) {
+          group.due_date = dates[0] || '';
+          group.due_date_2 = dates[1] || '';
+          group.due_date_3 = dates[2] || '';
+          console.log(`  Set due dates: ${group.due_date}, ${group.due_date_2}, ${group.due_date_3}`);
+        }
       }
       
       // Handle Items (array format for line items) - only from main pages
@@ -606,7 +745,7 @@ function groupPagesByInvoiceNumber(extractedFiles) {
 }
 
 // Create items in Monday.com Extracted Documents board
-async function createMondayExtractedItems(documents, sourceItemId) {
+async function createMondayExtractedItems(documents, sourceItemId, originalFiles) {
   try {
     // First, let's get the board structure to see the actual column IDs
     console.log('=== GETTING BOARD STRUCTURE ===');
@@ -661,44 +800,6 @@ async function createMondayExtractedItems(documents, sourceItemId) {
         }
       };
       
-      // Map to the actual column IDs we find
-      const columnValues = {};
-      
-      // Try to map to the most likely column IDs based on your board export
-      columns.forEach(col => {
-        const title = col.title.toLowerCase();
-        const id = col.id;
-        const type = col.type;
-        
-        if (title.includes('supplier')) {
-          columnValues[id] = escapedSupplier;
-        } else if (title.includes('document number') || (title.includes('number') && !title.includes('total'))) {
-          columnValues[id] = escapedInvoiceNumber;
-        } else if (title.includes('document type') || (title.includes('type') && !title.includes('document'))) {
-          // For dropdown columns, we need to be more careful
-          if (type === 'dropdown') {
-            // Let's just skip dropdowns for now since they need specific labels
-            console.log(`Skipping dropdown column "${title}" - needs manual configuration`);
-          } else {
-            columnValues[id] = escapedDocumentType;
-          }
-        } else if (title.includes('document date') || (title.includes('date') && !title.includes('due'))) {
-          columnValues[id] = formatDate(doc.document_date);
-        } else if (title.includes('due date')) {
-          columnValues[id] = formatDate(doc.due_date);
-        } else if (title.includes('amount') && !title.includes('total') && !title.includes('tax')) {
-          columnValues[id] = doc.total_amount || 0;
-        } else if (title.includes('total amount')) {
-          columnValues[id] = doc.total_amount || 0;
-        } else if (title.includes('tax amount')) {
-          columnValues[id] = doc.tax_amount || 0;
-        } else if (title.includes('extraction status')) {
-          // For status columns, use a valid status ID
-          if (type === 'status') {
-            columnValues[id] = { "index": 1 }; // Use "Done" status
-          } else {
-            columnValues[id] = "Extracted";
-          }
         } else if (title.includes('status') && !title.includes('extraction')) {
           // Generic status column
           if (type === 'status') {
@@ -706,6 +807,9 @@ async function createMondayExtractedItems(documents, sourceItemId) {
           } else {
             columnValues[id] = "Extracted";
           }
+        } else if (title.includes('document file') || title.includes('file')) {
+          // We'll handle file upload separately after item creation
+          console.log(`Will upload file to column: ${title} (${id})`);
         }
       });
       
@@ -743,6 +847,9 @@ async function createMondayExtractedItems(documents, sourceItemId) {
       const createdItemId = response.data.data.create_item.id;
       console.log(`✅ Created Monday.com item for ${doc.document_type} ${doc.invoice_number} (ID: ${createdItemId})`);
       
+      // Upload the original PDF file to the Document File column
+      await uploadPdfToMondayItem(createdItemId, originalFiles, doc.invoice_number, columns);
+      
       // Create subitems for line items if they exist
       if (doc.items && doc.items.length > 0) {
         console.log(`Creating ${doc.items.length} subitems for line items...`);
@@ -753,6 +860,72 @@ async function createMondayExtractedItems(documents, sourceItemId) {
     console.error('Error creating Monday.com items:', error);
     console.error('Error response:', error.response?.data);
     throw error;
+  }
+}
+
+// Upload PDF file to Monday.com item
+async function uploadPdfToMondayItem(itemId, originalFiles, invoiceNumber, columns) {
+  try {
+    if (!originalFiles || originalFiles.length === 0) {
+      console.log('No original files to upload');
+      return;
+    }
+    
+    // Find the Document File column
+    const fileColumn = columns.find(col => 
+      col.title.toLowerCase().includes('document file') || 
+      col.title.toLowerCase().includes('file')
+    );
+    
+    if (!fileColumn) {
+      console.log('No document file column found');
+      return;
+    }
+    
+    console.log(`Uploading PDF to column: ${fileColumn.title} (${fileColumn.id})`);
+    
+    // For now, upload the first PDF file
+    const pdfFile = originalFiles[0];
+    
+    // Upload file to Monday.com using the file upload API
+    const fileUploadMutation = `
+      mutation add_file_to_column($item_id: Int!, $column_id: String!, $file: File!) {
+        add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
+          id
+        }
+      }
+    `;
+    
+    // Create form data for file upload
+    const FormData = require('form-data');
+    const form = new FormData();
+    
+    form.append('query', fileUploadMutation);
+    form.append('variables', JSON.stringify({
+      item_id: parseInt(itemId),
+      column_id: fileColumn.id
+    }));
+    form.append('file', pdfFile.buffer, {
+      filename: pdfFile.name,
+      contentType: 'application/pdf'
+    });
+    
+    const uploadResponse = await axios.post('https://api.monday.com/v2/file', form, {
+      headers: {
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        ...form.getHeaders()
+      }
+    });
+    
+    if (uploadResponse.data.errors) {
+      console.error('File upload errors:', uploadResponse.data.errors);
+    } else {
+      console.log(`✅ Uploaded PDF file to Monday.com item ${itemId}`);
+    }
+    
+  } catch (error) {
+    console.error('Error uploading PDF to Monday.com:', error);
+    // Don't throw error - continue with other processing
   }
 }
 
