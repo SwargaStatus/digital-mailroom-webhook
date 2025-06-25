@@ -301,7 +301,7 @@ async function processFilesWithInstabase(files, sourceItemId) {
     
     // Step 3: Run deployment
     const runResponse = await axios.post(
-      `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/deployments/${INSTABASE_CONFIG.deploymentId}/runs`,
+      `${INSTABASE_CONFIG.baseUrl}/api/v2/deployments/${INSTABASE_CONFIG.deploymentId}/runs`,
       { batch_id: batchId },
       { headers: INSTABASE_CONFIG.headers }
     );
@@ -322,7 +322,7 @@ async function processFilesWithInstabase(files, sourceItemId) {
       await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds
       
       const statusResponse = await axios.get(
-        `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}`,
+        `${INSTABASE_CONFIG.baseUrl}/api/v2/runs/${runId}`,
         { headers: INSTABASE_CONFIG.headers }
       );
       
@@ -337,7 +337,7 @@ async function processFilesWithInstabase(files, sourceItemId) {
     
     // Step 5: Get results
     const resultsResponse = await axios.get(
-      `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}/results`,
+      `${INSTABASE_CONFIG.baseUrl}/api/v2/runs/${runId}/results`,
       { headers: INSTABASE_CONFIG.headers }
     );
     
