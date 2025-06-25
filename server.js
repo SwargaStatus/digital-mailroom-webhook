@@ -702,48 +702,54 @@ async function uploadPdfToMondayItem(itemId, originalFiles, columns) {
   /* ---------- build the multipart payload ---------- */
   const ops = {
     query: `
-      mutation($item_id: Int!, $column_id: String!, $file: File!){
-        add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file){
+      mutation ($file: File!, $item_id: Int!, $column_id: String!) {
+        add_file_to_column(
+          file: $file,
+          item_id: $item_id,
+          column_id: $column_id
+        ) {
           id
         }
       }`,
-    variables: { item_id: Number(itemId), column_id: fileCol.id, file: null }   // ← ① cast to Int
+    variables: {
+      file: null,                               // ← will be injected by “map”
+      item_id: Number(itemId),                  // ← **Int!**
+      column_id: fileCol.id                     // ← **String!**
+    }
   };
 
-  const map = { "0": ["variables.file"] };                                      // ← ② map part-0 → variables.file
-
+  const map = { '0': ['variables.file'] };
+  
   const form = new FormData();
   form.append('operations', JSON.stringify(ops));
   form.append('map',        JSON.stringify(map));
-  form.append('0',          pdf.buffer, { filename: pdf.name, contentType: 'application/pdf' });
+  form.append('0', pdf.buffer, { filename: pdf.name, contentType: 'application/pdf' });
 
-  try {                                                                         // ← ③ local try/catch
+
+  try {
     const { data } = await axios.post(
       'https://api.monday.com/v2/file',
       form,
       {
-        headers: {
-          ...form.getHeaders(),                                                 // let form-data set Content-Type & Length
-          Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`
-        },
-        maxBodyLength: Infinity,                                                // large files
+        headers: { Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`, ...form.getHeaders() },
+        maxBodyLength: Infinity,
         maxContentLength: Infinity
       }
     );
-
+  
     if (data.errors) {
       console.error('Monday GraphQL errors:', data.errors);
     } else {
       console.log(`✅ PDF attached to item ${itemId}`);
     }
   } catch (err) {
-    /* now you’ll actually see Monday’s explanation */
-    console.error('--- Monday error body --------------------------------');
-    console.error(JSON.stringify(err?.response?.data ?? err, null, 2));
-    console.error('-------------------------------------------------------');
-    throw err;   // bubble up if you still want the caller to handle it
+    console.error(
+      '--- Monday error body --------------------------------\n' +
+      JSON.stringify(err?.response?.data ?? err, null, 2) +
+      '\n-------------------------------------------------------'
+    );
+    throw err;
   }
-}
 
 async function createSubitemsForLineItems(parentItemId, items) {
   try {
