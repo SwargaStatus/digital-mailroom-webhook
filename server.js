@@ -384,6 +384,14 @@ async function processFilesWithInstabase(files, sourceItemId) {
             console.log(`    ${fieldName}: ${doc.fields[fieldName].value}`);
           }
         });
+        
+        // ALSO log the numeric fields to see what data is there
+        console.log(`    Numeric field values:`);
+        for (let i = 0; i < 10; i++) {
+          if (doc.fields?.[i.toString()]) {
+            console.log(`      Field ${i}: ${doc.fields[i.toString()].value}`);
+          }
+        }
       });
     });
     console.log('=== END DEBUG ===');
