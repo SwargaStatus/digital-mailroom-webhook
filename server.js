@@ -525,54 +525,106 @@ function groupPagesByInvoiceNumber(extractedFiles) {
 
 async function createMondayExtractedItems(documents, sourceItemId, originalFiles) {
   try {
-    console.log('=== GETTING BOARD STRUCTURE ===');
+    /* ── 1️⃣  grab the board’s columns once ─────────────────────────── */
     const boardQuery = `
       query {
-        boards(ids: [${MONDAY_CONFIG.extractedDocsBoardId}]) {
-          id
-          name
-          columns {
-            id
-            title
-            type
-            settings_str
-          }
+        boards(ids:[${MONDAY_CONFIG.extractedDocsBoardId}]) {
+          columns { id title type settings_str }
         }
-      }
-    `;
-    
-    const boardResponse = await axios.post('https://api.monday.com/v2', {
-      query: boardQuery
-    }, {
-      headers: {
-        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
-        'Content-Type': 'application/json'
-      }
-    });
-    
-    const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
-    console.log('Available columns:');
-    columns.forEach(col => {
-      console.log(`  ${col.title}: ID = "${col.id}", Type = ${col.type}`);
-    });
-    
+      }`;
+    const boardRes = await axios.post(
+      'https://api.monday.com/v2',
+      { query: boardQuery },
+      { headers: { Authorization:`Bearer ${MONDAY_CONFIG.apiKey}`,
+                   'Content-Type':'application/json' } }
+    );
+    const columns = boardRes.data.data.boards[0].columns;
+
+    /* helper to ISO-format dates safely */
+    const fmtDate = d => {
+      if (!d) return '';
+      try { return new Date(d).toISOString().slice(0,10); }
+      catch { return String(d).slice(0,10); }
+    };
+
+    /* ── 2️⃣  one main-item per grouped document ────────────────────── */
     for (const doc of documents) {
-      console.log(`Creating Monday.com item for ${doc.document_type} ${doc.invoice_number}...`);
-      
-      const escapedSupplier = (doc.supplier_name || '').replace(/"/g, '\\"');
-      const escapedInvoiceNumber = (doc.invoice_number || '').replace(/"/g, '\\"');
-      const escapedDocumentType = (doc.document_type || '').replace(/"/g, '\\"');
-      
-      const formatDate = (dateStr) => {
-        if (!dateStr) return '';
-        try {
-          const date = new Date(dateStr);
-          return date.toISOString().split('T')[0];
-        } catch (e) {
-          return String(dateStr).slice(0, 10);
+      console.log(`Creating item for ${doc.document_type} ${doc.invoice_number}`);
+
+      const escapedSupplier = (doc.supplier_name   || '').replace(/"/g,'\\"');
+      const escapedNumber   = (doc.invoice_number  || '').replace(/"/g,'\\"');
+      const escapedType     = (doc.document_type   || '').replace(/"/g,'\\"');
+
+      /* ▸ build columnValues ---------------------------------------- */
+      const columnValues = {};
+      for (const col of columns) {
+        const t = col.title.toLowerCase();
+        const id = col.id;
+        const type = col.type;
+
+        if (t.includes('supplier'))                columnValues[id] = escapedSupplier;
+        else if (t.includes('document number'))    columnValues[id] = escapedNumber;
+        else if (t.includes('document type')) {
+          if (type === 'dropdown') {
+            try {
+              const settings = JSON.parse(col.settings_str||'{}');
+              const match = settings.labels?.find(l =>
+                l.name?.toLowerCase() === escapedType.toLowerCase());
+              columnValues[id] = match ? match.name : settings.labels?.[0]?.name || escapedType;
+            } catch { columnValues[id] = escapedType; }
+          } else columnValues[id] = escapedType;
         }
-      };
-      
+        else if (t.includes('document date') && !t.includes('due')) columnValues[id] = fmtDate(doc.document_date);
+        else if (t === 'due date' || (t.includes('due date') && !t.includes('2') && !t.includes('3')))
+                                                   columnValues[id] = fmtDate(doc.due_date);
+        else if (t.includes('due date 2'))         columnValues[id] = fmtDate(doc.due_date_2);
+        else if (t.includes('due date 3'))         columnValues[id] = fmtDate(doc.due_date_3);
+        else if (t.includes('total amount'))       columnValues[id] = doc.total_amount || 0;
+        else if (t.includes('tax amount'))         columnValues[id] = doc.tax_amount   || 0;
+        else if (t.includes('extraction status') || (t.includes('status') && !t.includes('extraction')))
+          columnValues[id] = type === 'status' ? { index: 1 } : 'Extracted';
+      }
+
+      /* ▸ create the item ------------------------------------------- */
+      const createMutation = `
+        mutation {
+          create_item(
+            board_id:${MONDAY_CONFIG.extractedDocsBoardId},
+            item_name:"${escapedType.toUpperCase()} ${escapedNumber}",
+            column_values:${JSON.stringify(JSON.stringify(columnValues))}
+          ){ id }
+        }`;
+      const createRes = await axios.post(
+        'https://api.monday.com/v2',
+        { query: createMutation },
+        { headers:{ Authorization:`Bearer ${MONDAY_CONFIG.apiKey}`,
+                    'Content-Type':'application/json' } }
+      );
+      if (createRes.data.errors) {
+        console.error('GraphQL error:', createRes.data.errors);
+        continue;
+      }
+      const createdItemId = createRes.data.data.create_item.id;
+      console.log('✅ item created →', createdItemId);
+
+      /* ▸ attach the first original PDF (if any) --------------------- */
+      const fileCol = columns.find(c =>
+        ['document file','file'].some(s => c.title.toLowerCase().includes(s)));
+      if (fileCol && originalFiles.length) {
+        const { buffer, name } = originalFiles[0];
+        await uploadPdfToMondayItem(createdItemId, buffer, name, fileCol.id);
+      } else {
+        console.log('⚠️  no Document-File column or no original file');
+      }
+
+      /* ▸ create sub-items for line-items (if any) ------------------- */
+      if (doc.items?.length) await createSubitemsForLineItems(createdItemId, doc.items);
+    }
+  } catch (err) {
+    console.error('Error in createMondayExtractedItems:', err?.response?.data || err);
+    throw err;
+  }
+}
       const columnValues = {};
       
       columns.forEach(col => {
