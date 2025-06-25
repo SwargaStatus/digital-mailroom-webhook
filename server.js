@@ -43,7 +43,10 @@ async function processWebhookData(body) {
   const boardId = ev.boardId;
 
   // 1️⃣  pull PDFs from the file‑upload board
-  const pdfFiles = await getMondayItemFilesWithPublicUrl(itemId, boardId);
+ const pdfFiles = await getMondayItemFilesWithPublicUrl(
+    itemId,
+    MONDAY_CONFIG.fileUploadsBoardId   // always search the uploads board
+);
   if (!pdfFiles.length) return console.log('No pdfs on item', itemId);
 
   // 2️⃣  send to Instabase + wait → results
