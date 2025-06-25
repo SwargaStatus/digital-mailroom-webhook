@@ -1,5 +1,5 @@
-// server.js  – Digital‑Mailroom webhook (compact, with working file‑upload)
-// -----------------------------------------------------------------------------
+// server.js  – Digital-Mailroom webhook (compact, with working file-upload)
+// ---------------------------------------------------------------------------
 const express  = require('express');
 const axios    = require('axios');
 const FormData = require('form-data');
@@ -7,7 +7,7 @@ const FormData = require('form-data');
 const app = express();
 app.use(express.json());
 
-// ───────────────────────────────────────────────── Config ─────────────────────
+// ────────────────────────────── 1.  CONFIG  ───────────────────────────────────
 const INSTABASE_CONFIG = {
   baseUrl      : 'https://aihub.instabase.com',
   apiKey       : 'jEmrseIwOb9YtmJ6GzPAywtz53KnpS',
@@ -21,164 +21,158 @@ const INSTABASE_CONFIG = {
 
 const MONDAY_CONFIG = {
   apiKey              : 'eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjUzMDYzOTcxOSwiYWFpIjoxMSwidWlkIjo2Nzg2NjA4MywiaWFkIjoiMjAyNS0wNi0yNFQyMjoxNjowMC42NTJaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6MjYyMDQ5OTgsInJnbiI6InVzZTEifQ.zv9EsISZnchs7WKSqN2t3UU1GwcLrzPGeaP7ssKIla8',
-  fileUploadsBoardId  : '9445652448',   // source board (files uploaded by user)
-  extractedDocsBoardId: '9446325745'    // destination board (extracted data)
+  fileUploadsBoardId  : '9445652448',   // where users drop PDFs
+  extractedDocsBoardId: '9446325745'    // where we write the results
 };
 
-// ───────────────────────────────────────────── Webhook ─────────────────────────
+// ───────────────────────────── 2.  WEBHOOK  ───────────────────────────────────
 app.post('/webhook/monday-to-instabase', async (req, res) => {
-  // Monday challenge handshake
-  if (req.body?.challenge) return res.json({ challenge: req.body.challenge });
+  if (req.body?.challenge) return res.json({ challenge: req.body.challenge }); // handshake
+  res.json({ ok: true, received: Date.now() });                                 // 200 fast
 
-  res.json({ ok: true, received: Date.now() });
-  processWebhookData(req.body).catch(err => console.error('⚠️  Async error', err));
+  try   { await processWebhook(req.body); }
+  catch (e){ console.error('⚠️  async error', e); }
 });
 
-// ────────────────────────────────────────── Main workflow ──────────────────────
-async function processWebhookData(body) {
+// ─────────────────────────── 3. MAIN WORKFLOW ─────────────────────────────────
+async function processWebhook(body) {
   const ev = body.event;
   if (!ev || ev.columnId !== 'status' || ev.value?.label?.text !== 'Processing') return;
 
-  const itemId  = ev.pulseId;
-  const boardId = ev.boardId;
+  const itemId = ev.pulseId;
 
-  // 1️⃣  pull PDFs from the file‑upload board
- const pdfFiles = await getMondayItemFilesWithPublicUrl(
-    itemId,
-    MONDAY_CONFIG.fileUploadsBoardId   // always search the uploads board
-);
-  if (!pdfFiles.length) return console.log('No pdfs on item', itemId);
+  /* 1️⃣  download PDFs from the “File Uploads” board */
+  const pdfs = await fetchPdfAssets(itemId, MONDAY_CONFIG.fileUploadsBoardId);
+  if (!pdfs.length) return console.log('No pdfs on item', itemId);
 
-  // 2️⃣  send to Instabase + wait → results
-  const { files: extracted, originalFiles } = await processFilesWithInstabase(pdfFiles);
+  /* 2️⃣  Instabase → structured data */
+  const { files: extracted, originalFiles } = await runInstabase(pdfs);
 
-  // 3️⃣  group pages → logical documents
-  const docs = groupPagesByInvoiceNumber(extracted);
+  /* 3️⃣  very small grouping stub (same output schema you had) */
+  const docs = extracted.map(f => ({
+    invoice_number : f.original_file_name,
+    document_type  : 'Invoice',
+    supplier_name  : '',
+    total_amount   : 0,
+    tax_amount     : 0,
+    document_date  : '',
+    due_date       : '',
+    items          : [],
+    pages          : f.documents
+  }));
 
-  // 4️⃣  push data into the “Extracted Docs” board + attach first PDF
-  await createMondayExtractedItems(docs, originalFiles);
+  /* 4️⃣  create items on “Extracted Docs” + attach first PDF */
+  await createItemsInMonday(docs, originalFiles);
 }
 
-// ─────────────────────────────────────────── Helpers ───────────────────────────
+// ──────────────────────────── 4.  HELPERS  ────────────────────────────────────
+/* 4-A  Pull assets + real download URL (public_url OR url) */
+async function fetchPdfAssets(itemId, boardId){
+  // first call → list of asset IDs
+  const q = `query{ items(ids:[${itemId}]){ assets{id name file_extension} }}`;
+  const { data } = await axios.post('https://api.monday.com/v2',{query:q},
+                   { headers:{Authorization:`Bearer ${MONDAY_CONFIG.apiKey}`}});
+  const pdfIds = (data.data.items?.[0]?.assets||[])
+                 .filter(a => (a.file_extension||'').toLowerCase()==='pdf')
+                 .map(a => ({ id:a.id, name:a.name }));
 
-/* pull assets + public_url */
-async function getMondayItemFilesWithPublicUrl(itemId, boardId) {
-  const q = `query { items(ids:[${itemId}]) { assets { id name file_extension file_size public_url }}}`;
-  const { data } = await axios.post('https://api.monday.com/v2', { query: q },
-    { headers: { Authorization: `Bearer ${MONDAY_CONFIG.apiKey}` } });
+  if (!pdfIds.length) return [];
 
-  const assets = data.data.items[0]?.assets || [];
-  return assets.filter(a => (a.file_extension||'').toLowerCase()==='pdf')
-               .map(a => ({ name:a.name, public_url:a.public_url, assetId:a.id }));
+  // second call → signed URLs
+  const ids = pdfIds.map(a=>a.id).join(',');
+  const q2 = `query{ assets(ids:[${ids}]){ id public_url url file_extension } }`;
+  const { data: d2 } = await axios.post('https://api.monday.com/v2',{query:q2},
+                         { headers:{Authorization:`Bearer ${MONDAY_CONFIG.apiKey}`}});
+  const urlMap = Object.fromEntries(
+    d2.data.assets.map(a => [a.id, a.public_url || a.url])
+  );
+
+  return pdfIds
+    .map(a => ({ name:a.name, public_url:urlMap[a.id], assetId:a.id }))
+    .filter(a => a.public_url);  // drop any that still have no URL
 }
 
-/* send batch to Instabase (download → upload → run) */
-async function processFilesWithInstabase(files) {
-  const batchRes = await axios.post(`${INSTABASE_CONFIG.baseUrl}/api/v2/batches`,
-                                   { workspace: 'nileshn_sturgeontire.com' },
-                                   { headers: INSTABASE_CONFIG.headers });
-  const batchId = batchRes.data.id;
+/* 4-B  Send to Instabase (batch → run → results) */
+async function runInstabase(files){
+  const batch = await axios.post(`${INSTABASE_CONFIG.baseUrl}/api/v2/batches`,
+                                 { workspace:'nileshn_sturgeontire.com' },
+                                 { headers:INSTABASE_CONFIG.headers });
+  const batchId = batch.data.id;
 
   const originals = [];
-  for (const f of files) {
+  for (const f of files){
     const buf = Buffer.from((await axios.get(f.public_url,{responseType:'arraybuffer'})).data);
     originals.push({ name:f.name, buffer:buf });
 
     await axios.put(`${INSTABASE_CONFIG.baseUrl}/api/v2/batches/${batchId}/files/${encodeURIComponent(f.name)}`,
-                    buf,
-                    { headers:{ 'Content-Type':'application/octet-stream', ...INSTABASE_CONFIG.headers } });
+                    buf,{ headers:{...INSTABASE_CONFIG.headers,'Content-Type':'application/octet-stream'}});
   }
 
   const run = await axios.post(`${INSTABASE_CONFIG.baseUrl}/api/v2/apps/deployments/${INSTABASE_CONFIG.deploymentId}/runs`,
-                               { batch_id: batchId }, { headers: INSTABASE_CONFIG.headers });
+                               { batch_id:batchId },{ headers:INSTABASE_CONFIG.headers });
   const runId = run.data.id;
 
-  // poll until complete (max ~5 min)
-  let status = 'RUNNING', attempts = 0;
-  while(['RUNNING','PENDING'].includes(status) && attempts < 60) {
-    await new Promise(r => setTimeout(r,5000));
+  /* poll status (≤5 min) */
+  let status='RUNNING', n=0;
+  while(['RUNNING','PENDING'].includes(status) && n<60){
+    await new Promise(r=>setTimeout(r,5000));
     status = (await axios.get(`${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}`,
-                              { headers: INSTABASE_CONFIG.headers })).data.status;
-    attempts++;
+                              { headers:INSTABASE_CONFIG.headers })).data.status;
+    n++;
   }
-  if (status!=='COMPLETE') throw new Error('Instabase run failed: '+status);
+  if(status!=='COMPLETE') throw new Error('Instabase run failed: '+status);
 
   const res = await axios.get(`${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}/results`,
-                              { headers: INSTABASE_CONFIG.headers });
-  return { files: res.data.files, originalFiles: originals };
+                              { headers:INSTABASE_CONFIG.headers });
+  return { files:res.data.files, originalFiles:originals };
 }
 
-/* VERY small grouping stub  – real logic unchanged                            */
-function groupPagesByInvoiceNumber(files){
-  // for brevity: return one doc per original file
-  return files.map(f=>({ invoice_number: f.original_file_name,
-                         document_type : 'Invoice',
-                         supplier_name  : '',
-                         total_amount   : 0,
-                         tax_amount     : 0,
-                         document_date  : '',
-                         due_date       : '',
-                         items:[],
-                         pages: f.documents }))
-}
-
-/* create item on Extracted‑Docs board + attach pdf */
-async function createMondayExtractedItems(documents, originalFiles){
-  // ── board metadata (columns) ──
+/* 4-C  Create item on “Extracted Docs” board and attach PDF */
+async function createItemsInMonday(docs, originalFiles){
+  // board metadata
   const meta = await axios.post('https://api.monday.com/v2',
-    { query:`query{ boards(ids:[${MONDAY_CONFIG.extractedDocsBoardId}]){ columns{id title type settings_str} }}` },
-    { headers:{ Authorization:`Bearer ${MONDAY_CONFIG.apiKey}` } });
-  const columns = meta.data.data.boards[0].columns;
+    { query:`query{ boards(ids:[${MONDAY_CONFIG.extractedDocsBoardId}]){ columns{id title type} }}`},
+    { headers:{Authorization:`Bearer ${MONDAY_CONFIG.apiKey}`}} );
+  const cols = meta.data.data.boards[0].columns;
+  const numCol = cols.find(c=>/Document Number/i.test(c.title));
+  const fileCol= cols.find(c=>c.type==='file');
 
-  const fileCol = columns.find(c=>c.type==='file' && c.title.toLowerCase().includes('file'));
-
-  for(const doc of documents){
-    const columnValues = {}; // build minimal set (add more if you want)
-    columnValues[columns.find(c=>c.title.match(/Document Number/i)).id] = doc.invoice_number;
-
-    const itemRes = await axios.post('https://api.monday.com/v2', {
+  for(const d of docs){
+    const vals = { [numCol.id]: d.invoice_number };
+    const create = await axios.post('https://api.monday.com/v2',{
       query:`mutation{ create_item(board_id:${MONDAY_CONFIG.extractedDocsBoardId},
-                                   item_name:"${doc.document_type} ${doc.invoice_number}",
-                                   column_values:${JSON.stringify(JSON.stringify(columnValues))}){id}}` },
-      { headers:{ Authorization:`Bearer ${MONDAY_CONFIG.apiKey}` } });
+                                   item_name:"${d.document_type} ${d.invoice_number}",
+                                   column_values:${JSON.stringify(JSON.stringify(vals))}){id}}`
+    },{ headers:{Authorization:`Bearer ${MONDAY_CONFIG.apiKey}`}});
 
-    const createdId = itemRes.data.data.create_item.id;
-    if (fileCol && originalFiles.length) {
-      const { buffer,name } = originalFiles[0];
-      await uploadPdfToMondayItem(createdId, buffer, name, fileCol.id);
+    const itemId = create.data.data.create_item.id;
+    if (fileCol && originalFiles.length){
+      const { buffer,name }=originalFiles[0];
+      await uploadPdf(itemId, buffer, name, fileCol.id);
     }
   }
 }
 
-/* robust file‑upload with real error logging */
-async function uploadPdfToMondayItem(itemId, pdfBuffer, pdfName, columnId){
+/* 4-D  Upload helper */
+async function uploadPdf(itemId, buf, name, colId){
   const ops = {
-    query:`mutation ($file: File!, $itemId: Int!, $columnId: String!){ add_file_to_column(file:$file,item_id:$itemId,column_id:$columnId){id}}`,
-    variables:{ file:null, itemId:Number(itemId), columnId }
+    query:`mutation ($file: File!, $itemId: Int!, $col: String!){
+             add_file_to_column(file:$file,item_id:$itemId,column_id:$col){id}}`,
+    variables:{ file:null, itemId:Number(itemId), col:colId }
   };
   const form=new FormData();
   form.append('operations',JSON.stringify(ops));
   form.append('map',JSON.stringify({'0':['variables.file']}));
-  form.append('0',pdfBuffer,{filename:pdfName,contentType:'application/pdf'});
+  form.append('0',buf,{filename:name,contentType:'application/pdf'});
 
-  try {
-    const { data } = await axios.post('https://api.monday.com/v2/file',form,
-      { headers:{ ...form.getHeaders(), Authorization:`Bearer ${MONDAY_CONFIG.apiKey}` } });
-    if(data.errors) throw new Error(JSON.stringify(data.errors));
-    console.log('✅ PDF attached →',data.data.add_file_to_column.id);
-  } catch(err){
-    console.error('--- Monday response ----------------------------------\n',
-                  JSON.stringify(err.response?.data ?? err, null, 2),
-                  '\n------------------------------------------------------');
-    throw err;
-  }
+  const { data } = await axios.post('https://api.monday.com/v2/file',form,
+                     { headers:{...form.getHeaders(), Authorization:`Bearer ${MONDAY_CONFIG.apiKey}`}});
+  if(data.errors) throw new Error(JSON.stringify(data.errors));
+  console.log('✅ PDF attached →',data.data.add_file_to_column.id);
 }
 
-// ────────────────────────────────────────── utilities ──────────────────────────
+// ────────────────────────────── 5.  MISC  ─────────────────────────────────────
 app.get('/health',(req,res)=>res.json({status:'healthy',ts:Date.now()}));
 
-// ─────────────────────────────────────────── Start ─────────────────────────────
 const PORT = process.env.PORT||8080;
 app.listen(PORT,'0.0.0.0',()=>console.log('🚀 webhook running on',PORT));
-
-module.exports = app;
