@@ -685,60 +685,53 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
 }
 
 async function uploadPdfToMondayItem(itemId, originalFiles, columns) {
-  try {
-    if (!originalFiles?.length) return;
+  if (!originalFiles?.length) return;
 
-    // 1️⃣ locate the File column
-    const fileCol = columns.find(c =>
-      ['file', 'document file'].some(t => c.title.toLowerCase().includes(t))
-    );
-    if (!fileCol) return;
+  const fileCol = columns.find(c =>
+    ['file', 'document file'].some(t => c.title.toLowerCase().includes(t))
+  );
+  if (!fileCol) return;
 
-    const pdf = originalFiles[0];                    // first PDF buffer
+  const pdf = originalFiles[0];
 
-    /* ---------- build the multipart spec ---------- */
-    const ops = {
-      query: `
-        mutation ($item_id: ID!, $column_id: String!, $file: File!) {
-          add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
-            id
-          }
+  const ops = {
+    query: `
+      mutation ($item_id: ID!, $column_id: String!, $file: File!) {
+        add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
+          id
         }
-      `,
-      variables: {
-        item_id: itemId.toString(),
-        column_id: fileCol.id,
-        file: null                                  // 👈 placeholder!
-      }
-    };
+      }`,
+    variables: { item_id: itemId.toString(), column_id: fileCol.id, file: null }
+  };
+  const map = { "0": ["variables.file"] };
 
-    const map = { "0": ["variables.file"] };       // part “0” -> variables.file
+  const form = new FormData();
+  form.append('operations', JSON.stringify(ops));
+  form.append('map', JSON.stringify(map));
+  form.append('0', pdf.buffer, {
+    filename: pdf.name,
+    contentType: 'application/pdf',
+    knownLength: pdf.buffer.length          // <- important
+  });
 
-    const form = new FormData();
-    form.append('operations', JSON.stringify(ops));
-    form.append('map',        JSON.stringify(map));
-    form.append('0', pdf.buffer, {                 // part name must match map key
-      filename: pdf.name,
-      contentType: 'application/pdf'
-    });
+  // compute overall length so axios sets it
+  const length = await new Promise((res, rej) =>
+    form.getLength((err, len) => (err ? rej(err) : res(len)))
+  );
 
-    const resp = await axios.post('https://api.monday.com/v2/file', form, {
-      headers: {
-        Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
-        ...form.getHeaders()
-      },
-      timeout: 30000
-    });
+  const resp = await axios.post('https://api.monday.com/v2/file', form, {
+    headers: { Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`, ...form.getHeaders({ 'Content-Length': length }) },
+    maxContentLength: Infinity,
+    maxBodyLength: Infinity
+  });
 
-    if (resp.data.errors) {
-      console.error('File upload errors:', resp.data.errors);
-    } else {
-      console.log(`✅ PDF attached to item ${itemId}`);
-    }
-  } catch (err) {
-    console.error('Error uploading PDF:', err.message);
+  if (resp.data.errors) {
+    console.error('File upload errors:', resp.data.errors);
+  } else {
+    console.log(`✅ PDF attached to item ${itemId}`);
   }
 }
+
 async function createSubitemsForLineItems(parentItemId, items) {
   try {
     for (let i = 0; i < items.length; i++) {
