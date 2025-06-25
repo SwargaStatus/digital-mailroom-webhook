@@ -16,70 +16,6 @@ const INSTABASE_CONFIG = {
     'Authorization': 'Bearer jEmrseIwOb9YtmJ6GzPAywtz53KnpS',
     'Content-Type': 'application/json'
   }
-
-async function uploadPdfToMondayItem(itemId, originalFiles, columns) {
-  try {
-    if (!originalFiles || originalFiles.length === 0) {
-      console.log('No original files to upload');
-      return;
-    }
-    
-    // Find the Document File column
-    const fileColumn = columns.find(col => 
-      col.title.toLowerCase().includes('document file') || 
-      col.title.toLowerCase().includes('file')
-    );
-    
-    if (!fileColumn) {
-      console.log('No document file column found');
-      return;
-    }
-    
-    console.log(`Uploading PDF to column: ${fileColumn.title} (${fileColumn.id})`);
-    
-    // Upload the first PDF file
-    const pdfFile = originalFiles[0];
-    
-    // Use Monday.com's file upload API with form-data
-    const FormData = require('form-data');
-    const form = new FormData();
-    
-    const fileUploadMutation = `
-      mutation add_file_to_column($item_id: Int!, $column_id: String!, $file: File!) {
-        add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
-          id
-        }
-      }
-    `;
-    
-    form.append('query', fileUploadMutation);
-    form.append('variables', JSON.stringify({
-      item_id: parseInt(itemId),
-      column_id: fileColumn.id
-    }));
-    form.append('file', pdfFile.buffer, {
-      filename: pdfFile.name,
-      contentType: 'application/pdf'
-    });
-    
-    const uploadResponse = await axios.post('https://api.monday.com/v2/file', form, {
-      headers: {
-        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
-        ...form.getHeaders()
-      },
-      timeout: 30000
-    });
-    
-    if (uploadResponse.data.errors) {
-      console.error('File upload errors:', uploadResponse.data.errors);
-    } else {
-      console.log(`✅ Uploaded PDF file to Monday.com item ${itemId}`);
-    }
-    
-  } catch (error) {
-    console.error('Error uploading PDF to Monday.com:', error.message);
-    // Don't throw error - continue with other processing
-  }
 };
 
 const MONDAY_CONFIG = {
@@ -748,6 +684,71 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
   }
 }
 
+async function uploadPdfToMondayItem(itemId, originalFiles, columns) {
+  try {
+    if (!originalFiles || originalFiles.length === 0) {
+      console.log('No original files to upload');
+      return;
+    }
+    
+    // Find the Document File column
+    const fileColumn = columns.find(col => 
+      col.title.toLowerCase().includes('document file') || 
+      col.title.toLowerCase().includes('file')
+    );
+    
+    if (!fileColumn) {
+      console.log('No document file column found');
+      return;
+    }
+    
+    console.log(`Uploading PDF to column: ${fileColumn.title} (${fileColumn.id})`);
+    
+    // Upload the first PDF file
+    const pdfFile = originalFiles[0];
+    
+    // Use Monday.com's file upload API with form-data
+    const FormData = require('form-data');
+    const form = new FormData();
+    
+    const fileUploadMutation = `
+      mutation add_file_to_column($item_id: Int!, $column_id: String!, $file: File!) {
+        add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
+          id
+        }
+      }
+    `;
+    
+    form.append('query', fileUploadMutation);
+    form.append('variables', JSON.stringify({
+      item_id: parseInt(itemId),
+      column_id: fileColumn.id
+    }));
+    form.append('file', pdfFile.buffer, {
+      filename: pdfFile.name,
+      contentType: 'application/pdf'
+    });
+    
+    const uploadResponse = await axios.post('https://api.monday.com/v2/file', form, {
+      headers: {
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        ...form.getHeaders()
+      },
+      timeout: 30000
+    });
+    
+    if (uploadResponse.data.errors) {
+      console.error('File upload errors:', uploadResponse.data.errors);
+    } else {
+      console.log(`✅ Uploaded PDF file to Monday.com item ${itemId}`);
+    }
+    
+  } catch (error) {
+    console.error('Error uploading PDF to Monday.com:', error.message);
+    // Don't throw error - continue with other processing
+  }
+}
+
 async function createSubitemsForLineItems(parentItemId, items) {
   try {
     for (let i = 0; i < items.length; i++) {
@@ -783,20 +784,28 @@ async function createSubitemsForLineItems(parentItemId, items) {
           }
         }
       `;
-      
-      const subitemResponse = await axios.post('https://api.monday.com/v2', {
-        query: subitemMutation
-      }, {
-        headers: {
-          'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
-          'Content-Type': 'application/json'
+
+      const subitemResponse = await axios.post(
+        'https://api.monday.com/v2',
+        { query: subitemMutation },
+        {
+          headers: {
+            Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: 30000,
         }
-      });
-      
+      );
+
       if (subitemResponse.data.errors) {
-        console.error(`Error creating subitem ${i + 1}:`, subitemResponse.data.errors);
+        console.error(
+          `Error creating subitem ${i + 1}:`,
+          subitemResponse.data.errors
+        );
       } else {
-        console.log(`✅ Created subitem ${i + 1}: ${subitemName}`);
+        console.log(
+          `✅ Created subitem ${i + 1}: ${subitemName} (ID: ${subitemResponse.data.data.create_subitem.id})`
+        );
       }
     }
   } catch (error) {
@@ -804,54 +813,3 @@ async function createSubitemsForLineItems(parentItemId, items) {
     throw error;
   }
 }
-
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'healthy', 
-    timestamp: new Date().toISOString(),
-    service: 'Digital Mailroom Webhook v3.0'
-  });
-});
-
-app.post('/test/process-item/:itemId', async (req, res) => {
-  try {
-    const itemId = req.params.itemId;
-    console.log(`Manual test triggered for item ${itemId}`);
-    
-    const files = await getMondayItemFilesWithPublicUrl(itemId, MONDAY_CONFIG.fileUploadsBoardId);
-    
-    res.json({
-      success: true,
-      itemId,
-      filesFound: files.length,
-      files: files.map(f => ({ name: f.name, hasPublicUrl: !!f.public_url }))
-    });
-    
-  } catch (error) {
-    console.error('Test endpoint error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Digital Mailroom webhook service v3.0 running on port ${PORT}`);
-  console.log('📋 Complete Features:');
-  console.log('   - Monday.com file download with public_url');
-  console.log('   - Instabase document processing with retry logic');
-  console.log('   - PDF merging by invoice number');
-  console.log('   - Multiple due date support');
-  console.log('   - Document type dropdown handling');
-  console.log('   - Line item subitems creation');
-  console.log('   - Enhanced error logging and debugging');
-  console.log('');
-  console.log('🔗 Endpoints:');
-  console.log(`   POST /webhook/monday-to-instabase - Main webhook`);
-  console.log(`   POST /test/process-item/:itemId - Manual test`);
-  console.log(`   GET  /health - Health check`);
-});
-
-module.exports = app;
