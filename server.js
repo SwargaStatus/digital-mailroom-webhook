@@ -693,16 +693,16 @@ async function createMondayExtractedItems(documents, sourceItemId) {
         } else if (title.includes('tax amount')) {
           columnValues[id] = doc.tax_amount || 0;
         } else if (title.includes('extraction status')) {
-          // For status columns, use a simple string
+          // For status columns, use a valid status ID
           if (type === 'status') {
-            columnValues[id] = { "label": "Extracted" };
+            columnValues[id] = { "index": 1 }; // Use "Done" status
           } else {
             columnValues[id] = "Extracted";
           }
         } else if (title.includes('status') && !title.includes('extraction')) {
           // Generic status column
           if (type === 'status') {
-            columnValues[id] = { "label": "Done" };
+            columnValues[id] = { "index": 1 }; // Use "Done" status
           } else {
             columnValues[id] = "Extracted";
           }
