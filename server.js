@@ -690,8 +690,8 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
 }
 
 async function uploadPdfToMondayItem(itemId, originalFiles, columns) {
+  // ---------- guard clauses ----------
   if (!originalFiles?.length) return;
-
   const fileCol = columns.find(c =>
     ['file', 'document file'].some(t => c.title.toLowerCase().includes(t))
   );
@@ -699,41 +699,49 @@ async function uploadPdfToMondayItem(itemId, originalFiles, columns) {
 
   const pdf = originalFiles[0];
 
+  /* ---------- build the multipart payload ---------- */
   const ops = {
     query: `
-      mutation ($item_id: ID!, $column_id: String!, $file: File!) {
-        add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
+      mutation($item_id: Int!, $column_id: String!, $file: File!){
+        add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file){
           id
         }
       }`,
-    variables: { item_id: itemId.toString(), column_id: fileCol.id, file: null }
+    variables: { item_id: Number(itemId), column_id: fileCol.id, file: null }   // ← ① cast to Int
   };
-  const map = { "0": ["variables.file"] };
+
+  const map = { "0": ["variables.file"] };                                      // ← ② map part-0 → variables.file
 
   const form = new FormData();
   form.append('operations', JSON.stringify(ops));
-  form.append('map', JSON.stringify(map));
-  form.append('0', pdf.buffer, {
-    filename: pdf.name,
-    contentType: 'application/pdf',
-    knownLength: pdf.buffer.length          // <- important
-  });
+  form.append('map',        JSON.stringify(map));
+  form.append('0',          pdf.buffer, { filename: pdf.name, contentType: 'application/pdf' });
 
-  // compute overall length so axios sets it
-  const length = await new Promise((res, rej) =>
-    form.getLength((err, len) => (err ? rej(err) : res(len)))
-  );
+  try {                                                                         // ← ③ local try/catch
+    const { data } = await axios.post(
+      'https://api.monday.com/v2/file',
+      form,
+      {
+        headers: {
+          ...form.getHeaders(),                                                 // let form-data set Content-Type & Length
+          Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`
+        },
+        maxBodyLength: Infinity,                                                // large files
+        maxContentLength: Infinity
+      }
+    );
 
-  const resp = await axios.post('https://api.monday.com/v2/file', form, {
-    headers: { Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`, ...form.getHeaders({ 'Content-Length': length }) },
-    maxContentLength: Infinity,
-    maxBodyLength: Infinity
-  });
-
-  if (resp.data.errors) {
-    console.error('File upload errors:', resp.data.errors);
-  } else {
-    console.log(`✅ PDF attached to item ${itemId}`);
+    if (data.errors) {
+      console.error('Monday GraphQL errors:', data.errors);
+    } else {
+      console.log(`✅ PDF attached to item ${itemId}`);
+    }
+  } catch (err) {
+    /* now you’ll actually see Monday’s explanation */
+    console.error('--- Monday error body --------------------------------');
+    console.error(JSON.stringify(err?.response?.data ?? err, null, 2));
+    console.error('-------------------------------------------------------');
+    throw err;   // bubble up if you still want the caller to handle it
   }
 }
 
