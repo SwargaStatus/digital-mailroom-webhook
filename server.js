@@ -222,7 +222,10 @@ async function processFilesWithInstabase(files, sourceItemId) {
       console.log('Processing file:', JSON.stringify(file, null, 2));
       
       // Monday.com files have different URL structure
-      let fileUrl = file.url || file.public_url;
+      // REMOVED: let fileUrl = file.url || file.public_url;
+      // REMOVED: if (!fileUrl && file.assetId) { ... }
+      // 
+      // Instead: ALWAYS use asset API to get the real S3 URL
       
       if (!fileUrl && file.assetId) {
         // Use Monday.com assets API to get the file
