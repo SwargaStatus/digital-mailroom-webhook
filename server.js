@@ -711,8 +711,8 @@ async function uploadPdfToMondayItem(itemId, originalFiles, columns) {
     const FormData = require('form-data');
     const form = new FormData();
     
-    const fileUploadMutation = `
-      mutation add_file_to_column($item_id: Int!, $column_id: String!, $file: File!) {
+  const fileUploadMutation = `
+    mutation add_file_to_column($item_id: ID!, $column_id: String!, $file: File!) {
         add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
           id
         }
@@ -721,7 +721,7 @@ async function uploadPdfToMondayItem(itemId, originalFiles, columns) {
     
     form.append('query', fileUploadMutation);
     form.append('variables', JSON.stringify({
-      item_id: parseInt(itemId),
+      item_id: itemId.toString(),
       column_id: fileColumn.id
     }));
     form.append('file', pdfFile.buffer, {
