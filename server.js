@@ -16,6 +16,70 @@ const INSTABASE_CONFIG = {
     'Authorization': 'Bearer jEmrseIwOb9YtmJ6GzPAywtz53KnpS',
     'Content-Type': 'application/json'
   }
+
+async function uploadPdfToMondayItem(itemId, originalFiles, columns) {
+  try {
+    if (!originalFiles || originalFiles.length === 0) {
+      console.log('No original files to upload');
+      return;
+    }
+    
+    // Find the Document File column
+    const fileColumn = columns.find(col => 
+      col.title.toLowerCase().includes('document file') || 
+      col.title.toLowerCase().includes('file')
+    );
+    
+    if (!fileColumn) {
+      console.log('No document file column found');
+      return;
+    }
+    
+    console.log(`Uploading PDF to column: ${fileColumn.title} (${fileColumn.id})`);
+    
+    // Upload the first PDF file
+    const pdfFile = originalFiles[0];
+    
+    // Use Monday.com's file upload API with form-data
+    const FormData = require('form-data');
+    const form = new FormData();
+    
+    const fileUploadMutation = `
+      mutation add_file_to_column($item_id: Int!, $column_id: String!, $file: File!) {
+        add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
+          id
+        }
+      }
+    `;
+    
+    form.append('query', fileUploadMutation);
+    form.append('variables', JSON.stringify({
+      item_id: parseInt(itemId),
+      column_id: fileColumn.id
+    }));
+    form.append('file', pdfFile.buffer, {
+      filename: pdfFile.name,
+      contentType: 'application/pdf'
+    });
+    
+    const uploadResponse = await axios.post('https://api.monday.com/v2/file', form, {
+      headers: {
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        ...form.getHeaders()
+      },
+      timeout: 30000
+    });
+    
+    if (uploadResponse.data.errors) {
+      console.error('File upload errors:', uploadResponse.data.errors);
+    } else {
+      console.log(`✅ Uploaded PDF file to Monday.com item ${itemId}`);
+    }
+    
+  } catch (error) {
+    console.error('Error uploading PDF to Monday.com:', error.message);
+    // Don't throw error - continue with other processing
+  }
 };
 
 const MONDAY_CONFIG = {
@@ -463,19 +527,24 @@ function groupPagesByInvoiceNumber(extractedFiles) {
       }
       
       if (dueDateData && Array.isArray(dueDateData)) {
-        console.log(`  Found due date data:`, dueDateData);
+        console.log(`  Found due date data on ${pageType} page:`, dueDateData);
         
         const dates = [];
         dueDateData.forEach(row => {
           if (Array.isArray(row) && row.length > 0) {
             const cellValue = row[0];
+            console.log(`    Checking cell value: "${cellValue}"`);
             if (cellValue && cellValue !== 'Due Date' && cellValue.match(/\d{4}-\d{2}-\d{2}/)) {
               dates.push(cellValue);
+              console.log(`    Added date: ${cellValue}`);
             }
           }
         });
         
-        if (pageType === 'main' || !group.due_date) {
+        console.log(`  Extracted dates array:`, dates);
+        
+        // Always update if we have dates (prioritize main page, but accept any page with dates)
+        if (dates.length > 0 && (pageType === 'main' || !group.due_date)) {
           group.due_date = dates[0] || '';
           group.due_date_2 = dates[1] || '';
           group.due_date_3 = dates[2] || '';
@@ -664,6 +733,9 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
       
       const createdItemId = response.data.data.create_item.id;
       console.log(`✅ Created Monday.com item for ${doc.document_type} ${doc.invoice_number} (ID: ${createdItemId})`);
+      
+      // Upload the PDF file to Document File column
+      await uploadPdfToMondayItem(createdItemId, originalFiles, columns);
       
       if (doc.items && doc.items.length > 0) {
         console.log(`Creating ${doc.items.length} subitems for line items...`);
