@@ -422,14 +422,24 @@ function groupPagesByInvoiceNumber(extractedFiles) {
       const fields = doc.fields;
       console.log(`  Available fields:`, Object.keys(fields || {}));
       
-      // Get invoice number (handle different field names)
-      const invoiceNumber = 
-        fields.document_number?.value || 
-        fields.invoice_number?.value || 
-        fields.number?.value ||
-        'unknown';
+      // UPDATED: Use numeric field mapping based on what we discovered
+      const invoiceNumber = fields['0']?.value || 'unknown'; // Field 0 = Document Number
+      const pageType = fields['1']?.value || 'unknown';      // Field 1 = Page Type
+      const documentType = fields['2']?.value || 'invoice';  // Field 2 = Document Type
+      const supplier = fields['3']?.value || '';             // Field 3 = Supplier
+      const terms = fields['4']?.value || '';                // Field 4 = Terms
+      const documentDate = fields['5']?.value || '';         // Field 5 = Document Date
+      const dueDateData = fields['6']?.value || '';          // Field 6 = Due Date
+      const itemsData = fields['7']?.value || [];            // Field 7 = Items
+      const totalAmount = fields['8']?.value || 0;           // Field 8 = Total
+      const taxAmount = fields['9']?.value || 0;             // Field 9 = Tax
       
-      console.log(`  Extracted invoice number: "${invoiceNumber}"`);
+      console.log(`  Extracted data:`);
+      console.log(`    Invoice Number: "${invoiceNumber}"`);
+      console.log(`    Page Type: "${pageType}"`);
+      console.log(`    Document Type: "${documentType}"`);
+      console.log(`    Supplier: "${supplier}"`);
+      console.log(`    Total: "${totalAmount}"`);
       
       // Skip pages without invoice numbers (continuation pages)
       if (!invoiceNumber || invoiceNumber === 'none' || invoiceNumber === 'unknown') {
@@ -443,15 +453,15 @@ function groupPagesByInvoiceNumber(extractedFiles) {
       if (!documentGroups[invoiceNumber]) {
         documentGroups[invoiceNumber] = {
           invoice_number: invoiceNumber,
-          document_type: fields.document_type?.value || 'invoice',
-          supplier_name: '',
+          document_type: documentType,
+          supplier_name: supplier,
           total_amount: 0,
           tax_amount: 0,
-          document_date: '',
+          document_date: documentDate,
           due_date: '',
           due_date_2: '',
           due_date_3: '',
-          terms: '',
+          terms: terms,
           items: [], // For subitems
           pages: [],
           confidence: 0
@@ -462,79 +472,81 @@ function groupPagesByInvoiceNumber(extractedFiles) {
       // Add page data to group
       const group = documentGroups[invoiceNumber];
       group.pages.push({
-        page_type: fields.page_type?.value,
+        page_type: pageType,
         file_name: file.original_file_name,
         fields: fields
       });
       
-      // Update document-level fields from any page with the data
-      if (fields.supplier?.value) {
-        console.log(`  Found supplier: ${fields.supplier.value}`);
-        group.supplier_name = fields.supplier.value;
-      }
-      if (fields.total?.value) {
-        // Clean up the total amount - remove currency symbols and convert to number
-        const totalStr = String(fields.total.value).replace(/[^0-9.-]/g, '');
-        group.total_amount = parseFloat(totalStr) || 0;
-        console.log(`  Found total: ${group.total_amount}`);
-      }
-      if (fields.tax?.value) {
-        const taxStr = String(fields.tax.value).replace(/[^0-9.-]/g, '');
-        group.tax_amount = parseFloat(taxStr) || 0;
-        console.log(`  Found tax: ${group.tax_amount}`);
-      }
-      if (fields.document_date?.value) {
-        group.document_date = fields.document_date.value;
-        console.log(`  Found document date: ${group.document_date}`);
-      }
-      if (fields.terms?.value) {
-        group.terms = fields.terms.value;
-        console.log(`  Found terms: ${group.terms}`);
+      // Update document-level fields - prioritize "main" page data over "continuation"
+      if (pageType === 'main' || !group.supplier_name) {
+        if (supplier) {
+          console.log(`  Found supplier: ${supplier}`);
+          group.supplier_name = supplier;
+        }
+        
+        if (totalAmount) {
+          // Clean up the total amount - remove currency symbols and convert to number
+          const totalStr = String(totalAmount).replace(/[^0-9.-]/g, '');
+          group.total_amount = parseFloat(totalStr) || 0;
+          console.log(`  Found total: ${group.total_amount}`);
+        }
+        
+        if (taxAmount) {
+          const taxStr = String(taxAmount).replace(/[^0-9.-]/g, '');
+          group.tax_amount = parseFloat(taxStr) || 0;
+          console.log(`  Found tax: ${group.tax_amount}`);
+        }
+        
+        if (documentDate) {
+          group.document_date = documentDate;
+          console.log(`  Found document date: ${group.document_date}`);
+        }
+        
+        if (terms) {
+          group.terms = terms;
+          console.log(`  Found terms: ${group.terms}`);
+        }
       }
       
-      // Handle Due Date (could be single date or table with multiple dates)
-      if (fields.due_date?.value) {
-        const dueDateValue = fields.due_date.value;
-        console.log(`  Found due date value:`, dueDateValue);
+      // Handle Due Date (table format: [["Due Date"], ["2025-06-25"]])
+      if (dueDateData && Array.isArray(dueDateData)) {
+        console.log(`  Found due date data:`, dueDateData);
         
-        // If it's a table/array, extract multiple dates
-        if (Array.isArray(dueDateValue)) {
-          group.due_date = dueDateValue[0] || '';
-          group.due_date_2 = dueDateValue[1] || '';
-          group.due_date_3 = dueDateValue[2] || '';
-        } else if (typeof dueDateValue === 'object' && dueDateValue.rows) {
-          // Handle table format
-          const dates = dueDateValue.rows.map(row => row.date || row[0]).filter(Boolean);
-          group.due_date = dates[0] || '';
-          group.due_date_2 = dates[1] || '';
-          group.due_date_3 = dates[2] || '';
-        } else {
-          // Single date
-          group.due_date = String(dueDateValue);
-        }
+        // Extract dates from table format
+        const dates = [];
+        dueDateData.forEach(row => {
+          if (Array.isArray(row) && row.length > 0) {
+            // Skip header rows (like "Due Date")
+            const cellValue = row[0];
+            if (cellValue && cellValue !== 'Due Date' && cellValue.match(/\d{4}-\d{2}-\d{2}/)) {
+              dates.push(cellValue);
+            }
+          }
+        });
+        
+        group.due_date = dates[0] || '';
+        group.due_date_2 = dates[1] || '';
+        group.due_date_3 = dates[2] || '';
         console.log(`  Set due dates: ${group.due_date}, ${group.due_date_2}, ${group.due_date_3}`);
       }
       
-      // Handle Items (for subitems)
-      if (fields.items?.value) {
-        const itemsValue = fields.items.value;
-        console.log(`  Found items value:`, itemsValue);
+      // Handle Items (array format for line items) - only from main pages
+      if (itemsData && Array.isArray(itemsData) && itemsData.length > 0 && pageType === 'main') {
+        console.log(`  Found items data:`, itemsData.length, 'items');
         
-        if (Array.isArray(itemsValue)) {
-          group.items = itemsValue;
-        } else if (typeof itemsValue === 'object' && itemsValue.rows) {
-          // Handle table format for items
-          group.items = itemsValue.rows.map(row => ({
-            description: row.description || row[0] || '',
-            quantity: row.quantity || row[1] || '',
-            unit_price: row.unit_price || row[2] || '',
-            amount: row.amount || row[3] || ''
-          }));
-        }
+        const processedItems = itemsData.map(item => ({
+          item_number: item['Item Number'] || item.item_number || '',
+          description: item.description || item.desc || '',
+          quantity: parseFloat(item.Quantity || item.quantity || '0') || 0,
+          unit_cost: parseFloat(item['Unit Cost'] || item.unit_cost || item.price || '0') || 0,
+          amount: parseFloat(item.amount || item.total || '0') || 0
+        }));
+        
+        group.items = processedItems;
         console.log(`  Processed ${group.items.length} items`);
       }
       
-      // Calculate average confidence
+      // Calculate average confidence (if available)
       const confidences = Object.values(fields)
         .map(field => field.confidence?.model || 0)
         .filter(conf => conf > 0);
@@ -548,7 +560,7 @@ function groupPagesByInvoiceNumber(extractedFiles) {
   console.log(`=== GROUPING RESULT ===`);
   console.log(`Found ${Object.keys(documentGroups).length} document groups:`);
   Object.keys(documentGroups).forEach(key => {
-    console.log(`  Group "${key}": ${documentGroups[key].pages.length} pages`);
+    console.log(`  Group "${key}": ${documentGroups[key].pages.length} pages, ${documentGroups[key].items.length} items`);
   });
   console.log('=== END GROUPING DEBUG ===');
   
@@ -648,21 +660,32 @@ async function createSubitemsForLineItems(parentItemId, items, invoiceNumber) {
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
       
-      // Clean up item data
-      const description = String(item.description || item.desc || '').replace(/"/g, '\\"');
-      const quantity = parseFloat(String(item.quantity || item.qty || '0').replace(/[^0-9.-]/g, '')) || 0;
-      const unitPrice = parseFloat(String(item.unit_price || item.price || '0').replace(/[^0-9.-]/g, '')) || 0;
-      const amount = parseFloat(String(item.amount || item.total || '0').replace(/[^0-9.-]/g, '')) || 0;
+      // Clean up item data based on the structure we discovered
+      const itemNumber = String(item.item_number || '').replace(/"/g, '\\"');
+      const description = String(item.description || itemNumber || `Item ${i + 1}`).replace(/"/g, '\\"');
+      const quantity = item.quantity || 0;
+      const unitCost = item.unit_cost || 0;
+      const amount = item.amount || (quantity * unitCost);
       
-      const subitemName = `${description.substring(0, 50)}${description.length > 50 ? '...' : ''}`;
+      const subitemName = `${itemNumber}: ${description.substring(0, 40)}${description.length > 40 ? '...' : ''}`;
+      
+      console.log(`Creating subitem: ${subitemName} (Qty: ${quantity}, Cost: ${unitCost})`);
       
       // Create subitem with inventory data
+      const subitemColumnValues = {
+        item_number: itemNumber,
+        description: description,
+        quantity: quantity,
+        unit_cost: unitCost,
+        amount: amount
+      };
+      
       const subitemMutation = `
         mutation {
           create_subitem(
             parent_item_id: ${parentItemId}
             item_name: "${subitemName}"
-            column_values: "{\\"quantity\\": ${quantity}, \\"unit_price\\": ${unitPrice}, \\"amount\\": ${amount}, \\"description\\": \\"${description}\\"}"
+            column_values: ${JSON.stringify(JSON.stringify(subitemColumnValues))}
           ) {
             id
             name
