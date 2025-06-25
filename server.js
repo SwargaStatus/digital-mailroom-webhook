@@ -282,16 +282,42 @@ async function processFilesWithInstabase(files, sourceItemId) {
       console.log(`✅ Successfully uploaded ${file.name} to Instabase`);
     }
     
-    // Step 3: Run deployment (CORRECTED API ENDPOINT)
+    // Step 3: Run deployment (CORRECTED API ENDPOINT) with retry logic
     console.log(`Starting Instabase processing with deployment ${INSTABASE_CONFIG.deploymentId}...`);
-    const runResponse = await axios.post(
-      `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/deployments/${INSTABASE_CONFIG.deploymentId}/runs`,
-      { batch_id: batchId },
-      { headers: INSTABASE_CONFIG.headers }
-    );
     
-    const runId = runResponse.data.id;
-    console.log('✅ Started processing run:', runId);
+    let runResponse;
+    let runId;
+    
+    // Retry logic for network issues
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        console.log(`Attempt ${attempt}: Starting deployment run...`);
+        
+        runResponse = await axios.post(
+          `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/deployments/${INSTABASE_CONFIG.deploymentId}/runs`,
+          { batch_id: batchId },
+          { 
+            headers: INSTABASE_CONFIG.headers,
+            timeout: 30000 // 30 second timeout
+          }
+        );
+        
+        runId = runResponse.data.id;
+        console.log(`✅ Started processing run: ${runId}`);
+        break; // Success, exit retry loop
+        
+      } catch (error) {
+        console.error(`Attempt ${attempt} failed:`, error.message);
+        
+        if (attempt === 3) {
+          throw error; // Final attempt failed
+        }
+        
+        // Wait before retry
+        console.log(`Waiting 5 seconds before retry...`);
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+    }
     
     // Step 4: Poll for completion with better status handling
     let status = 'RUNNING';
@@ -307,7 +333,10 @@ async function processFilesWithInstabase(files, sourceItemId) {
       
       const statusResponse = await axios.get(
         `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}`,
-        { headers: INSTABASE_CONFIG.headers }
+        { 
+          headers: INSTABASE_CONFIG.headers,
+          timeout: 15000 // 15 second timeout for status checks
+        }
       );
       
       status = statusResponse.data.status;
@@ -356,11 +385,14 @@ async function processFilesWithInstabase(files, sourceItemId) {
     
     console.log('✅ Instabase processing completed successfully');
     
-    // Step 5: Get results (CORRECTED API ENDPOINT)
+    // Step 5: Get results (CORRECTED API ENDPOINT) with timeout
     console.log('Retrieving extraction results...');
     const resultsResponse = await axios.get(
       `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}/results`,
-      { headers: INSTABASE_CONFIG.headers }
+      { 
+        headers: INSTABASE_CONFIG.headers,
+        timeout: 30000 // 30 second timeout for results
+      }
     );
     
     console.log('✅ Extraction results received');
