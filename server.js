@@ -27,7 +27,9 @@ const MONDAY_CONFIG = {
 // Main webhook endpoint that Monday.com will call
 app.post('/webhook/monday-to-instabase', async (req, res) => {
   try {
-    console.log('Received webhook from Monday.com:', JSON.stringify(req.body, null, 2));
+    console.log('=== WEBHOOK RECEIVED ===');
+    console.log('Full request body:', JSON.stringify(req.body, null, 2));
+    console.log('Headers:', JSON.stringify(req.headers, null, 2));
     
     // Handle Monday.com webhook validation challenge
     if (req.body.challenge) {
@@ -35,13 +37,50 @@ app.post('/webhook/monday-to-instabase', async (req, res) => {
       return res.json({ challenge: req.body.challenge });
     }
     
-    const { item_id, board_id, column_values } = req.body;
+    // Respond immediately to Monday.com to prevent timeout
+    res.json({ 
+      success: true, 
+      message: 'Webhook received, processing started',
+      timestamp: new Date().toISOString()
+    });
+    
+    // Process in background
+    processWebhookData(req.body);
+    
+  } catch (error) {
+    console.error('=== WEBHOOK ERROR ===');
+    console.error('Error details:', error);
+    console.error('Stack trace:', error.stack);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Process webhook data in background
+async function processWebhookData(webhookData) {
+  try {
+    console.log('=== STARTING BACKGROUND PROCESSING ===');
+    console.log('Webhook data structure:', JSON.stringify(webhookData, null, 2));
+    
+    // For now, just log what we receive and return success
+    console.log('=== WEBHOOK PROCESSING COMPLETED (LOGGING ONLY) ===');
+    return;
+    
+    // TODO: Re-enable this once we understand the data structure
+    /*
+    const { item_id, board_id, column_values } = webhookData;
+    console.log('Processing item_id:', item_id, 'board_id:', board_id);
+    
+    if (!item_id || !board_id) {
+      console.error('Missing item_id or board_id:', { item_id, board_id });
+      return;
+    }
     
     // Extract PDF file URLs from Monday.com item
     const pdfFiles = await getMondayItemFiles(item_id, board_id);
     
     if (!pdfFiles || pdfFiles.length === 0) {
-      return res.status(400).json({ error: 'No PDF files found in Monday.com item' });
+      console.log('No PDF files found in Monday.com item');
+      return;
     }
     
     // Process files through Instabase
@@ -52,18 +91,16 @@ app.post('/webhook/monday-to-instabase', async (req, res) => {
     
     // Create items in Monday.com Extracted Documents board
     await createMondayExtractedItems(groupedDocuments, item_id);
+    */
     
-    res.json({ 
-      success: true, 
-      processedFiles: pdfFiles.length,
-      extractedDocuments: groupedDocuments.length 
-    });
+    console.log('=== PROCESSING COMPLETED SUCCESSFULLY ===');
     
   } catch (error) {
-    console.error('Webhook processing error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('=== BACKGROUND PROCESSING ERROR ===');
+    console.error('Error details:', error);
+    console.error('Stack trace:', error.stack);
   }
-});
+}
 
 // Get PDF files from Monday.com item
 async function getMondayItemFiles(itemId, boardId) {
