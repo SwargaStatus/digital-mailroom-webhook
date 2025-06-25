@@ -5,7 +5,7 @@ import axios   from 'axios';
 const app = express();
 app.use(express.json());
 
-// ────────────────  CONFIG (hard-coded for quick test)  ────────────────
+// ───────────── CONFIG (hard-coded for quick test) ─────────────
 const MONDAY_API_TOKEN        = 'eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjUzMDYzOTcxOSwiYWFpIjoxMSwidWlkIjo2Nzg2NjA4MywiaWFkIjoiMjAyNS0wNi0yNFQyMjoxNjowMC42NTJaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6MjYyMDQ5OTgsInJnbiI6InVzZTEifQ.zv9EsISZnchs7WKSqN2t3UU1GwcLrzPGeaP7ssKIla8';
 const MONDAY_FILE_BOARD_ID    = 9445652448;
 const MONDAY_EXTRACT_BOARD_ID = 9446325745;
@@ -15,7 +15,7 @@ const IB_DEPLOYMENT_ID = '0197a3fe-599d-7bac-a34b-81704cc83beb';
 const IB_WORKSPACE     = 'nileshn_sturgeontire.com';
 const IB_CONTEXT       = 'sturgeontire';
 
-// ────────────────  AXIOS HELPERS  ────────────────
+// ───────────── AXIOS HELPERS ─────────────
 const monday = axios.create({
   baseURL: 'https://api.monday.com/v2',
   headers: { Authorization: `Bearer ${MONDAY_API_TOKEN}` }
@@ -26,14 +26,14 @@ const instabase = axios.create({
   headers: { Authorization: `Bearer ${IB_API_TOKEN}`, 'IB-Context': IB_CONTEXT }
 });
 
-// ────────────────  WEBHOOK  ────────────────
+// ───────────── WEBHOOK ─────────────
 app.post('/webhook/monday-to-instabase', (req, res) => {
   if (req.body?.challenge) return res.json({ challenge: req.body.challenge });
   res.json({ ok: true });
   handleWebhook(req.body).catch(console.error);
 });
 
-// ────────────────  CORE  ────────────────
+// ───────────── CORE ─────────────
 async function handleWebhook(payload) {
   const evt = payload?.event;
   if (!evt) return;
@@ -53,15 +53,16 @@ async function handleWebhook(payload) {
   console.log(`✓ Completed item ${itemId}`);
 }
 
-// ────────────────  MONDAY  ────────────────
+// ───────────── MONDAY.COM ─────────────
 async function fetchFiles(itemId) {
+  // ► inline the ID to avoid variable-binding quirks
   const q = `
-    query ($ids: [Int]) {
-      items (ids: $ids) {
+    {
+      items (ids: [${itemId}]) {
         column_values { id type value text }
       }
     }`;
-  const { data } = await monday.post('', { query: q, variables: { ids: [itemId] }});
+  const { data } = await monday.post('', { query: q });
 
   const col = data.data.items[0].column_values
              .find(c => c.type === 'file' || c.id.includes('file'));
@@ -75,15 +76,16 @@ async function fetchFiles(itemId) {
 }
 
 async function assetUrl(assetId) {
+  // ► inline the assetId as well
   const q = `
-    query ($id: Int!) {
-      assets (ids: [$id]) { public_url }
+    {
+      assets (ids: [${assetId}]) { public_url }
     }`;
-  const { data } = await monday.post('', { query: q, variables: { id: assetId }});
+  const { data } = await monday.post('', { query: q });
   return data.data.assets[0]?.public_url;
 }
 
-// ────────────────  INSTABASE  ────────────────
+// ───────────── INSTABASE ─────────────
 async function runInstabase(files) {
   const { data: batch } = await instabase.post('/batches', {
     name: `mailroom-${Date.now()}`, workspace: IB_WORKSPACE
@@ -115,7 +117,7 @@ async function runInstabase(files) {
   return (await instabase.get(`/runs/${run.id}/results`)).data.files;
 }
 
-// ────────────────  POST-PROCESS  ────────────────
+// ───────────── POST-PROCESS ─────────────
 function groupByInvoice(files) {
   const m = {};
   for (const f of files) {
@@ -157,7 +159,7 @@ async function writeBack(docs, srcId) {
   }
 }
 
-// ────────────────  HEALTH & BOOT  ────────────────
+// ───────────── HEALTH & BOOT ─────────────
 app.get('/health', (_, res) => res.json({ ok: true, ts: Date.now() }));
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Webhook running on :${PORT}`));
