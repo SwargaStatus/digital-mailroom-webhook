@@ -813,3 +813,42 @@ async function createSubitemsForLineItems(parentItemId, items) {
     throw error;
   }
 }
+/* ---------- health + test endpoints ---------- */
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    service: 'Digital-Mailroom Webhook v3.1'
+  });
+});
+
+app.post('/test/process-item/:itemId', async (req, res) => {
+  try {
+    const itemId = req.params.itemId;
+    const files = await getMondayItemFilesWithPublicUrl(
+      itemId,
+      MONDAY_CONFIG.fileUploadsBoardId
+    );
+    res.json({
+      success: true,
+      itemId,
+      filesFound: files.length,
+      files: files.map(f => ({ name: f.name, hasPublicUrl: !!f.public_url }))
+    });
+  } catch (err) {
+    console.error('Test endpoint error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/* ---------- start the server ---------- */
+const PORT = process.env.PORT || 3000;          // Railway injects PORT
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(
+    `🚀 Digital-Mailroom webhook service running on port ${PORT}`
+  );
+});
+
+/* optional for tests */
+module.exports = app;
+
