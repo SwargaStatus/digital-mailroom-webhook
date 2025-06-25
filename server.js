@@ -282,10 +282,10 @@ async function processFilesWithInstabase(files, sourceItemId) {
       console.log(`✅ Successfully uploaded ${file.name} to Instabase`);
     }
     
-    // Step 3: Run deployment
+    // Step 3: Run deployment (CORRECTED API ENDPOINT)
     console.log(`Starting Instabase processing with deployment ${INSTABASE_CONFIG.deploymentId}...`);
     const runResponse = await axios.post(
-      `${INSTABASE_CONFIG.baseUrl}/api/v2/deployments/${INSTABASE_CONFIG.deploymentId}/runs`,
+      `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/deployments/${INSTABASE_CONFIG.deploymentId}/runs`,
       { batch_id: batchId },
       { headers: INSTABASE_CONFIG.headers }
     );
@@ -306,7 +306,7 @@ async function processFilesWithInstabase(files, sourceItemId) {
       await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds
       
       const statusResponse = await axios.get(
-        `${INSTABASE_CONFIG.baseUrl}/api/v2/runs/${runId}`,
+        `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}`,
         { headers: INSTABASE_CONFIG.headers }
       );
       
@@ -323,7 +323,7 @@ async function processFilesWithInstabase(files, sourceItemId) {
         // Try to get more error details
         try {
           const logsResponse = await axios.get(
-            `${INSTABASE_CONFIG.baseUrl}/api/v2/runs/${runId}/logs`,
+            `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}/logs`,
             { headers: INSTABASE_CONFIG.headers }
           );
           console.log('=== INSTABASE ERROR LOGS ===');
@@ -335,7 +335,7 @@ async function processFilesWithInstabase(files, sourceItemId) {
         // Try to get run details for more context
         try {
           const detailsResponse = await axios.get(
-            `${INSTABASE_CONFIG.baseUrl}/api/v2/runs/${runId}/details`,
+            `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}/details`,
             { headers: INSTABASE_CONFIG.headers }
           );
           console.log('=== RUN DETAILS ===');
@@ -356,10 +356,10 @@ async function processFilesWithInstabase(files, sourceItemId) {
     
     console.log('✅ Instabase processing completed successfully');
     
-    // Step 5: Get results
+    // Step 5: Get results (CORRECTED API ENDPOINT)
     console.log('Retrieving extraction results...');
     const resultsResponse = await axios.get(
-      `${INSTABASE_CONFIG.baseUrl}/api/v2/runs/${runId}/results`,
+      `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}/results`,
       { headers: INSTABASE_CONFIG.headers }
     );
     
