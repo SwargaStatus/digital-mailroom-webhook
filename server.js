@@ -594,10 +594,10 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
               );
               
               if (matchingLabel) {
-                columnValues[id] = { "label": matchingLabel.name };
+                columnValues[id] = matchingLabel.name;
                 console.log(`Found matching dropdown option: ${matchingLabel.name}`);
               } else {
-                columnValues[id] = { "label": settings.labels[0].name };
+                columnValues[id] = settings.labels[0].name;
                 console.log(`Using first available dropdown option: ${settings.labels[0].name}`);
               }
             }
