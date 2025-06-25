@@ -273,6 +273,18 @@ async function processFilesWithInstabase(files, sourceItemId) {
       });
       const fileBuffer = Buffer.from(fileResponse.data);
       
+      // Validate the downloaded file
+      console.log(`Downloaded ${file.name}: ${fileBuffer.length} bytes`);
+      
+      // Check if it looks like a valid PDF
+      const pdfHeader = fileBuffer.slice(0, 4).toString();
+      console.log(`PDF header for ${file.name}: ${pdfHeader}`);
+      
+      if (!pdfHeader.startsWith('%PDF')) {
+        console.error(`File ${file.name} doesn't appear to be a valid PDF (header: ${pdfHeader})`);
+        continue;
+      }
+      
       // Upload to Instabase
       await axios.put(
         `${INSTABASE_CONFIG.baseUrl}/api/v2/batches/${batchId}/files/${file.name}`,
