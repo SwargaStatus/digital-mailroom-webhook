@@ -686,69 +686,59 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
 
 async function uploadPdfToMondayItem(itemId, originalFiles, columns) {
   try {
-    if (!originalFiles || originalFiles.length === 0) {
-      console.log('No original files to upload');
-      return;
-    }
-    
-    // Find the Document File column
-    const fileColumn = columns.find(col => 
-      col.title.toLowerCase().includes('document file') || 
-      col.title.toLowerCase().includes('file')
+    if (!originalFiles?.length) return;
+
+    // 1️⃣ locate the File column
+    const fileCol = columns.find(c =>
+      ['file', 'document file'].some(t => c.title.toLowerCase().includes(t))
     );
-    
-    if (!fileColumn) {
-      console.log('No document file column found');
-      return;
-    }
-    
-    console.log(`Uploading PDF to column: ${fileColumn.title} (${fileColumn.id})`);
-    
-    // Upload the first PDF file
-    const pdfFile = originalFiles[0];
-    
-    // Use Monday.com's file upload API with form-data
-    const FormData = require('form-data');
-    const form = new FormData();
-    
-  const fileUploadMutation = `
-    mutation add_file_to_column($item_id: ID!, $column_id: String!, $file: File!) {
-        add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
-          id
+    if (!fileCol) return;
+
+    const pdf = originalFiles[0];                    // first PDF buffer
+
+    /* ---------- build the multipart spec ---------- */
+    const ops = {
+      query: `
+        mutation ($item_id: ID!, $column_id: String!, $file: File!) {
+          add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
+            id
+          }
         }
+      `,
+      variables: {
+        item_id: itemId.toString(),
+        column_id: fileCol.id,
+        file: null                                  // 👈 placeholder!
       }
-    `;
-    
-    form.append('query', fileUploadMutation);
-    form.append('variables', JSON.stringify({
-      item_id: itemId.toString(),
-      column_id: fileColumn.id
-    }));
-    form.append('file', pdfFile.buffer, {
-      filename: pdfFile.name,
+    };
+
+    const map = { "0": ["variables.file"] };       // part “0” -> variables.file
+
+    const form = new FormData();
+    form.append('operations', JSON.stringify(ops));
+    form.append('map',        JSON.stringify(map));
+    form.append('0', pdf.buffer, {                 // part name must match map key
+      filename: pdf.name,
       contentType: 'application/pdf'
     });
-    
-    const uploadResponse = await axios.post('https://api.monday.com/v2/file', form, {
+
+    const resp = await axios.post('https://api.monday.com/v2/file', form, {
       headers: {
-        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
         ...form.getHeaders()
       },
       timeout: 30000
     });
-    
-    if (uploadResponse.data.errors) {
-      console.error('File upload errors:', uploadResponse.data.errors);
+
+    if (resp.data.errors) {
+      console.error('File upload errors:', resp.data.errors);
     } else {
-      console.log(`✅ Uploaded PDF file to Monday.com item ${itemId}`);
+      console.log(`✅ PDF attached to item ${itemId}`);
     }
-    
-  } catch (error) {
-    console.error('Error uploading PDF to Monday.com:', error.message);
-    // Don't throw error - continue with other processing
+  } catch (err) {
+    console.error('Error uploading PDF:', err.message);
   }
 }
-
 async function createSubitemsForLineItems(parentItemId, items) {
   try {
     for (let i = 0; i < items.length; i++) {
