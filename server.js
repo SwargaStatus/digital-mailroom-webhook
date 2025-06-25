@@ -353,7 +353,10 @@ async function processFilesWithInstabase(files, sourceItemId) {
         try {
           const logsResponse = await axios.get(
             `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}/logs`,
-            { headers: INSTABASE_CONFIG.headers }
+            { 
+              headers: INSTABASE_CONFIG.headers,
+              timeout: 15000
+            }
           );
           console.log('=== INSTABASE ERROR LOGS ===');
           console.log(JSON.stringify(logsResponse.data, null, 2));
@@ -365,7 +368,10 @@ async function processFilesWithInstabase(files, sourceItemId) {
         try {
           const detailsResponse = await axios.get(
             `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}/details`,
-            { headers: INSTABASE_CONFIG.headers }
+            { 
+              headers: INSTABASE_CONFIG.headers,
+              timeout: 15000
+            }
           );
           console.log('=== RUN DETAILS ===');
           console.log(JSON.stringify(detailsResponse.data, null, 2));
@@ -602,6 +608,39 @@ function groupPagesByInvoiceNumber(extractedFiles) {
 // Create items in Monday.com Extracted Documents board
 async function createMondayExtractedItems(documents, sourceItemId) {
   try {
+    // First, let's get the board structure to see the actual column IDs
+    console.log('=== GETTING BOARD STRUCTURE ===');
+    const boardQuery = `
+      query {
+        boards(ids: [${MONDAY_CONFIG.extractedDocsBoardId}]) {
+          id
+          name
+          columns {
+            id
+            title
+            type
+          }
+        }
+      }
+    `;
+    
+    const boardResponse = await axios.post('https://api.monday.com/v2', {
+      query: boardQuery
+    }, {
+      headers: {
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    console.log('Board structure:', JSON.stringify(boardResponse.data, null, 2));
+    
+    const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
+    console.log('Available columns:');
+    columns.forEach(col => {
+      console.log(`  ${col.title}: ID = "${col.id}", Type = ${col.type}`);
+    });
+    
     for (const doc of documents) {
       console.log(`Creating Monday.com item for ${doc.document_type} ${doc.invoice_number}...`);
       
@@ -622,24 +661,32 @@ async function createMondayExtractedItems(documents, sourceItemId) {
         }
       };
       
-      // Create main item with proper column mapping based on your Monday.com board
-      const columnValues = {
-        supplier: escapedSupplier,
-        document_number: escapedInvoiceNumber,
-        document_type: escapedDocumentType,
-        document_date: formatDate(doc.document_date),
-        due_date: formatDate(doc.due_date),
-        amount: doc.total_amount || 0,
-        extraction_status: "Extracted"
-      };
+      // Map to the actual column IDs we find (we'll update this based on what we discover)
+      const columnValues = {};
       
-      // Add additional due dates if they exist (you'll need to create these columns in Monday.com)
-      if (doc.due_date_2) {
-        columnValues.due_date_2 = formatDate(doc.due_date_2);
-      }
-      if (doc.due_date_3) {
-        columnValues.due_date_3 = formatDate(doc.due_date_3);
-      }
+      // Try to map to the most likely column IDs based on your board export
+      columns.forEach(col => {
+        const title = col.title.toLowerCase();
+        const id = col.id;
+        
+        if (title.includes('supplier')) {
+          columnValues[id] = escapedSupplier;
+        } else if (title.includes('document number') || title.includes('number')) {
+          columnValues[id] = escapedInvoiceNumber;
+        } else if (title.includes('document type') || title.includes('type')) {
+          columnValues[id] = escapedDocumentType;
+        } else if (title.includes('document date') || (title.includes('date') && !title.includes('due'))) {
+          columnValues[id] = formatDate(doc.document_date);
+        } else if (title.includes('due date')) {
+          columnValues[id] = formatDate(doc.due_date);
+        } else if (title.includes('amount') && !title.includes('total')) {
+          columnValues[id] = doc.total_amount || 0;
+        } else if (title.includes('extraction status') || title.includes('status')) {
+          columnValues[id] = "Extracted";
+        }
+      });
+      
+      console.log('Mapped column values:', columnValues);
       
       const mutation = `
         mutation {
@@ -654,7 +701,7 @@ async function createMondayExtractedItems(documents, sourceItemId) {
         }
       `;
       
-      console.log('Creating item with column values:', columnValues);
+      console.log('Creating item with mutation:', mutation);
       
       const response = await axios.post('https://api.monday.com/v2', {
         query: mutation
