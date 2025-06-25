@@ -390,8 +390,8 @@ function groupPagesByInvoiceNumber(extractedFiles) {
       
       // Get invoice number (handle different field names)
       const invoiceNumber = 
-        fields.invoice_number?.value || 
         fields.document_number?.value || 
+        fields.invoice_number?.value || 
         fields.number?.value ||
         'unknown';
       
@@ -407,8 +407,13 @@ function groupPagesByInvoiceNumber(extractedFiles) {
           document_type: fields.document_type?.value || 'invoice',
           supplier_name: '',
           total_amount: 0,
+          tax_amount: 0,
           document_date: '',
           due_date: '',
+          due_date_2: '',
+          due_date_3: '',
+          terms: '',
+          items: [], // For subitems
           pages: [],
           confidence: 0
         };
@@ -422,18 +427,62 @@ function groupPagesByInvoiceNumber(extractedFiles) {
         fields: fields
       });
       
-      // Update document-level fields from header pages or any page with the data
-      if (fields.supplier_name?.value) {
-        group.supplier_name = fields.supplier_name.value;
+      // Update document-level fields from any page with the data
+      if (fields.supplier?.value) {
+        group.supplier_name = fields.supplier.value;
       }
-      if (fields.total_amount?.value) {
-        group.total_amount = fields.total_amount.value;
+      if (fields.total?.value) {
+        // Clean up the total amount - remove currency symbols and convert to number
+        const totalStr = String(fields.total.value).replace(/[^0-9.-]/g, '');
+        group.total_amount = parseFloat(totalStr) || 0;
+      }
+      if (fields.tax?.value) {
+        const taxStr = String(fields.tax.value).replace(/[^0-9.-]/g, '');
+        group.tax_amount = parseFloat(taxStr) || 0;
       }
       if (fields.document_date?.value) {
         group.document_date = fields.document_date.value;
       }
+      if (fields.terms?.value) {
+        group.terms = fields.terms.value;
+      }
+      
+      // Handle Due Date (could be single date or table with multiple dates)
       if (fields.due_date?.value) {
-        group.due_date = fields.due_date.value;
+        const dueDateValue = fields.due_date.value;
+        
+        // If it's a table/array, extract multiple dates
+        if (Array.isArray(dueDateValue)) {
+          group.due_date = dueDateValue[0] || '';
+          group.due_date_2 = dueDateValue[1] || '';
+          group.due_date_3 = dueDateValue[2] || '';
+        } else if (typeof dueDateValue === 'object' && dueDateValue.rows) {
+          // Handle table format
+          const dates = dueDateValue.rows.map(row => row.date || row[0]).filter(Boolean);
+          group.due_date = dates[0] || '';
+          group.due_date_2 = dates[1] || '';
+          group.due_date_3 = dates[2] || '';
+        } else {
+          // Single date
+          group.due_date = String(dueDateValue);
+        }
+      }
+      
+      // Handle Items (for subitems)
+      if (fields.items?.value) {
+        const itemsValue = fields.items.value;
+        
+        if (Array.isArray(itemsValue)) {
+          group.items = itemsValue;
+        } else if (typeof itemsValue === 'object' && itemsValue.rows) {
+          // Handle table format for items
+          group.items = itemsValue.rows.map(row => ({
+            description: row.description || row[0] || '',
+            quantity: row.quantity || row[1] || '',
+            unit_price: row.unit_price || row[2] || '',
+            amount: row.amount || row[3] || ''
+          }));
+        }
       }
       
       // Calculate average confidence
@@ -460,19 +509,52 @@ async function createMondayExtractedItems(documents, sourceItemId) {
       const escapedSupplier = (doc.supplier_name || '').replace(/"/g, '\\"');
       const escapedInvoiceNumber = (doc.invoice_number || '').replace(/"/g, '\\"');
       const escapedDocumentType = (doc.document_type || '').replace(/"/g, '\\"');
+      const escapedTerms = (doc.terms || '').replace(/"/g, '\\"');
+      
+      // Format dates for Monday.com (YYYY-MM-DD format)
+      const formatDate = (dateStr) => {
+        if (!dateStr) return '';
+        try {
+          const date = new Date(dateStr);
+          return date.toISOString().split('T')[0];
+        } catch (e) {
+          return String(dateStr).slice(0, 10); // Try to extract YYYY-MM-DD format
+        }
+      };
+      
+      // Create main item with proper column mapping based on your Monday.com board
+      const columnValues = {
+        supplier: escapedSupplier,
+        document_number: escapedInvoiceNumber,
+        document_type: escapedDocumentType,
+        document_date: formatDate(doc.document_date),
+        due_date: formatDate(doc.due_date),
+        amount: doc.total_amount || 0,
+        extraction_status: "Extracted"
+      };
+      
+      // Add additional due dates if they exist (you'll need to create these columns in Monday.com)
+      if (doc.due_date_2) {
+        columnValues.due_date_2 = formatDate(doc.due_date_2);
+      }
+      if (doc.due_date_3) {
+        columnValues.due_date_3 = formatDate(doc.due_date_3);
+      }
       
       const mutation = `
         mutation {
           create_item(
             board_id: ${MONDAY_CONFIG.extractedDocsBoardId}
             item_name: "${escapedDocumentType.toUpperCase()} ${escapedInvoiceNumber}"
-            column_values: "{\\"source_request_id\\": \\"${sourceItemId}\\", \\"document_number\\": \\"${escapedInvoiceNumber}\\", \\"document_type\\": \\"${escapedDocumentType}\\", \\"amount\\": ${doc.total_amount || 0}, \\"supplier\\": \\"${escapedSupplier}\\", \\"document_date\\": \\"${doc.document_date}\\", \\"due_date\\": \\"${doc.due_date}\\", \\"extraction_status\\": \\"Extracted\\"}"
+            column_values: ${JSON.stringify(JSON.stringify(columnValues))}
           ) {
             id
             name
           }
         }
       `;
+      
+      console.log('Creating item with column values:', columnValues);
       
       const response = await axios.post('https://api.monday.com/v2', {
         query: mutation
@@ -485,13 +567,70 @@ async function createMondayExtractedItems(documents, sourceItemId) {
       
       if (response.data.errors) {
         console.error('Monday.com GraphQL errors:', response.data.errors);
-      } else {
-        console.log(`✅ Created Monday.com item for ${doc.document_type} ${doc.invoice_number} (ID: ${response.data.data.create_item.id})`);
+        continue;
+      }
+      
+      const createdItemId = response.data.data.create_item.id;
+      console.log(`✅ Created Monday.com item for ${doc.document_type} ${doc.invoice_number} (ID: ${createdItemId})`);
+      
+      // Create subitems for line items if they exist
+      if (doc.items && doc.items.length > 0) {
+        console.log(`Creating ${doc.items.length} subitems for line items...`);
+        await createSubitemsForLineItems(createdItemId, doc.items, doc.invoice_number);
       }
     }
   } catch (error) {
     console.error('Error creating Monday.com items:', error);
     console.error('Error response:', error.response?.data);
+    throw error;
+  }
+}
+
+// Create subitems for inventory line items
+async function createSubitemsForLineItems(parentItemId, items, invoiceNumber) {
+  try {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      
+      // Clean up item data
+      const description = String(item.description || item.desc || '').replace(/"/g, '\\"');
+      const quantity = parseFloat(String(item.quantity || item.qty || '0').replace(/[^0-9.-]/g, '')) || 0;
+      const unitPrice = parseFloat(String(item.unit_price || item.price || '0').replace(/[^0-9.-]/g, '')) || 0;
+      const amount = parseFloat(String(item.amount || item.total || '0').replace(/[^0-9.-]/g, '')) || 0;
+      
+      const subitemName = `${description.substring(0, 50)}${description.length > 50 ? '...' : ''}`;
+      
+      // Create subitem with inventory data
+      const subitemMutation = `
+        mutation {
+          create_subitem(
+            parent_item_id: ${parentItemId}
+            item_name: "${subitemName}"
+            column_values: "{\\"quantity\\": ${quantity}, \\"unit_price\\": ${unitPrice}, \\"amount\\": ${amount}, \\"description\\": \\"${description}\\"}"
+          ) {
+            id
+            name
+          }
+        }
+      `;
+      
+      const subitemResponse = await axios.post('https://api.monday.com/v2', {
+        query: subitemMutation
+      }, {
+        headers: {
+          'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      if (subitemResponse.data.errors) {
+        console.error(`Error creating subitem ${i + 1}:`, subitemResponse.data.errors);
+      } else {
+        console.log(`✅ Created subitem ${i + 1}: ${subitemName}`);
+      }
+    }
+  } catch (error) {
+    console.error('Error creating subitems:', error);
     throw error;
   }
 }
