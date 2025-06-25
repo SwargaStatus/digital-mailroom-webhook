@@ -176,10 +176,25 @@ async function getMondayItemFiles(itemId, boardId) {
       throw new Error('No files in file column');
     }
     
-    const filesData = JSON.parse(fileColumn.value);
-    console.log('Files data:', filesData);
+    let filesData;
+    try {
+      filesData = JSON.parse(fileColumn.value);
+    } catch (e) {
+      console.error('Error parsing file column value:', fileColumn.value);
+      throw new Error('Invalid file data format');
+    }
     
-    return filesData.files || [];
+    console.log('Parsed files data:', JSON.stringify(filesData, null, 2));
+    
+    // Monday.com file structure might be different
+    const files = filesData.files || filesData || [];
+    
+    if (!Array.isArray(files)) {
+      console.error('Files data is not an array:', files);
+      throw new Error('Invalid files structure');
+    }
+    
+    return files;
     
   } catch (error) {
     console.error('Error getting Monday files:', error);
@@ -204,10 +219,58 @@ async function processFilesWithInstabase(files, sourceItemId) {
     // Step 2: Upload files to batch
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      console.log('Uploading file:', file.name);
+      console.log('Processing file:', JSON.stringify(file, null, 2));
+      
+      // Monday.com files have different URL structure
+      let fileUrl = file.url || file.public_url;
+      
+      if (!fileUrl && file.assetId) {
+        // Use Monday.com assets API to get the file
+        try {
+          const assetQuery = `
+            query {
+              assets(ids: [${file.assetId}]) {
+                id
+                name
+                url
+                file_extension
+                file_size
+              }
+            }
+          `;
+          
+          const assetResponse = await axios.post('https://api.monday.com/v2', {
+            query: assetQuery
+          }, {
+            headers: {
+              'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+              'Content-Type': 'application/json'
+            }
+          });
+          
+          if (assetResponse.data.data?.assets?.[0]?.url) {
+            fileUrl = assetResponse.data.data.assets[0].url;
+            console.log('Got asset URL from Monday.com API:', fileUrl);
+          }
+        } catch (assetError) {
+          console.error('Error getting asset URL:', assetError);
+        }
+      }
+      
+      if (!fileUrl) {
+        console.error('No URL found for file:', file);
+        continue;
+      }
+      
+      console.log('Downloading file from URL:', fileUrl);
       
       // Download file from Monday.com
-      const fileResponse = await axios.get(file.url, { responseType: 'arraybuffer' });
+      const fileResponse = await axios.get(fileUrl, { 
+        responseType: 'arraybuffer',
+        headers: {
+          'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`
+        }
+      });
       const fileBuffer = Buffer.from(fileResponse.data);
       
       // Upload to Instabase
