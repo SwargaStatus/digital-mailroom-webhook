@@ -61,37 +61,54 @@ async function processWebhookData(webhookData) {
     console.log('=== STARTING BACKGROUND PROCESSING ===');
     console.log('Webhook data structure:', JSON.stringify(webhookData, null, 2));
     
-    // For now, just log what we receive and return success
-    console.log('=== WEBHOOK PROCESSING COMPLETED (LOGGING ONLY) ===');
-    return;
-    
-    // TODO: Re-enable this once we understand the data structure
-    /*
-    const { item_id, board_id, column_values } = webhookData;
-    console.log('Processing item_id:', item_id, 'board_id:', board_id);
-    
-    if (!item_id || !board_id) {
-      console.error('Missing item_id or board_id:', { item_id, board_id });
+    // Extract Monday.com event data
+    const event = webhookData.event;
+    if (!event) {
+      console.log('No event data found');
       return;
     }
     
-    // Extract PDF file URLs from Monday.com item
-    const pdfFiles = await getMondayItemFiles(item_id, board_id);
+    // Get the item details from Monday.com format
+    const itemId = event.pulseId;
+    const boardId = event.boardId;
+    const columnId = event.columnId;
+    const newValue = event.value?.label?.text;
+    
+    console.log('Extracted data:', {
+      itemId,
+      boardId, 
+      columnId,
+      newValue
+    });
+    
+    // Only process if status changed to "Processing"
+    if (columnId !== 'status' || newValue !== 'Processing') {
+      console.log('Not a status change to Processing, skipping');
+      return;
+    }
+    
+    console.log('Status changed to Processing, getting item files...');
+    
+    // Get the full item data including files
+    const pdfFiles = await getMondayItemFiles(itemId, boardId);
     
     if (!pdfFiles || pdfFiles.length === 0) {
       console.log('No PDF files found in Monday.com item');
       return;
     }
     
+    console.log(`Found ${pdfFiles.length} PDF files, sending to Instabase...`);
+    
     // Process files through Instabase
-    const extractedData = await processFilesWithInstabase(pdfFiles, item_id);
+    const extractedData = await processFilesWithInstabase(pdfFiles, itemId);
     
     // Group pages by invoice number
     const groupedDocuments = groupPagesByInvoiceNumber(extractedData);
     
+    console.log(`Grouped into ${groupedDocuments.length} documents, creating Monday.com items...`);
+    
     // Create items in Monday.com Extracted Documents board
-    await createMondayExtractedItems(groupedDocuments, item_id);
-    */
+    await createMondayExtractedItems(groupedDocuments, itemId);
     
     console.log('=== PROCESSING COMPLETED SUCCESSFULLY ===');
     
@@ -105,41 +122,68 @@ async function processWebhookData(webhookData) {
 // Get PDF files from Monday.com item
 async function getMondayItemFiles(itemId, boardId) {
   try {
+    console.log(`Getting files for item ${itemId} on board ${boardId}`);
+    
     const query = `
       query {
         items(ids: [${itemId}]) {
+          id
+          name
           column_values {
             id
             value
             text
+            type
           }
         }
       }
     `;
     
+    console.log('Monday.com GraphQL query:', query);
+    
     const response = await axios.post('https://api.monday.com/v2', {
       query: query
     }, {
       headers: {
-        'Authorization': MONDAY_CONFIG.apiKey,
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
         'Content-Type': 'application/json'
       }
     });
     
-    // Extract file URLs from the PDF Attachments column
-    const fileColumn = response.data.data.items[0].column_values.find(
-      col => col.id === 'files' // Assuming 'files' is your PDF Attachments column ID
+    console.log('Monday.com API response:', JSON.stringify(response.data, null, 2));
+    
+    if (!response.data.data || !response.data.data.items || response.data.data.items.length === 0) {
+      throw new Error('Item not found in Monday.com');
+    }
+    
+    const item = response.data.data.items[0];
+    console.log('Found item:', item.name);
+    
+    // Find the files column (look for file type columns)
+    const fileColumns = item.column_values.filter(col => 
+      col.type === 'file' || col.id === 'files' || col.id.includes('file')
     );
     
-    if (!fileColumn || !fileColumn.value) {
-      throw new Error('No files found in Monday.com item');
+    console.log('File columns found:', fileColumns);
+    
+    if (fileColumns.length === 0) {
+      throw new Error('No file columns found');
+    }
+    
+    // Get files from the first file column
+    const fileColumn = fileColumns[0];
+    if (!fileColumn.value) {
+      throw new Error('No files in file column');
     }
     
     const filesData = JSON.parse(fileColumn.value);
+    console.log('Files data:', filesData);
+    
     return filesData.files || [];
     
   } catch (error) {
     console.error('Error getting Monday files:', error);
+    console.error('Error details:', error.response?.data || error.message);
     throw error;
   }
 }
