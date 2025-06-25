@@ -661,28 +661,51 @@ async function createMondayExtractedItems(documents, sourceItemId) {
         }
       };
       
-      // Map to the actual column IDs we find (we'll update this based on what we discover)
+      // Map to the actual column IDs we find
       const columnValues = {};
       
       // Try to map to the most likely column IDs based on your board export
       columns.forEach(col => {
         const title = col.title.toLowerCase();
         const id = col.id;
+        const type = col.type;
         
         if (title.includes('supplier')) {
           columnValues[id] = escapedSupplier;
-        } else if (title.includes('document number') || title.includes('number')) {
+        } else if (title.includes('document number') || (title.includes('number') && !title.includes('total'))) {
           columnValues[id] = escapedInvoiceNumber;
-        } else if (title.includes('document type') || title.includes('type')) {
-          columnValues[id] = escapedDocumentType;
+        } else if (title.includes('document type') || (title.includes('type') && !title.includes('document'))) {
+          // For dropdown columns, we need to be more careful
+          if (type === 'dropdown') {
+            // Let's just skip dropdowns for now since they need specific labels
+            console.log(`Skipping dropdown column "${title}" - needs manual configuration`);
+          } else {
+            columnValues[id] = escapedDocumentType;
+          }
         } else if (title.includes('document date') || (title.includes('date') && !title.includes('due'))) {
           columnValues[id] = formatDate(doc.document_date);
         } else if (title.includes('due date')) {
           columnValues[id] = formatDate(doc.due_date);
-        } else if (title.includes('amount') && !title.includes('total')) {
+        } else if (title.includes('amount') && !title.includes('total') && !title.includes('tax')) {
           columnValues[id] = doc.total_amount || 0;
-        } else if (title.includes('extraction status') || title.includes('status')) {
-          columnValues[id] = "Extracted";
+        } else if (title.includes('total amount')) {
+          columnValues[id] = doc.total_amount || 0;
+        } else if (title.includes('tax amount')) {
+          columnValues[id] = doc.tax_amount || 0;
+        } else if (title.includes('extraction status')) {
+          // For status columns, use a simple string
+          if (type === 'status') {
+            columnValues[id] = { "label": "Extracted" };
+          } else {
+            columnValues[id] = "Extracted";
+          }
+        } else if (title.includes('status') && !title.includes('extraction')) {
+          // Generic status column
+          if (type === 'status') {
+            columnValues[id] = { "label": "Done" };
+          } else {
+            columnValues[id] = "Extracted";
+          }
         }
       });
       
