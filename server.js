@@ -1,6 +1,6 @@
 // Digital Mailroom Webhook — FINAL VERSION with Source ID & Subitem Index Fixes
 // -----------------------------------------------------------------------------
-// This version fixes Source request ID linking and subitem indexing
+// This version fixes Source Request ID linking and subitem indexing
 // -----------------------------------------------------------------------------
 
 const express   = require('express');
@@ -774,11 +774,11 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
     
     const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
     
-    // 🔧 FIXED: Find the actual "Source request ID" column instead of "name"
+    // 🔧 FIXED: Find the actual "Source Request ID" column instead of "name"
     const sourceRequestIdColumn = columns.find(col => 
-      col.title.toLowerCase().includes('Source request id') || 
+      col.title.toLowerCase().includes('source request id') || 
       col.title.toLowerCase().includes('source id') ||
-      col.title.toLowerCase() === 'Source request id'
+      col.title.toLowerCase() === 'source request id'
     );
     
     log('info', 'SOURCE_REQUEST_ID_COLUMN_SEARCH', {
@@ -810,7 +810,7 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
     if (!sourceRequestIdColumn) {
       log('warn', 'MISSING_SOURCE_REQUEST_ID_COLUMN', {
         requestId,
-        warning: 'No Source request ID column found - cannot link Instabase run ID'
+        warning: 'No Source Request ID column found - cannot link Instabase run ID'
       });
     }
     
@@ -917,7 +917,7 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         invoiceNumber: doc.invoice_number
       });
       
-      // 🔧 FIXED: Update the correct Source request ID column with Instabase Run ID
+      // 🔧 FIXED: Update the correct Source Request ID column with Instabase Run ID
       if (instabaseRunId && sourceRequestIdColumn) {
         try {
           const updateMutation = `
@@ -1235,7 +1235,7 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
   }
 }
 
-// 🔧 UPDATED: buildColumnValues function to include Source request ID mapping
+// 🔧 UPDATED: buildColumnValues function to include Source Request ID mapping
 function buildColumnValues(columns, doc, formatDate, instabaseRunId = null) {
   const columnValues = {};
   
@@ -1252,10 +1252,10 @@ function buildColumnValues(columns, doc, formatDate, instabaseRunId = null) {
     
     if (title.includes('supplier')) {
       columnValues[id] = doc.supplier_name || '';
-    } else if (title.includes('Source request id') || title.includes('source id')) {
-      // 🔧 FIXED: Map Instabase Run ID to Source request ID column
+    } else if (title.includes('source request id') || title.includes('source id')) {
+      // 🔧 FIXED: Map Instabase Run ID to Source Request ID column
       columnValues[id] = instabaseRunId || '';
-      console.log(`[DEBUG] Mapped Instabase Run ID: ${instabaseRunId} to Source request ID column ${col.id}`);
+      console.log(`[DEBUG] Mapped Instabase Run ID: ${instabaseRunId} to Source Request ID column ${col.id}`);
     } else if (title.includes('reference number') || title === 'reference number' || title.includes('reference')) {
       columnValues[id] = doc.reference_number || '';
       console.log(`[DEBUG] Mapped reference number: ${doc.reference_number} to column ${col.id}`);
@@ -1362,7 +1362,7 @@ app.get('/test/subitem-board-structure', async (req, res) => {
     const mainColumns = mainBoardResponse.data.data.boards[0].columns;
     const subitemsColumn = mainColumns.find(col => col.type === 'subtasks');
     const sourceRequestIdColumn = mainColumns.find(col => 
-      col.title.toLowerCase().includes('Source request id') || 
+      col.title.toLowerCase().includes('source request id') || 
       col.title.toLowerCase().includes('source id')
     );
     
@@ -1582,10 +1582,10 @@ app.listen(PORT, '0.0.0.0', () => {
 
 // -----------------------------------------------------------------------------
 //  🔧 FINAL FIXES APPLIED:
-//  1. ✅ FIXED Source request ID linking - now finds the correct column by title
+//  1. ✅ FIXED Source Request ID linking - now finds the correct column by title
 //  2. ✅ FIXED Subitem indexing - uses "Line 1", "Line 2", etc. instead of item numbers
-//  3. ✅ Enhanced column mapping to include Source request ID in buildColumnValues
-//  4. ✅ Improved logging for both Source request ID and subitem creation
-//  5. ✅ Updated test endpoints to show Source request ID column info
+//  3. ✅ Enhanced column mapping to include Source Request ID in buildColumnValues
+//  4. ✅ Improved logging for both Source Request ID and subitem creation
+//  5. ✅ Updated test endpoints to show Source Request ID column info
 //  6. ✅ Better error handling and fallbacks for missing columns
 // -----------------------------------------------------------------------------
