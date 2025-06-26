@@ -92,7 +92,7 @@ async function processWebhookData(body, requestId) {
       return;
     }
 
-    const { files: extracted, originalFiles } = await processFilesWithInstabase(pdfFiles, requestId);
+    const { files: extracted, originalFiles, runId } = await processFilesWithInstabase(pdfFiles, requestId);
     const groups = groupPagesByInvoiceNumber(extracted, requestId);
     
     // 🔧 DEBUG: Log the groups after processing to verify items are found
@@ -106,7 +106,7 @@ async function processWebhookData(body, requestId) {
       }))
     });
     
-    await createMondayExtractedItems(groups, itemId, originalFiles, requestId);
+    await createMondayExtractedItems(groups, itemId, originalFiles, requestId, runId);
     
     log('info', 'PROCESSING_COMPLETE', { requestId, itemId });
   } catch (err) {
@@ -286,7 +286,8 @@ async function processFilesWithInstabase(files, requestId) {
     
     return { 
       files: resultsResponse.data.files, 
-      originalFiles: originalFiles 
+      originalFiles: originalFiles,
+      runId: runId  // Return the run ID so we can link it
     };
     
   } catch (error) {
@@ -743,7 +744,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 7️⃣  ENHANCED MONDAY ITEMS CREATION WITH FIXED SUBITEMS
 // ----------------------------------------------------------------------------
-async function createMondayExtractedItems(documents, sourceItemId, originalFiles, requestId) {
+async function createMondayExtractedItems(documents, sourceItemId, originalFiles, requestId, instabaseRunId) {
   try {
     log('info', 'STAGE: Getting board structure', { requestId });
     
@@ -893,6 +894,45 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         documentType: doc.document_type,
         invoiceNumber: doc.invoice_number
       });
+      
+      // 🔧 NEW: Update the Source Request ID column with Instabase Run ID
+      if (instabaseRunId) {
+        try {
+          const updateMutation = `
+            mutation {
+              change_column_value(
+                item_id: ${createdItemId}
+                board_id: ${MONDAY_CONFIG.extractedDocsBoardId}
+                column_id: "name"
+                value: "${escapedDocumentType.toUpperCase()} ${escapedInvoiceNumber} (${instabaseRunId})"
+              ) {
+                id
+              }
+            }
+          `;
+          
+          await axios.post('https://api.monday.com/v2', {
+            query: updateMutation
+          }, {
+            headers: {
+              'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+              'Content-Type': 'application/json'
+            }
+          });
+          
+          log('info', 'INSTABASE_RUN_ID_LINKED', {
+            requestId,
+            itemId: createdItemId,
+            instabaseRunId: instabaseRunId
+          });
+        } catch (linkError) {
+          log('error', 'FAILED_TO_LINK_RUN_ID', {
+            requestId,
+            itemId: createdItemId,
+            error: linkError.message
+          });
+        }
+      }
       
       // Upload PDF file
       if (originalFiles && originalFiles.length > 0) {
@@ -1455,14 +1495,15 @@ app.post('/test/process-item/:id', async (req, res) => {
       return res.json({ success: false, message: 'No PDF files found' });
     }
     
-    const { files: extracted, originalFiles } = await processFilesWithInstabase(files, requestId);
+    const { files: extracted, originalFiles, runId } = await processFilesWithInstabase(files, requestId);
     const groups = groupPagesByInvoiceNumber(extracted, requestId);
-    await createMondayExtractedItems(groups, req.params.id, originalFiles, requestId);
+    await createMondayExtractedItems(groups, req.params.id, originalFiles, requestId, runId);
     
     res.json({ 
       success: true, 
       message: 'Processing completed',
       requestId,
+      instabaseRunId: runId,
       filesProcessed: files.length,
       groupsCreated: groups.length,
       itemsWithLineItems: groups.filter(g => g.items.length > 0).length
