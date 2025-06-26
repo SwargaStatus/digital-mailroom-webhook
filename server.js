@@ -1084,9 +1084,10 @@ app.get('/health', (req, res) => {
   });
 });
 
-app.get('/test/board-structure', async (req, res) => {
+app.get('/test/subitem-board-structure', async (req, res) => {
   try {
-    const boardQuery = `
+    // Get main board structure
+    const mainBoardQuery = `
       query {
         boards(ids: [${MONDAY_CONFIG.extractedDocsBoardId}]) {
           id
@@ -1101,8 +1102,8 @@ app.get('/test/board-structure', async (req, res) => {
       }
     `;
     
-    const response = await axios.post('https://api.monday.com/v2', {
-      query: boardQuery
+    const mainBoardResponse = await axios.post('https://api.monday.com/v2', {
+      query: mainBoardQuery
     }, {
       headers: {
         'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
@@ -1110,13 +1111,97 @@ app.get('/test/board-structure', async (req, res) => {
       }
     });
     
+    const mainColumns = mainBoardResponse.data.data.boards[0].columns;
+    const subitemsColumn = mainColumns.find(col => col.type === 'subtasks');
+    
+    if (!subitemsColumn) {
+      return res.json({ 
+        success: false, 
+        error: 'No subitems column found',
+        mainBoardColumns: mainColumns
+      });
+    }
+    
+    // Parse subitems column settings to get linked board ID
+    let settings = {};
+    try {
+      settings = JSON.parse(subitemsColumn.settings_str || '{}');
+    } catch (e) {
+      return res.json({
+        success: false,
+        error: 'Could not parse subitems column settings',
+        rawSettings: subitemsColumn.settings_str
+      });
+    }
+    
+    const subitemBoardId = Array.isArray(settings.boardIds)
+      ? settings.boardIds[0]
+      : settings.linked_board_id;
+    
+    if (!subitemBoardId) {
+      return res.json({
+        success: false,
+        error: 'No subitem board ID found in settings',
+        settings: settings
+      });
+    }
+    
+    // Get subitem board structure
+    const subitemBoardQuery = `
+      query {
+        boards(ids: [${subitemBoardId}]) {
+          id
+          name
+          columns {
+            id
+            title
+            type
+            settings_str
+          }
+        }
+      }
+    `;
+    
+    const subitemBoardResponse = await axios.post('https://api.monday.com/v2', {
+      query: subitemBoardQuery
+    }, {
+      headers: {
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const subitemColumns = subitemBoardResponse.data.data.boards[0].columns;
+    
     res.json({
       success: true,
-      board: response.data.data.boards[0],
-      hasSubitemsColumn: !!response.data.data.boards[0].columns.find(c => c.type === 'subtasks')
+      mainBoard: {
+        id: MONDAY_CONFIG.extractedDocsBoardId,
+        name: mainBoardResponse.data.data.boards[0].name,
+        subitemsColumn: {
+          id: subitemsColumn.id,
+          title: subitemsColumn.title,
+          settings: settings
+        }
+      },
+      subitemBoard: {
+        id: subitemBoardId,
+        name: subitemBoardResponse.data.data.boards[0].name,
+        columns: subitemColumns.map(col => ({
+          id: col.id,
+          title: col.title,
+          type: col.type,
+          titleLowercase: col.title.trim().toLowerCase()
+        }))
+      }
     });
+    
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ 
+      success: false, 
+      error: error.message,
+      stack: error.stack 
+    });
   }
 });
 
