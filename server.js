@@ -868,8 +868,14 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
     
     log('info', 'SUBITEM_COLUMNS_FETCHED', {
       requestId,
+      subitemBoardId,
       columnCount: subitemColumns.length,
-      columns: subitemColumns.map(c => ({ id: c.id, title: c.title, type: c.type }))
+      columns: subitemColumns.map(c => ({ 
+        id: c.id, 
+        title: c.title, 
+        type: c.type,
+        titleLowercase: c.title.trim().toLowerCase()
+      }))
     });
 
     // 3️⃣ Loop each line item and map into those columns
