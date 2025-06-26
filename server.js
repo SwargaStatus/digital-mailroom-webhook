@@ -1,53 +1,315 @@
-function groupPagesByInvoiceNumber(extractedFiles) {
-  console.log('=== GROUPING DEBUG ===');
-  console.log('🚨🚨🚨 NEW CODE DEPLOYED - TESTING SUBITEMS 🚨🚨🚨');
-  console.log('Input files:', extractedFiles?.length || 0);
-  
-  // 🚨 IMMEDIATE DEBUG - Let's see what we're working with
-  if (extractedFiles && extractedFiles.length > 0) {
-    console.log('📄 FILE 0 EXISTS, checking documents...');
-    const file = extractedFiles[0];
-    if (file.documents && file.documents.length > 0) {
-      console.log(`📄 FOUND ${file.documents.length} DOCUMENTS`);
+async function createMondayExtractedItems(documents, sourceItemId, originalFiles, requestId) {
+  try {
+    log('info', 'STAGE: Getting board structure', { requestId });
+    
+    const boardQuery = `
+      query {
+        boards(ids: [${MONDAY_CONFIG.extractedDocsBoardId}]) {
+          id
+          name
+          columns {
+            id
+            title
+            type
+            settings_str
+          }
+        }
+      }
+    `;
+    
+    const boardResponse = await axios.post('https://api.monday.com/v2', {
+      query: boardQuery
+    }, {
+      headers: {
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
+    
+    // 🔧 FIX 6: Validate subitems column exists
+    const subitemsColumn = columns.find(col => col.type === 'subtasks');
+    log('info', 'BOARD_VALIDATION', {
+      requestId,
+      totalColumns: columns.length,
+      hasSubitemsColumn: !!subitemsColumn,
+      subitemsColumnId: subitemsColumn?.id,
+      subitemsColumnTitle: subitemsColumn?.title
+    });
+    
+    if (!subitemsColumn) {
+      log('error', 'MISSING_SUBITEMS_COLUMN', {
+        requestId,
+        error: 'Board missing subitems column - cannot create subitems',
+        availableColumns: columns.map(c => ({ id: c.id, title: c.title, type: c.type }))
+      });
+    }
+    
+    for (const doc of documents) {
+      log('info', 'CREATING_MONDAY_ITEM', {
+        requestId,
+        documentType: doc.document_type,
+        invoiceNumber: doc.invoice_number,
+        itemCount: doc.items?.length || 0
+      });
       
-      file.documents.forEach((doc, docIndex) => {
-        console.log(`📄 DOC ${docIndex} - Fields available:`, Object.keys(doc.fields || {}));
+      const escapedSupplier = (doc.supplier_name || '').replace(/"/g, '\\"');
+      const escapedInvoiceNumber = (doc.invoice_number || '').replace(/"/g, '\\"');
+      const escapedDocumentType = (doc.document_type || '').replace(/"/g, '\\"');
+      
+      const formatDate = (dateStr) => {
+        if (!dateStr) return '';
+        try {
+          const date = new Date(dateStr);
+          return date.toISOString().split('T')[0];
+        } catch (e) {
+          return String(dateStr).slice(0, 10);
+        }
+      };
+      
+      const columnValues = {};
+      
+      // Map extracted data to Monday.com columns
+      columns.forEach(col => {
+        const title = col.title.toLowerCase();
+        const id = col.id;
+        const type = col.type;
         
-        // Check field 7 specifically
-        const field7 = doc.fields?.['7'];
-        console.log(`📄 DOC ${docIndex} - Field 7: exists=${!!field7}, hasValue=${!!field7?.value}, type=${typeof field7?.value}`);
-        
-        if (field7?.value && Array.isArray(field7.value)) {
-          console.log(`📄 DOC ${docIndex} - Field 7 is array with ${field7.value.length} items!`);
-          if (field7.value.length > 0) {
-            console.log(`📄 DOC ${docIndex} - First item in field 7:`, JSON.stringify(field7.value[0]));
+        if (title.includes('supplier')) {
+          columnValues[id] = escapedSupplier;
+        } else if (title.includes('document number') || (title.includes('number') && !title.includes('total'))) {
+          columnValues[id] = escapedInvoiceNumber;
+        } else if (title.includes('document type') || (title.includes('type') && !title.includes('document'))) {
+          if (type === 'dropdown') {
+            let settings = {};
+            try {
+              settings = JSON.parse(col.settings_str || '{}');
+            } catch (e) {
+              log('warn', 'Could not parse dropdown settings', { requestId, columnId: id });
+            }
+            
+            if (settings.labels && settings.labels.length > 0) {
+              const matchingLabel = settings.labels.find(label => 
+                label.name?.toLowerCase() === escapedDocumentType.toLowerCase()
+              );
+              
+              if (matchingLabel) {
+                columnValues[id] = matchingLabel.name;
+              } else {
+                columnValues[id] = settings.labels[0].name;
+              }
+            }
+          } else {
+            columnValues[id] = escapedDocumentType;
+          }
+        } else if (title.includes('document date') || (title.includes('date') && !title.includes('due'))) {
+          columnValues[id] = formatDate(doc.document_date);
+        } else if (title === 'due date' || title.includes('due date') && !title.includes('2') && !title.includes('3')) {
+          columnValues[id] = formatDate(doc.due_date);
+        } else if (title.includes('due date 2')) {
+          columnValues[id] = formatDate(doc.due_date_2);
+        } else if (title.includes('due date 3')) {
+          columnValues[id] = formatDate(doc.due_date_3);
+        } else if (title.includes('amount') && !title.includes('total') && !title.includes('tax')) {
+          columnValues[id] = doc.total_amount || 0;
+        } else if (title.includes('total amount')) {
+          columnValues[id] = doc.total_amount || 0;
+        } else if (title.includes('tax amount')) {
+          columnValues[id] = doc.tax_amount || 0;
+        } else if (title.includes('extraction status')) {
+          if (type === 'status') {
+            columnValues[id] = { "index": 1 };
+          } else {
+            columnValues[id] = "Extracted";
+          }
+        } else if (title.includes('status') && !title.includes('extraction')) {
+          if (type === 'status') {
+            columnValues[id] = { "index": 1 };
+          } else {
+            columnValues[id] = "Extracted";
           }
         }
       });
+      
+      // Create the item
+      const mutation = `
+        mutation {
+          create_item(
+            board_id: ${MONDAY_CONFIG.extractedDocsBoardId}
+            item_name: "${escapedDocumentType.toUpperCase()} ${escapedInvoiceNumber}"
+            column_values: ${JSON.stringify(JSON.stringify(columnValues))}
+          ) {
+            id
+            name
+          }
+        }
+      `;
+      
+      const response = await axios.post('https://api.monday.com/v2', {
+        query: mutation
+      }, {
+        headers: {
+          'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      if (response.data.errors) {
+        log('error', 'ITEM_CREATION_FAILED', {
+          requestId,
+          errors: response.data.errors
+        });
+        continue;
+      }
+      
+      const createdItemId = response.data.data.create_item.id;
+      log('info', 'ITEM_CREATED_SUCCESS', {
+        requestId,
+        itemId: createdItemId,
+        documentType: doc.document_type,
+        invoiceNumber: doc.invoice_number
+      });
+      
+      // Upload PDF file
+      if (originalFiles && originalFiles.length > 0) {
+        const fileColumn = columns.find(col => col.type === 'file');
+        if (fileColumn) {
+          try {
+            await uploadPdfToMondayItem(createdItemId, originalFiles[0].buffer, originalFiles[0].name, fileColumn.id, requestId);
+          } catch (uploadError) {
+            log('error', 'PDF_UPLOAD_FAILED', {
+              requestId,
+              itemId: createdItemId,
+              error: uploadError.message
+            });
+          }
+        }
+      }
+      
+      // 🔧 FIX 7: Enhanced subitem creation with proper validation and testing
+      log('info', 'SUBITEM_PROCESSING_START', {
+        requestId,
+        itemId: createdItemId,
+        hasItems: !!(doc.items && doc.items.length > 0),
+        itemCount: doc.items?.length || 0,
+        hasSubitemsColumn: !!subitemsColumn
+      });
+      
+      // Always test subitem creation first
+      if (subitemsColumn) {
+        try {
+          log('info', 'TEST_SUBITEM_CREATION', { requestId, itemId: createdItemId });
+          
+          const testSubitemMutation = `
+            mutation {
+              create_subitem(
+                parent_item_id: ${createdItemId}
+                item_name: "🧪 TEST - Line Items Processing"
+              ) {
+                id
+                name
+                board { id }
+              }
+            }
+          `;
+          
+          const testResponse = await axios.post('https://api.monday.com/v2', {
+            query: testSubitemMutation
+          }, {
+            headers: {
+              'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+              'Content-Type': 'application/json',
+              'API-Version': '2024-04'
+            }
+          });
+          
+          if (testResponse.data.errors) {
+            log('error', 'TEST_SUBITEM_FAILED', {
+              requestId,
+              itemId: createdItemId,
+              errors: testResponse.data.errors
+            });
+          } else {
+            const testSubitemId = testResponse.data.data.create_subitem.id;
+            log('info', 'TEST_SUBITEM_SUCCESS', {
+              requestId,
+              itemId: createdItemId,
+              testSubitemId: testSubitemId
+            });
+            
+            // Now create actual line item subitems
+            if (doc.items && doc.items.length > 0) {
+              log('info', 'CREATING_LINE_ITEM_SUBITEMS', {
+                requestId,
+                itemId: createdItemId,
+                lineItemCount: doc.items.length
+              });
+              
+              await createSubitemsForLineItems(createdItemId, doc.items, columns, requestId);
+            } else {
+              log('warn', 'NO_LINE_ITEMS_TO_CREATE', {
+                requestId,
+                itemId: createdItemId,
+                documentHasItems: !!(doc.items),
+                itemsLength: doc.items?.length || 0
+              });
+            }
+          }
+        } catch (testError) {
+          log('error', 'TEST_SUBITEM_EXCEPTION', {
+            requestId,
+            itemId: createdItemId,
+            error: testError.message,
+            stack: testError.stack
+          });
+        }
+      } else {
+        log('error', 'CANNOT_CREATE_SUBITEMS', {
+          requestId,
+          itemId: createdItemId,
+          reason: 'No subitems column found on board'
+        });
+      }
     }
+  } catch (error) {
+    log('error', 'CREATE_MONDAY_ITEMS_FAILED', {
+      requestId,
+      error: error.message,
+      stack: error.stack
+    });
+    throw error;
   }
+}
+        function groupPagesByInvoiceNumber(extractedFiles, requestId) {
+  log('info', 'STAGE: Grouping debug started', { 
+    requestId, 
+    inputFiles: extractedFiles?.length || 0 
+  });
   
   const documentGroups = {};
   
   if (!extractedFiles || extractedFiles.length === 0) {
-    console.log('No extracted files to process');
+    log('warn', 'No extracted files to process', { requestId });
     return [];
   }
   
   extractedFiles.forEach((file, fileIndex) => {
-    console.log(`Processing file ${fileIndex}: ${file.original_file_name}`);
+    log('info', 'Processing file', { 
+      requestId, 
+      fileIndex, 
+      fileName: file.original_file_name 
+    });
     
     if (!file.documents || file.documents.length === 0) {
-      console.log('  No documents found in file');
+      log('warn', 'No documents found in file', { requestId, fileIndex });
       return;
     }
     
     file.documents.forEach((doc, docIndex) => {
-      console.log(`  Processing document ${docIndex}`);
       const fields = doc.fields || {};
-      console.log(`  Available fields:`, Object.keys(fields));
       
-      // Extract field values based on Instabase field mapping
+      // Extract field values
       const invoiceNumber = fields['0']?.value || 'unknown';
       const pageType = fields['1']?.value || 'unknown';
       const documentType = fields['2']?.value || 'invoice';
@@ -59,34 +321,46 @@ function groupPagesByInvoiceNumber(extractedFiles) {
       const totalAmount = fields['8']?.value || 0;
       const taxAmount = fields['9']?.value || 0;
       
-      console.log(`  Extracted data:`);
-      console.log(`    Invoice Number: "${invoiceNumber}"`);
-      console.log(`    Page Type: "${pageType}"`);
-      console.log(`    Document Type: "${documentType}"`);
-      console.log(`    Supplier: "${supplier}"`);
-      console.log(`    Total: "${totalAmount}"`);
+      log('info', 'Document processed', {
+        requestId,
+        docIndex,
+        invoiceNumber,
+        pageType,
+        documentType,
+        supplier,
+        totalAmount
+      });
       
-      // 🔍 SIMPLE DEBUG: Check field 7 for line items
-      console.log(`🔍 FIELD 7 CHECK: exists=${fields['7'] !== undefined}, value=${fields['7']?.value ? 'HAS_DATA' : 'NO_DATA'}`);
+      // 🔧 FIX 4: Enhanced Field 7 validation and debugging
+      log('info', 'FIELD_7_CHECK', {
+        requestId,
+        docIndex,
+        field7Exists: fields['7'] !== undefined,
+        field7HasValue: !!fields['7']?.value,
+        field7Type: typeof fields['7']?.value,
+        field7IsArray: Array.isArray(fields['7']?.value),
+        field7Length: Array.isArray(fields['7']?.value) ? fields['7'].value.length : 'N/A'
+      });
       
-      if (fields['7']?.value) {
-        console.log(`🔍 FIELD 7 TYPE: ${typeof fields['7'].value}, isArray=${Array.isArray(fields['7'].value)}, length=${Array.isArray(fields['7'].value) ? fields['7'].value.length : 'N/A'}`);
-      }
-      
-      // Quick check of all fields for arrays
+      // Check all fields for arrays (potential line items)
       Object.keys(fields).forEach(key => {
         const val = fields[key]?.value;
         if (Array.isArray(val) && val.length > 0) {
-          console.log(`🔍 ARRAY FOUND in field ${key}: length=${val.length}`);
+          log('info', 'ARRAY_FOUND', {
+            requestId,
+            fieldKey: key,
+            arrayLength: val.length,
+            firstItem: val[0]
+          });
         }
       });
       
       if (!invoiceNumber || invoiceNumber === 'none' || invoiceNumber === 'unknown') {
-        console.log(`  Skipping document - no valid invoice number`);
+        log('warn', 'Skipping document - no valid invoice number', { requestId, docIndex });
         return;
       }
       
-      // Create new group if it doesn't exist
+      // Create or update document group
       if (!documentGroups[invoiceNumber]) {
         documentGroups[invoiceNumber] = {
           invoice_number: invoiceNumber,
@@ -103,7 +377,7 @@ function groupPagesByInvoiceNumber(extractedFiles) {
           pages: [],
           confidence: 0
         };
-        console.log(`  Created new group for invoice: ${invoiceNumber}`);
+        log('info', 'Created new document group', { requestId, invoiceNumber });
       }
       
       const group = documentGroups[invoiceNumber];
@@ -115,59 +389,53 @@ function groupPagesByInvoiceNumber(extractedFiles) {
       
       // Update group data with main page info
       if (pageType === 'main' || !group.supplier_name) {
-        if (supplier) {
-          group.supplier_name = supplier;
-        }
-        
+        if (supplier) group.supplier_name = supplier;
         if (totalAmount) {
           const totalStr = String(totalAmount).replace(/[^0-9.-]/g, '');
           group.total_amount = parseFloat(totalStr) || 0;
         }
-        
         if (taxAmount) {
           const taxStr = String(taxAmount).replace(/[^0-9.-]/g, '');
           group.tax_amount = parseFloat(taxStr) || 0;
         }
-        
-        if (documentDate) {
-          group.document_date = documentDate;
-        }
-        
-        if (terms) {
-          group.terms = terms;
-        }
+        if (documentDate) group.document_date = documentDate;
+        if (terms) group.terms = terms;
       }
       
-      // 🔧 FIXED: Process line items from TABLE format (field 7)
-      console.log(`  === PROCESSING LINE ITEMS TABLE FOR ${pageType} PAGE ===`);
+      // 🔧 FIX 5: Enhanced line items processing with validation
+      log('info', 'LINE_ITEMS_PROCESSING_START', { 
+        requestId, 
+        pageType,
+        hasItemsData: !!itemsData,
+        itemsDataType: typeof itemsData,
+        itemsDataLength: Array.isArray(itemsData) ? itemsData.length : 'N/A'
+      });
+      
       if (itemsData && Array.isArray(itemsData) && itemsData.length > 0) {
-        console.log(`  Found items table with ${itemsData.length} rows on ${pageType} page`);
+        log('info', 'ITEMS_TABLE_FOUND', { 
+          requestId, 
+          pageType,
+          tableRowCount: itemsData.length,
+          firstRowSample: itemsData[0]
+        });
         
-        // Process each row of the table
         const processedItems = [];
         
         itemsData.forEach((row, rowIndex) => {
-          console.log(`    Processing table row ${rowIndex}:`, JSON.stringify(row, null, 2));
-          
-          // Handle different possible table structures
           let itemNumber = '';
           let unitCost = 0;
           let quantity = 0;
           
           if (Array.isArray(row)) {
-            // If row is an array [itemNumber, unitCost, quantity] or similar
+            // Array format: [itemNumber, unitCost, quantity]
             itemNumber = String(row[0] || '').trim();
             unitCost = parseFloat(row[1]) || 0;
             quantity = parseFloat(row[2]) || 0;
-            
-            console.log(`      Array format - Item: "${itemNumber}", Cost: ${unitCost}, Qty: ${quantity}`);
           } else if (typeof row === 'object' && row !== null) {
-            // If row is an object with properties
+            // Object format with properties
             itemNumber = String(row['Item Number'] || row.item_number || row.itemNumber || row.number || '').trim();
             unitCost = parseFloat(row['Unit Cost'] || row.unit_cost || row.unitCost || row.cost || row.price || 0);
             quantity = parseFloat(row.Quantity || row.quantity || row.qty || 0);
-            
-            console.log(`      Object format - Item: "${itemNumber}", Cost: ${unitCost}, Qty: ${quantity}`);
           }
           
           // Only add if we have meaningful data
@@ -181,38 +449,50 @@ function groupPagesByInvoiceNumber(extractedFiles) {
             };
             
             processedItems.push(processedItem);
-            console.log(`      ✅ Added item: ${itemNumber} (${quantity} × ${unitCost} = ${processedItem.amount})`);
-          } else {
-            console.log(`      ⚠️  Skipped row ${rowIndex} - insufficient data`);
+            log('info', 'ITEM_PROCESSED', {
+              requestId,
+              rowIndex,
+              itemNumber,
+              quantity,
+              unitCost,
+              amount: processedItem.amount
+            });
           }
         });
         
-        // Add items to the group (prioritize main page, but accept any page with items)
+        // Add items to the group (prioritize main page)
         if (processedItems.length > 0 && (pageType === 'main' || group.items.length === 0)) {
           group.items = processedItems;
-          console.log(`  ✅ Added ${processedItems.length} line items to invoice ${invoiceNumber}`);
+          log('info', 'ITEMS_ADDED_TO_GROUP', { 
+            requestId, 
+            invoiceNumber,
+            itemCount: processedItems.length 
+          });
         }
       } else {
-        console.log(`  No items table found on ${pageType} page`);
+        log('info', 'NO_ITEMS_TABLE_FOUND', { requestId, pageType });
       }
-      console.log(`  === END LINE ITEMS PROCESSING ===`);
     });
   });
   
-  console.log(`=== GROUPING RESULT ===`);
-  console.log(`Found ${Object.keys(documentGroups).length} document groups:`);
-  Object.keys(documentGroups).forEach(key => {
-    const group = documentGroups[key];
-    console.log(`  Group "${key}": ${group.pages.length} pages, ${group.items.length} items`);
-    if (group.items.length > 0) {
-      console.log(`    Items: ${group.items.map(item => `${item.item_number}(${item.quantity}×${item.unit_cost})`).join(', ')}`);
-    } else {
-      console.log(`    ❌ NO ITEMS FOUND - This is why subitems aren't being created!`);
-    }
+  const resultGroups = Object.values(documentGroups);
+  log('info', 'GROUPING_RESULT', {
+    requestId,
+    groupCount: resultGroups.length,
+    groupsWithItems: resultGroups.filter(g => g.items.length > 0).length
   });
-  console.log('=== END GROUPING DEBUG ===');
   
-  return Object.values(documentGroups);
+  resultGroups.forEach(group => {
+    log('info', 'GROUP_SUMMARY', {
+      requestId,
+      invoiceNumber: group.invoice_number,
+      pageCount: group.pages.length,
+      itemCount: group.items.length,
+      hasItems: group.items.length > 0
+    });
+  });
+  
+  return resultGroups;
 }// Digital‑Mailroom Webhook — FIXED VERSION with PDF upload working
 // -----------------------------------------------------------------------------
 // This is the corrected server that fixes the PDF upload issue
