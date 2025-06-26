@@ -807,250 +807,58 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
 // 🔧 COMPLETELY REWRITTEN: Subitem creation function
 async function createSubitemsForLineItems(parentItemId, items, columns, requestId) {
   try {
-    log('info', 'SUBITEM_CREATION_START', {
-      requestId,
-      parentItemId,
-      lineItemCount: items.length
-    });
-    
-    // Test subitem creation capability first
-    const testSubitemMutation = `
-      mutation {
-        create_subitem(
-          parent_item_id: ${parentItemId}
-          item_name: "🧪 TEST - Line Items Available"
-        ) {
-          id
-          name
-          board { id }
-        }
-      }
-    `;
-    
-    log('info', 'TESTING_SUBITEM_CREATION', { requestId, parentItemId });
-    
-    const testResponse = await axios.post('https://api.monday.com/v2', {
-      query: testSubitemMutation
-    }, {
-      headers: {
-        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
-        'Content-Type': 'application/json',
-        'API-Version': '2024-04'
-      }
-    });
-    
-    if (testResponse.data.errors) {
-      log('error', 'TEST_SUBITEM_FAILED', {
-        requestId,
-        parentItemId,
-        errors: testResponse.data.errors
-      });
-      return;
-    }
-    
-    const testSubitemId = testResponse.data.data.create_subitem.id;
-    const subitemBoardId = testResponse.data.data.create_subitem.board.id;
-    
-    log('info', 'TEST_SUBITEM_SUCCESS', {
-      requestId,
-      parentItemId,
-      testSubitemId,
-      subitemBoardId
-    });
-    
-    // Get subitem board structure
-    const subitemBoardQuery = `
+    log('info', 'SUBITEM_CREATION_START', { requestId, parentItemId, lineItemCount: items.length });
+
+    // 1️⃣ Read your “subtasks” column’s linked board ID:
+    const subitemsColumn = columns.find(c => c.type === 'subtasks');
+    const subitemBoardId   = JSON.parse(subitemsColumn.settings_str).linked_board_id;
+
+    // 2️⃣ Fetch that board’s columns:
+    const colsQ = `
       query {
-        boards(ids: [${subitemBoardId}]) {
-          id
-          name
-          columns {
-            id
-            title
-            type
-          }
+        boards(ids:[${subitemBoardId}]) {
+          columns { id title type }
         }
       }
     `;
-    
-    const subitemBoardResponse = await axios.post('https://api.monday.com/v2', {
-      query: subitemBoardQuery
-    }, {
-      headers: {
-        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
-        'Content-Type': 'application/json'
-      }
+    const colsRes = await axios.post('https://api.monday.com/v2', { query: colsQ }, {
+      headers: { Authorization: `Bearer ${MONDAY_CONFIG.apiKey}` }
     });
-    
-    const subitemColumns = subitemBoardResponse.data.data?.boards?.[0]?.columns || [];
-    
-    log('info', 'SUBITEM_BOARD_COLUMNS', {
-      requestId,
-      subitemBoardId,
-      columnCount: subitemColumns.length,
-      columns: subitemColumns.map(c => ({ id: c.id, title: c.title, type: c.type }))
-    });
-    
-    // Create actual line item subitems
+    const subitemColumns = colsRes.data.data.boards[0].columns;
+
+    // 3️⃣ Loop each line item and map it into your three target columns:
     for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      
-      // Clean and prepare data
-      const itemNumber = String(item.item_number || '').replace(/"/g, '\\"').substring(0, 50);
-      const description = String(item.description || '').replace(/"/g, '\\"').substring(0, 100);
-      const quantity = parseFloat(item.quantity) || 0;
-      const unitCost = parseFloat(item.unit_cost) || 0;
-      const amount = parseFloat(item.amount) || (quantity * unitCost);
-      
-      // Create meaningful subitem name
-      const subitemName = itemNumber ? 
-        `${itemNumber}${description ? ` - ${description}` : ''}` : 
-        `Line Item ${i + 1}${description ? ` - ${description}` : ''}`;
-      
-      log('info', 'CREATING_LINE_ITEM', {
-        requestId,
-        lineIndex: i + 1,
-        itemNumber,
-        description,
-        quantity,
-        unitCost,
-        amount,
-        subitemName
-      });
-      
-      // Map to subitem columns
-      const subitemColumnValues = {};
-      
+      const { item_number, quantity, unit_cost } = items[i];
+      const columnValues = {};
       subitemColumns.forEach(col => {
-        const title = col.title.toLowerCase();
-        
-        if (title.includes('item num') || title.includes('item number') || title === 'item #') {
-          subitemColumnValues[col.id] = itemNumber;
-        } else if (title.includes('description') || title.includes('desc')) {
-          subitemColumnValues[col.id] = description;
-        } else if (title.includes('quantity') || title === 'qty') {
-          if (col.type === 'numbers') {
-            subitemColumnValues[col.id] = quantity;
-          } else {
-            subitemColumnValues[col.id] = String(quantity);
-          }
-        } else if (title.includes('unit cost') || title.includes('price')) {
-          if (col.type === 'numbers') {
-            subitemColumnValues[col.id] = unitCost;
-          } else {
-            subitemColumnValues[col.id] = String(unitCost);
-          }
-        } else if (title.includes('amount') || title.includes('total')) {
-          if (col.type === 'numbers') {
-            subitemColumnValues[col.id] = amount;
-          } else {
-            subitemColumnValues[col.id] = String(amount);
-          }
-        }
+        const t = col.title.trim().toLowerCase();
+        if (t === 'item number') columnValues[col.id] = item_number;
+        if (t === 'quantity')    columnValues[col.id] = quantity;
+        if (t === 'unit cost')   columnValues[col.id] = unit_cost;
       });
-      
-      log('info', 'SUBITEM_COLUMN_MAPPING', {
-        requestId,
-        lineIndex: i + 1,
-        columnValues: subitemColumnValues
-      });
-      
-      // Create the subitem with column values
-      const subitemMutation = `
+
+      // 4️⃣ Fire the create_subitem mutation:
+      const m = `
         mutation {
           create_subitem(
             parent_item_id: ${parentItemId}
-            item_name: "${subitemName.replace(/"/g, '\\"')}"
-            column_values: ${JSON.stringify(JSON.stringify(subitemColumnValues))}
-          ) {
-            id
-            name
-          }
+            item_name: "${item_number}"
+            column_values: ${JSON.stringify(JSON.stringify(columnValues))}
+          ) { id }
         }
       `;
-      
-      const subitemResponse = await axios.post('https://api.monday.com/v2', {
-        query: subitemMutation
-      }, {
+      await axios.post('https://api.monday.com/v2', { query: m }, {
         headers: {
-          'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
-          'Content-Type': 'application/json',
+          Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
           'API-Version': '2024-04'
-        },
-        timeout: 30000
-      });
-      
-      if (subitemResponse.data.errors) {
-        log('error', 'SUBITEM_WITH_COLUMNS_FAILED', {
-          requestId,
-          lineIndex: i + 1,
-          errors: subitemResponse.data.errors
-        });
-        
-        // Try creating without column values
-        const simpleSubitemMutation = `
-          mutation {
-            create_subitem(
-              parent_item_id: ${parentItemId}
-              item_name: "${subitemName.replace(/"/g, '\\"')}"
-            ) {
-              id
-              name
-            }
-          }
-        `;
-        
-        const retryResponse = await axios.post('https://api.monday.com/v2', {
-          query: simpleSubitemMutation
-        }, {
-          headers: {
-            'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
-            'Content-Type': 'application/json',
-            'API-Version': '2024-04'
-          }
-        });
-        
-        if (retryResponse.data.errors) {
-          log('error', 'SIMPLE_SUBITEM_ALSO_FAILED', {
-            requestId,
-            lineIndex: i + 1,
-            errors: retryResponse.data.errors
-          });
-        } else {
-          log('info', 'SIMPLE_SUBITEM_SUCCESS', {
-            requestId,
-            lineIndex: i + 1,
-            subitemId: retryResponse.data.data.create_subitem.id,
-            subitemName
-          });
         }
-      } else {
-        log('info', 'SUBITEM_WITH_COLUMNS_SUCCESS', {
-          requestId,
-          lineIndex: i + 1,
-          subitemId: subitemResponse.data.data.create_subitem.id,
-          subitemName
-        });
-      }
-      
-      // Small delay between subitem creations to avoid rate limiting
-      await new Promise(resolve => setTimeout(resolve, 500));
+      });
+      await new Promise(r => setTimeout(r, 250)); // small delay
     }
-    
-    log('info', 'ALL_SUBITEMS_CREATED', {
-      requestId,
-      parentItemId,
-      lineItemCount: items.length
-    });
-    
+
+    log('info', 'ALL_SUBITEMS_CREATED', { requestId, parentItemId, lineItemCount: items.length });
   } catch (error) {
-    log('error', 'SUBITEM_CREATION_ERROR', {
-      requestId,
-      parentItemId,
-      error: error.message,
-      stack: error.stack
-    });
-    // Don't throw - continue with other processing
+    log('error', 'SUBITEM_CREATION_ERROR', { requestId, parentItemId, error: error.message });
   }
 }
 
