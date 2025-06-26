@@ -94,6 +94,18 @@ async function processWebhookData(body, requestId) {
 
     const { files: extracted, originalFiles } = await processFilesWithInstabase(pdfFiles, requestId);
     const groups = groupPagesByInvoiceNumber(extracted, requestId);
+    
+    // 🔧 DEBUG: Log the groups after processing to verify items are found
+    log('info', 'GROUPS_AFTER_PROCESSING', {
+      requestId,
+      groupCount: groups.length,
+      groups: groups.map(g => ({
+        invoiceNumber: g.invoice_number,
+        itemCount: g.items?.length || 0,
+        items: g.items || []
+      }))
+    });
+    
     await createMondayExtractedItems(groups, itemId, originalFiles, requestId);
     
     log('info', 'PROCESSING_COMPLETE', { requestId, itemId });
@@ -323,13 +335,18 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
         field7Length: Array.isArray(fields['7']?.value) ? fields['7'].value.length : 'N/A'
       });
       
-      // 🔧 ENHANCED FIELD 7 DEBUGGING
+      // 🔧 ENHANCED FIELD 7 DEBUGGING - Show the actual structure
       if (fields['7']) {
+        log('info', 'FIELD_7_RAW_STRUCTURE', {
+          requestId,
+          docIndex,
+          field7Raw: JSON.stringify(fields['7'], null, 2)
+        });
+        
         log('info', 'FIELD_7_DETAILED', {
           requestId,
           docIndex,
           field7Exists: true,
-          field7Raw: fields['7'],
           field7Value: fields['7']?.value,
           field7ValueType: typeof fields['7']?.value,
           field7ValueStringified: JSON.stringify(fields['7']?.value)
@@ -360,7 +377,42 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
       const terms = fields['4']?.value || '';
       const documentDate = fields['5']?.value || '';
       const dueDateData = fields['6']?.value || '';
-      const itemsData = fields['7']?.value || [];
+      
+      // 🔧 FIXED: Extract line items from the correct nested structure
+      const raw7 = fields['7'];
+      let itemsData = [];
+      
+      if (raw7) {
+        // Try multiple possible nested structures where Instabase might store table data
+        if (Array.isArray(raw7.value)) {
+          // Direct array
+          itemsData = raw7.value;
+          log('info', 'ITEMS_FOUND_DIRECT_ARRAY', { requestId, itemCount: itemsData.length });
+        } else if (raw7.value?.tables?.[0]?.rows) {
+          // Nested in tables structure
+          itemsData = raw7.value.tables[0].rows;
+          log('info', 'ITEMS_FOUND_IN_TABLES', { requestId, itemCount: itemsData.length });
+        } else if (raw7.value?.rows) {
+          // Direct rows property
+          itemsData = raw7.value.rows;
+          log('info', 'ITEMS_FOUND_IN_ROWS', { requestId, itemCount: itemsData.length });
+        } else if (raw7.tables?.[0]?.rows) {
+          // Tables at root level
+          itemsData = raw7.tables[0].rows;
+          log('info', 'ITEMS_FOUND_ROOT_TABLES', { requestId, itemCount: itemsData.length });
+        } else if (raw7.rows) {
+          // Rows at root level
+          itemsData = raw7.rows;
+          log('info', 'ITEMS_FOUND_ROOT_ROWS', { requestId, itemCount: itemsData.length });
+        } else {
+          log('info', 'NO_RECOGNIZABLE_TABLE_STRUCTURE', { 
+            requestId, 
+            field7Keys: Object.keys(raw7),
+            field7ValueKeys: raw7.value ? Object.keys(raw7.value) : 'No value object'
+          });
+        }
+      }
+      
       const totalAmount = fields['8']?.value || 0;
       const taxAmount = fields['9']?.value || 0;
       
@@ -1117,31 +1169,76 @@ app.get('/test/board-structure', async (req, res) => {
   }
 });
 
-app.post('/test/process-item/:id', async (req, res) => {
-  const requestId = `test_${Date.now()}`;
+app.post('/test/debug-extraction/:id', async (req, res) => {
+  const requestId = `debug_${Date.now()}`;
   try {
-    log('info', 'TEST_PROCESSING_START', { requestId, itemId: req.params.id });
+    log('info', 'DEBUG_EXTRACTION_START', { requestId, itemId: req.params.id });
     
+    // Get files
     const files = await getMondayItemFilesWithPublicUrl(req.params.id, MONDAY_CONFIG.fileUploadsBoardId, requestId);
     
     if (files.length === 0) {
       return res.json({ success: false, message: 'No PDF files found' });
     }
     
+    // Process with Instabase
     const { files: extracted, originalFiles } = await processFilesWithInstabase(files, requestId);
+    
+    // Log the RAW extraction results
+    log('info', 'RAW_INSTABASE_RESULTS', {
+      requestId,
+      extractedFiles: extracted,
+      fileCount: extracted?.length || 0
+    });
+    
+    if (extracted && extracted.length > 0) {
+      extracted.forEach((file, fileIndex) => {
+        log('info', 'FILE_DETAILS', {
+          requestId,
+          fileIndex,
+          fileName: file.original_file_name,
+          documentCount: file.documents?.length || 0
+        });
+        
+        if (file.documents) {
+          file.documents.forEach((doc, docIndex) => {
+            log('info', 'DOCUMENT_DETAILS', {
+              requestId,
+              fileIndex,
+              docIndex,
+              fields: doc.fields,
+              fieldKeys: Object.keys(doc.fields || {}),
+              field7: doc.fields?.['7'],
+              allFieldsWithValues: Object.keys(doc.fields || {}).map(key => ({
+                fieldKey: key,
+                value: doc.fields[key]?.value,
+                type: typeof doc.fields[key]?.value,
+                isArray: Array.isArray(doc.fields[key]?.value)
+              }))
+            });
+          });
+        }
+      });
+    }
+    
+    // Also run grouping to see what happens
     const groups = groupPagesByInvoiceNumber(extracted, requestId);
-    await createMondayExtractedItems(groups, req.params.id, originalFiles, requestId);
     
     res.json({ 
       success: true, 
-      message: 'Processing completed',
+      message: 'Debug extraction completed - check logs for detailed results',
       requestId,
       filesProcessed: files.length,
+      extractedFiles: extracted?.length || 0,
       groupsCreated: groups.length,
-      itemsWithLineItems: groups.filter(g => g.items.length > 0).length
+      rawExtractionPreview: {
+        firstFile: extracted?.[0]?.original_file_name,
+        firstDocument: extracted?.[0]?.documents?.[0]?.fields ? Object.keys(extracted[0].documents[0].fields) : 'No fields',
+        field7Content: extracted?.[0]?.documents?.[0]?.fields?.['7']?.value
+      }
     });
   } catch (error) {
-    log('error', 'TEST_PROCESSING_ERROR', { requestId, error: error.message });
+    log('error', 'DEBUG_EXTRACTION_ERROR', { requestId, error: error.message });
     res.status(500).json({ error: error.message, requestId });
   }
 });
