@@ -1,235 +1,4 @@
-// 🔧 FIXED: Find the actual "Source Request ID" column instead of "name"
-    const sourceRequestIdColumn = columns.find(col => 
-      col.title.toLowerCase() === 'id'
-    );
-    
-    log('info', 'SOURCE_REQUEST_ID_COLUMN_SEARCH', {
-      requestId,
-      foundColumn: !!sourceRequestIdColumn,
-      columnId: sourceRequestIdColumn?.id,
-      columnTitle: sourceRequestIdColumn?.title,
-      allColumns: columns.map(c => ({ id: c.id, title: c.title, type: c.type }))
-    });
-    
-    // Validate subitems column exists
-    const subitemsColumn = columns.find(col => col.type === 'subtasks');
-    log('info', 'BOARD_VALIDATION', {
-      requestId,
-      totalColumns: columns.length,
-      hasSubitemsColumn: !!subitemsColumn,
-      subitemsColumnId: subitemsColumn?.id,
-      subitemsColumnTitle: subitemsColumn?.title,
-      hasSourceRequestIdColumn: !!sourceRequestIdColumn
-    });
-    
-    if (!subitemsColumn) {
-      log('error', 'MISSING_SUBITEMS_COLUMN', {
-        requestId,
-        error: 'Board missing subitems column - cannot create subitems'
-      });
-    }
-    
-    if (!sourceRequestIdColumn) {
-      log('warn', 'MISSING_SOURCE_REQUEST_ID_COLUMN', {
-        requestId,
-        warning: 'No Source Request ID column found - cannot link Instabase run ID'
-      });
-    }
-    
-    for (const doc of documents) {
-      log('info', 'CREATING_MONDAY_ITEM', {
-        requestId,
-        documentType: doc.document_type,
-        invoiceNumber: doc.invoice_number,
-        itemCount: doc.items?.length || 0,
-        isMultiPage: doc.isMultiPageReconstruction || false,
-        originalPageCount: doc.originalPageCount || 1
-      });
-      
-      const escapedSupplier = (doc.supplier_name || '').replace(/"/g, '\\"');
-      const escapedInvoiceNumber = (doc.invoice_number || '').replace(/"/g, '\\"');
-      const escapedDocumentType = (doc.document_type || '').replace(/"/g, '\\"');
-      
-      const formatDate = (dateStr) => {
-        if (!dateStr || dateStr === 'Due Date' || dateStr === 'undefined' || dateStr === 'null') {
-          return '';
-        }
-        try {
-          // Handle various date formats
-          let date;
-          if (typeof dateStr === 'string') {
-            // Clean the date string
-            const cleanDate = dateStr.trim();
-            if (cleanDate.match(/^\d{4}-\d{2}-\d{2}$/)) {
-              // Already in YYYY-MM-DD format
-              return cleanDate;
-            }
-            date = new Date(cleanDate);
-          } else {
-            date = new Date(dateStr);
-          }
-          
-          if (isNaN(date.getTime())) {
-            log('warn', 'INVALID_DATE_FORMAT', { 
-              requestId, 
-              originalDate: dateStr,
-              reason: 'Date parsing failed'
-            });
-            return '';
-          }
-          
-          return date.toISOString().split('T')[0];
-        } catch (e) {
-          log('warn', 'DATE_FORMAT_ERROR', { 
-            requestId, 
-            originalDate: dateStr,
-            error: e.message
-          });
-          return '';
-        }
-      };
-      
-      const columnValues = buildColumnValues(columns, doc, formatDate, instabaseRunId);
-      
-      log('info', 'COLUMN_VALUES_MAPPED', { 
-        requestId, 
-        invoiceNumber: doc.invoice_number,
-        columnValues,
-        docDueDates: {
-          due_date: doc.due_date,
-          due_date_2: doc.due_date_2,
-          due_date_3: doc.due_date_3
-        }
-      });
-      
-      // Create the item - Use Run ID as the primary name/ID
-      const mutation = `
-        mutation {
-          create_item(
-            board_id: ${MONDAY_CONFIG.extractedDocsBoardId}
-            item_name: "${instabaseRunId || 'RUN_PENDING'}"
-            column_values: ${JSON.stringify(JSON.stringify(columnValues))}
-          ) {
-            id
-            name
-          }
-        }
-      `;
-      
-      const response = await axios.post('https://api.monday.com/v2', {
-        query: mutation
-      }, {
-        headers: {
-          'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
-          'Content-Type': 'application/json'
-        }
-      });
-      
-      if (response.data.errors) {
-        log('error', 'ITEM_CREATION_FAILED', {
-          requestId,
-          errors: response.data.errors
-        });
-        continue;
-      }
-      
-      const createdItemId = response.data.data.create_item.id;
-      log('info', 'ITEM_CREATED_SUCCESS', {
-        requestId,
-        itemId: createdItemId,
-        documentType: doc.document_type,
-        invoiceNumber: doc.invoice_number,
-        isMultiPageReconstruction: doc.isMultiPageReconstruction || false
-      });
-      
-      // Upload PDF file
-      if (originalFiles && originalFiles.length > 0) {
-        const fileColumn = columns.find(col => col.type === 'file');
-        if (fileColumn) {
-          try {
-            await uploadPdfToMondayItem(createdItemId, originalFiles[0].buffer, originalFiles[0].name, fileColumn.id, requestId);
-          } catch (uploadError) {
-            log('error', 'PDF_UPLOAD_FAILED', {
-              requestId,
-              itemId: createdItemId,
-              error: uploadError.message
-            });
-          }
-        }
-      }
-      
-      // 🔧 FIXED: Enhanced subitem creation with proper validation
-      log('info', 'SUBITEM_PROCESSING_START', {
-        requestId,
-        itemId: createdItemId,
-        hasItems: !!(doc.items && doc.items.length > 0),
-        itemCount: doc.items?.length || 0,
-        hasSubitemsColumn: !!subitemsColumn
-      });
-      
-      // Create subitems if we have line items and subitems column exists
-      if (subitemsColumn && doc.items && doc.items.length > 0) {
-        try {
-          log('info', 'CREATING_SUBITEMS', { 
-            requestId, 
-            itemId: createdItemId,
-            lineItemCount: doc.items.length 
-          });
-          
-          await createSubitemsForLineItems(createdItemId, doc.items, columns, requestId);
-          
-        } catch (subitemError) {
-          log('error', 'SUBITEM_CREATION_FAILED', {
-            requestId,
-            itemId: createdItemId,
-            error: subitemError.message,
-            stack: subitemError.stack
-          });
-        }
-      } else {
-        if (!subitemsColumn) {
-          log('warn', 'NO_SUBITEMS_COLUMN', { requestId, itemId: createdItemId });
-        }
-        if (!doc.items || doc.items.length === 0) {
-          log('warn', 'NO_LINE_ITEMS', { 
-            requestId, 
-            itemId: createdItemId,
-            hasItems: !!doc.items,
-            itemsLength: doc.items?.length || 0
-          });
-        }
-      }
-    }
-    
-    log('info', 'ALL_ITEMS_PROCESSED', { requestId, documentCount: documents.length });
-    
-  } catch (error) {
-    log('error', 'CREATE_MONDAY_ITEMS_FAILED', {
-      requestId,
-      error: error.message,
-      stack: error.stack
-    });
-    throw error;
-  }
-}
-
-// 🔧 FIXED: Subitem creation function with proper indexing
-async function createSubitemsForLineItems(parentItemId, items, columns, requestId) {
-  try {
-    log('info', 'SUBITEM_CREATION_START', { requestId, parentItemId, lineItemCount: items.length });
-
-    // 1️⃣ Get the linked board ID from your Subtasks column
-    const subitemsColumn = columns.find(c => c.type === 'subtasks');
-    if (!subitemsColumn) {
-      log('error', 'NO_SUBTASKS_COLUMN_FOUND', { requestId });
-      return;
-    }
-
-    let settings = {};
-    try {
-      settings = JSON.parse(subitemsColumn.settings_str || '{}');
-    } catch (e) {
-      log// Digital Mailroom Webhook — FINAL VERSION with Multi-Page Document Reconstruction
+// Digital Mailroom Webhook — FINAL VERSION with Multi-Page Document Reconstruction
 // -----------------------------------------------------------------------------
 // This version intelligently merges split PDF pages back into complete documents
 // -----------------------------------------------------------------------------
@@ -703,389 +472,124 @@ function reconstructMultiPageDocument(pages, masterPage, requestId, filename) {
   const documentDate = masterFields['5']?.value || '';
   const referenceNumber = masterFields['10']?.value || '';
   
-  // 🔧 ENHANCED: Smart page classification and data extraction
-  const classifiedPages = classifyAndExtractPages(pages, requestId, filename);
+  // 🔧 NEW: Merge due dates from all pages (prioritize non-empty values)
+  let mergedDueDates = { due_date: '', due_date_2: '', due_date_3: '' };
   
-  // 🔧 ENHANCED: Merge data intelligently from classified pages
-  const mergedData = mergeDataFromClassifiedPages(classifiedPages, requestId);
+  pages.forEach((page, pageIndex) => {
+    const raw6 = page.fields['6'];
+    if (raw6) {
+      const dueDates = extractDueDatesFromField(raw6, requestId, pageIndex);
+      
+      // Merge due dates (keep first non-empty value found)
+      if (dueDates.due_date && !mergedDueDates.due_date) {
+        mergedDueDates.due_date = dueDates.due_date;
+      }
+      if (dueDates.due_date_2 && !mergedDueDates.due_date_2) {
+        mergedDueDates.due_date_2 = dueDates.due_date_2;
+      }
+      if (dueDates.due_date_3 && !mergedDueDates.due_date_3) {
+        mergedDueDates.due_date_3 = dueDates.due_date_3;
+      }
+    }
+  });
+  
+  // 🔧 NEW: Merge line items from all pages
+  const allLineItems = [];
+  
+  pages.forEach((page, pageIndex) => {
+    log('info', 'PROCESSING_PAGE_FOR_ITEMS', {
+      requestId,
+      filename,
+      pageIndex,
+      availableFields: Object.keys(page.fields)
+    });
+    
+    const pageItems = extractLineItemsFromPage(page, requestId, pageIndex);
+    if (pageItems.length > 0) {
+      allLineItems.push(...pageItems);
+      log('info', 'ITEMS_FOUND_ON_PAGE', {
+        requestId,
+        filename,
+        pageIndex,
+        itemCount: pageItems.length
+      });
+    }
+  });
+  
+  // 🔧 NEW: Find totals from any page (usually last page)
+  let totalAmount = 0;
+  let taxAmount = 0;
+  
+  // Search all pages for totals (prioritize later pages)
+  for (let i = pages.length - 1; i >= 0; i--) {
+    const page = pages[i];
+    const pageTotalAmount = page.fields['8']?.value;
+    const pageTaxAmount = page.fields['9']?.value;
+    
+    if (pageTotalAmount && !totalAmount) {
+      const totalStr = String(pageTotalAmount).replace(/[^0-9.-]/g, '');
+      totalAmount = parseFloat(totalStr) || 0;
+      log('info', 'TOTAL_FOUND_ON_PAGE', {
+        requestId,
+        filename,
+        pageIndex: i,
+        totalAmount,
+        rawValue: pageTotalAmount
+      });
+    }
+    
+    if (pageTaxAmount && !taxAmount) {
+      const taxStr = String(pageTaxAmount).replace(/[^0-9.-]/g, '');
+      taxAmount = parseFloat(taxStr) || 0;
+      log('info', 'TAX_FOUND_ON_PAGE', {
+        requestId,
+        filename,
+        pageIndex: i,
+        taxAmount,
+        rawValue: pageTaxAmount
+      });
+    }
+    
+    // If we found both, we can stop
+    if (totalAmount && taxAmount) break;
+  }
   
   const reconstructedDocument = {
     invoice_number: invoiceNumber,
     document_type: documentType,
-    supplier_name: supplier || mergedData.supplier,
-    reference_number: referenceNumber || mergedData.referenceNumber,
-    total_amount: mergedData.totalAmount,
-    tax_amount: mergedData.taxAmount,
-    document_date: documentDate || mergedData.documentDate,
-    due_date: mergedData.dueDates.due_date,
-    due_date_2: mergedData.dueDates.due_date_2,
-    due_date_3: mergedData.dueDates.due_date_3,
-    terms: terms || mergedData.terms,
-    items: mergedData.allLineItems,
+    supplier_name: supplier,
+    reference_number: referenceNumber,
+    total_amount: totalAmount,
+    tax_amount: taxAmount,
+    document_date: documentDate,
+    due_date: mergedDueDates.due_date,
+    due_date_2: mergedDueDates.due_date_2,
+    due_date_3: mergedDueDates.due_date_3,
+    terms: terms,
+    items: allLineItems,
     pages: pages.map((page, index) => ({
       page_type: page.fields['1']?.value || `page_${index + 1}`,
       file_name: filename,
-      fields: page.fields,
-      classification: classifiedPages.find(cp => cp.pageIndex === index)?.classification || 'unknown'
+      fields: page.fields
     })),
     confidence: 0,
     isMultiPageReconstruction: true,
     originalPageCount: pages.length,
-    reconstructionStrategy: 'ai_enhanced_classification'
+    reconstructionStrategy: 'filename_grouping_with_content_merging'
   };
   
   log('info', 'DOCUMENT_RECONSTRUCTION_COMPLETE', {
     requestId,
     filename,
     invoiceNumber,
-    totalAmount: mergedData.totalAmount,
-    taxAmount: mergedData.taxAmount,
-    lineItemCount: mergedData.allLineItems.length,
-    pageCount: pages.length,
-    pageClassifications: classifiedPages.map(cp => cp.classification)
-  });
-  
-  return reconstructedDocument;
-}
-
-// 🔧 NEW: Advanced page classification with fallback logic
-function classifyAndExtractPages(pages, requestId, filename) {
-  const classifiedPages = [];
-  
-  pages.forEach((page, pageIndex) => {
-    const fields = page.fields;
-    
-    // Get Instabase classification from Page Type field
-    const instabasePageType = fields['1']?.value?.toLowerCase() || '';
-    
-    // 🔧 ENHANCED: Multi-strategy page classification
-    let classification = 'unknown';
-    let confidence = 0;
-    
-    // Strategy 1: Use Instabase Page Type if available and reliable
-    if (instabasePageType && instabasePageType !== 'unknown' && instabasePageType !== '') {
-      classification = instabasePageType;
-      confidence = 0.9; // High confidence in AI classification
-      
-      log('info', 'USING_INSTABASE_CLASSIFICATION', {
-        requestId,
-        filename,
-        pageIndex,
-        classification,
-        confidence
-      });
-    } else {
-      // Strategy 2: Fallback content-based classification
-      const contentAnalysis = analyzePageContent(fields, pageIndex, requestId);
-      classification = contentAnalysis.classification;
-      confidence = contentAnalysis.confidence;
-      
-      log('info', 'USING_CONTENT_BASED_CLASSIFICATION', {
-        requestId,
-        filename,
-        pageIndex,
-        classification,
-        confidence,
-        reasoning: contentAnalysis.reasoning
-      });
-    }
-    
-    classifiedPages.push({
-      pageIndex,
-      page,
-      classification,
-      confidence,
-      fields,
-      hasInvoiceNumber: !!(fields['0']?.value && fields['0'].value !== 'unknown'),
-      hasLineItems: hasLineItemsInPage(fields),
-      hasTotals: !!(fields['8']?.value || fields['9']?.value),
-      hasDueDates: !!fields['6']?.value
-    });
-  });
-  
-  // 🔧 ENHANCED: Post-process classifications for consistency
-  return refinePageClassifications(classifiedPages, requestId, filename);
-}
-
-// 🔧 NEW: Content-based page analysis for fallback classification
-function analyzePageContent(fields, pageIndex, requestId) {
-  const hasInvoiceNumber = fields['0']?.value && fields['0'].value !== 'unknown';
-  const hasLineItems = hasLineItemsInPage(fields);
-  const hasTotals = !!(fields['8']?.value || fields['9']?.value);
-  const hasSupplier = !!(fields['3']?.value);
-  const hasDocumentDate = !!(fields['5']?.value);
-  const hasDueDates = !!(fields['6']?.value);
-  
-  let classification = 'unknown';
-  let confidence = 0.5;
-  let reasoning = [];
-  
-  // Main page indicators
-  if (hasInvoiceNumber && hasSupplier && hasDocumentDate) {
-    classification = 'main';
-    confidence = 0.8;
-    reasoning.push('has invoice number, supplier, and document date');
-  }
-  // Continuation page with line items
-  else if (hasLineItems && !hasInvoiceNumber) {
-    classification = 'continuation';
-    confidence = 0.7;
-    reasoning.push('has line items but no invoice number');
-  }
-  // Summary/final page with totals
-  else if (hasTotals) {
-    classification = 'summary';
-    confidence = 0.8;
-    reasoning.push('contains total amounts');
-  }
-  // Terms page (usually has due dates but no line items or totals)
-  else if (hasDueDates && !hasLineItems && !hasTotals) {
-    classification = 'terms';
-    confidence = 0.6;
-    reasoning.push('has due dates but no line items or totals');
-  }
-  // Fallback based on position
-  else {
-    if (pageIndex === 0) {
-      classification = 'main';
-      confidence = 0.4;
-      reasoning.push('first page fallback');
-    } else {
-      classification = 'continuation';
-      confidence = 0.3;
-      reasoning.push('middle page fallback');
-    }
-  }
-  
-  return {
-    classification,
-    confidence,
-    reasoning: reasoning.join(', '),
-    indicators: {
-      hasInvoiceNumber,
-      hasLineItems,
-      hasTotals,
-      hasSupplier,
-      hasDocumentDate,
-      hasDueDates
-    }
-  };
-}
-
-// 🔧 NEW: Check if page contains line items
-function hasLineItemsInPage(fields) {
-  // Check field 7 (primary line items field)
-  const field7 = fields['7'];
-  if (field7?.value) {
-    if (typeof field7.value === 'string') {
-      try {
-        const parsed = JSON.parse(field7.value);
-        return Array.isArray(parsed) && parsed.length > 0;
-      } catch (e) {
-        return false;
-      }
-    }
-    return Array.isArray(field7.value) && field7.value.length > 0;
-  }
-  
-  // Check any field for arrays that might contain line items
-  for (const fieldKey of Object.keys(fields)) {
-    const fieldValue = fields[fieldKey]?.value;
-    if (Array.isArray(fieldValue) && fieldValue.length > 0) {
-      const firstItem = fieldValue[0];
-      if (typeof firstItem === 'object' || Array.isArray(firstItem)) {
-        return true;
-      }
-    }
-  }
-  
-  return false;
-}
-
-// 🔧 NEW: Refine classifications for consistency
-function refinePageClassifications(classifiedPages, requestId, filename) {
-  log('info', 'REFINING_PAGE_CLASSIFICATIONS', {
-    requestId,
-    filename,
-    pageCount: classifiedPages.length,
-    initialClassifications: classifiedPages.map(cp => cp.classification)
-  });
-  
-  // Ensure we have exactly one main page
-  const mainPages = classifiedPages.filter(cp => cp.classification === 'main');
-  if (mainPages.length === 0) {
-    // Promote the first page with invoice number to main
-    const firstWithInvoice = classifiedPages.find(cp => cp.hasInvoiceNumber);
-    if (firstWithInvoice) {
-      firstWithInvoice.classification = 'main';
-      log('info', 'PROMOTED_TO_MAIN', { requestId, pageIndex: firstWithInvoice.pageIndex });
-    } else {
-      // Fallback: make first page main
-      classifiedPages[0].classification = 'main';
-      log('info', 'FALLBACK_FIRST_PAGE_TO_MAIN', { requestId });
-    }
-  } else if (mainPages.length > 1) {
-    // Keep only the first main page, demote others to continuation
-    for (let i = 1; i < mainPages.length; i++) {
-      mainPages[i].classification = 'continuation';
-      log('info', 'DEMOTED_DUPLICATE_MAIN', { requestId, pageIndex: mainPages[i].pageIndex });
-    }
-  }
-  
-  // Identify summary page (last page with totals)
-  const pagesWithTotals = classifiedPages.filter(cp => cp.hasTotals);
-  if (pagesWithTotals.length > 0) {
-    const lastPageWithTotals = pagesWithTotals[pagesWithTotals.length - 1];
-    if (lastPageWithTotals.classification !== 'main') {
-      lastPageWithTotals.classification = 'summary';
-      log('info', 'IDENTIFIED_SUMMARY_PAGE', { requestId, pageIndex: lastPageWithTotals.pageIndex });
-    }
-  }
-  
-  log('info', 'CLASSIFICATION_REFINEMENT_COMPLETE', {
-    requestId,
-    filename,
-    finalClassifications: classifiedPages.map(cp => cp.classification)
-  });
-  
-  return classifiedPages;
-}
-
-// 🔧 NEW: Merge data from classified pages intelligently
-function mergeDataFromClassifiedPages(classifiedPages, requestId) {
-  log('info', 'MERGING_DATA_FROM_CLASSIFIED_PAGES', {
-    requestId,
-    pageCount: classifiedPages.length,
-    classifications: classifiedPages.map(cp => cp.classification)
-  });
-  
-  let totalAmount = 0;
-  let taxAmount = 0;
-  let supplier = '';
-  let referenceNumber = '';
-  let documentDate = '';
-  let terms = '';
-  const allLineItems = [];
-  let mergedDueDates = { due_date: '', due_date_2: '', due_date_3: '' };
-  
-  // Process pages in priority order: main -> summary -> continuation -> terms
-  const pageOrder = ['main', 'summary', 'continuation', 'terms'];
-  
-  pageOrder.forEach(pageType => {
-    const pagesOfType = classifiedPages.filter(cp => cp.classification === pageType);
-    
-    pagesOfType.forEach(classifiedPage => {
-      const { page, pageIndex, fields } = classifiedPage;
-      
-      log('info', 'PROCESSING_CLASSIFIED_PAGE', {
-        requestId,
-        pageIndex,
-        classification: pageType,
-        processing: 'data extraction'
-      });
-      
-      // Extract supplier (prioritize main page)
-      if (!supplier && fields['3']?.value) {
-        supplier = fields['3'].value;
-      }
-      
-      // Extract reference number (prioritize main page)
-      if (!referenceNumber && fields['10']?.value) {
-        referenceNumber = fields['10'].value;
-      }
-      
-      // Extract document date (prioritize main page)
-      if (!documentDate && fields['5']?.value) {
-        documentDate = fields['5'].value;
-      }
-      
-      // Extract terms (any page)
-      if (!terms && fields['4']?.value) {
-        terms = fields['4'].value;
-      }
-      
-      // Extract totals (prioritize summary page, then main)
-      if (fields['8']?.value && !totalAmount) {
-        const totalStr = String(fields['8'].value).replace(/[^0-9.-]/g, '');
-        const amount = parseFloat(totalStr) || 0;
-        if (amount > totalAmount) {
-          totalAmount = amount;
-          log('info', 'TOTAL_UPDATED', {
-            requestId,
-            pageIndex,
-            pageType,
-            totalAmount,
-            source: 'field_8'
-          });
-        }
-      }
-      
-      if (fields['9']?.value && !taxAmount) {
-        const taxStr = String(fields['9'].value).replace(/[^0-9.-]/g, '');
-        const amount = parseFloat(taxStr) || 0;
-        if (amount > taxAmount) {
-          taxAmount = amount;
-          log('info', 'TAX_UPDATED', {
-            requestId,
-            pageIndex,
-            pageType,
-            taxAmount,
-            source: 'field_9'
-          });
-        }
-      }
-      
-      // Extract due dates (merge from all pages)
-      if (fields['6']) {
-        const pageDueDates = extractDueDatesFromField(fields['6'], requestId, pageIndex);
-        
-        if (pageDueDates.due_date && !mergedDueDates.due_date) {
-          mergedDueDates.due_date = pageDueDates.due_date;
-        }
-        if (pageDueDates.due_date_2 && !mergedDueDates.due_date_2) {
-          mergedDueDates.due_date_2 = pageDueDates.due_date_2;
-        }
-        if (pageDueDates.due_date_3 && !mergedDueDates.due_date_3) {
-          mergedDueDates.due_date_3 = pageDueDates.due_date_3;
-        }
-      }
-      
-      // Extract line items (from all pages with items)
-      if (classifiedPage.hasLineItems) {
-        const pageItems = extractLineItemsFromPage({ fields }, requestId, pageIndex);
-        if (pageItems.length > 0) {
-          allLineItems.push(...pageItems);
-          log('info', 'LINE_ITEMS_MERGED', {
-            requestId,
-            pageIndex,
-            pageType,
-            newItemCount: pageItems.length,
-            totalItemCount: allLineItems.length
-          });
-        }
-      }
-    });
-  });
-  
-  log('info', 'DATA_MERGING_COMPLETE', {
-    requestId,
     totalAmount,
     taxAmount,
     lineItemCount: allLineItems.length,
-    supplier,
-    dueDatesCount: Object.values(mergedDueDates).filter(d => d).length
+    pageCount: pages.length,
+    dueDatesFound: Object.values(mergedDueDates).filter(d => d).length
   });
   
-  return {
-    totalAmount,
-    taxAmount,
-    supplier,
-    referenceNumber,
-    documentDate,
-    terms,
-    allLineItems,
-    dueDates: mergedDueDates
-  };
+  return reconstructedDocument;
 }
 
 // 🔧 NEW: Helper function to extract due dates from field 6
@@ -1247,3 +751,574 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
     });
     
     const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
+    
+    // 🔧 FIXED: Find the actual "Source Request ID" column instead of "name"
+    const sourceRequestIdColumn = columns.find(col => 
+      col.title.toLowerCase() === 'id'
+    );
+    
+    log('info', 'SOURCE_REQUEST_ID_COLUMN_SEARCH', {
+      requestId,
+      foundColumn: !!sourceRequestIdColumn,
+      columnId: sourceRequestIdColumn?.id,
+      columnTitle: sourceRequestIdColumn?.title,
+      allColumns: columns.map(c => ({ id: c.id, title: c.title, type: c.type }))
+    });
+    
+    // Validate subitems column exists
+    const subitemsColumn = columns.find(col => col.type === 'subtasks');
+    log('info', 'BOARD_VALIDATION', {
+      requestId,
+      totalColumns: columns.length,
+      hasSubitemsColumn: !!subitemsColumn,
+      subitemsColumnId: subitemsColumn?.id,
+      subitemsColumnTitle: subitemsColumn?.title,
+      hasSourceRequestIdColumn: !!sourceRequestIdColumn
+    });
+    
+    if (!subitemsColumn) {
+      log('error', 'MISSING_SUBITEMS_COLUMN', {
+        requestId,
+        error: 'Board missing subitems column - cannot create subitems'
+      });
+    }
+    
+    if (!sourceRequestIdColumn) {
+      log('warn', 'MISSING_SOURCE_REQUEST_ID_COLUMN', {
+        requestId,
+        warning: 'No Source Request ID column found - cannot link Instabase run ID'
+      });
+    }
+    
+    for (const doc of documents) {
+      log('info', 'CREATING_MONDAY_ITEM', {
+        requestId,
+        documentType: doc.document_type,
+        invoiceNumber: doc.invoice_number,
+        itemCount: doc.items?.length || 0,
+        isMultiPage: doc.isMultiPageReconstruction || false,
+        originalPageCount: doc.originalPageCount || 1
+      });
+      
+      const escapedSupplier = (doc.supplier_name || '').replace(/"/g, '\\"');
+      const escapedInvoiceNumber = (doc.invoice_number || '').replace(/"/g, '\\"');
+      const escapedDocumentType = (doc.document_type || '').replace(/"/g, '\\"');
+      
+      const formatDate = (dateStr) => {
+        if (!dateStr || dateStr === 'Due Date' || dateStr === 'undefined' || dateStr === 'null') {
+          return '';
+        }
+        try {
+          // Handle various date formats
+          let date;
+          if (typeof dateStr === 'string') {
+            // Clean the date string
+            const cleanDate = dateStr.trim();
+            if (cleanDate.match(/^\d{4}-\d{2}-\d{2}$/)) {
+              // Already in YYYY-MM-DD format
+              return cleanDate;
+            }
+            date = new Date(cleanDate);
+          } else {
+            date = new Date(dateStr);
+          }
+          
+          if (isNaN(date.getTime())) {
+            log('warn', 'INVALID_DATE_FORMAT', { 
+              requestId, 
+              originalDate: dateStr,
+              reason: 'Date parsing failed'
+            });
+            return '';
+          }
+          
+          return date.toISOString().split('T')[0];
+        } catch (e) {
+          log('warn', 'DATE_FORMAT_ERROR', { 
+            requestId, 
+            originalDate: dateStr,
+            error: e.message
+          });
+          return '';
+        }
+      };
+      
+      const columnValues = buildColumnValues(columns, doc, formatDate, instabaseRunId);
+      
+      log('info', 'COLUMN_VALUES_MAPPED', { 
+        requestId, 
+        invoiceNumber: doc.invoice_number,
+        columnValues,
+        docDueDates: {
+          due_date: doc.due_date,
+          due_date_2: doc.due_date_2,
+          due_date_3: doc.due_date_3
+        }
+      });
+      
+      // Create the item - Use Run ID as the primary name/ID
+      const mutation = `
+        mutation {
+          create_item(
+            board_id: ${MONDAY_CONFIG.extractedDocsBoardId}
+            item_name: "${instabaseRunId || 'RUN_PENDING'}"
+            column_values: ${JSON.stringify(JSON.stringify(columnValues))}
+          ) {
+            id
+            name
+          }
+        }
+      `;
+      
+      const response = await axios.post('https://api.monday.com/v2', {
+        query: mutation
+      }, {
+        headers: {
+          'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      if (response.data.errors) {
+        log('error', 'ITEM_CREATION_FAILED', {
+          requestId,
+          errors: response.data.errors
+        });
+        continue;
+      }
+      
+      const createdItemId = response.data.data.create_item.id;
+      log('info', 'ITEM_CREATED_SUCCESS', {
+        requestId,
+        itemId: createdItemId,
+        documentType: doc.document_type,
+        invoiceNumber: doc.invoice_number,
+        isMultiPageReconstruction: doc.isMultiPageReconstruction || false
+      });
+      
+      // Upload PDF file
+      if (originalFiles && originalFiles.length > 0) {
+        const fileColumn = columns.find(col => col.type === 'file');
+        if (fileColumn) {
+          try {
+            await uploadPdfToMondayItem(createdItemId, originalFiles[0].buffer, originalFiles[0].name, fileColumn.id, requestId);
+          } catch (uploadError) {
+            log('error', 'PDF_UPLOAD_FAILED', {
+              requestId,
+              itemId: createdItemId,
+              error: uploadError.message
+            });
+          }
+        }
+      }
+      
+      // 🔧 FIXED: Enhanced subitem creation with proper validation
+      log('info', 'SUBITEM_PROCESSING_START', {
+        requestId,
+        itemId: createdItemId,
+        hasItems: !!(doc.items && doc.items.length > 0),
+        itemCount: doc.items?.length || 0,
+        hasSubitemsColumn: !!subitemsColumn
+      });
+      
+      // Create subitems if we have line items and subitems column exists
+      if (subitemsColumn && doc.items && doc.items.length > 0) {
+        try {
+          log('info', 'CREATING_SUBITEMS', { 
+            requestId, 
+            itemId: createdItemId,
+            lineItemCount: doc.items.length 
+          });
+          
+          await createSubitemsForLineItems(createdItemId, doc.items, columns, requestId);
+          
+        } catch (subitemError) {
+          log('error', 'SUBITEM_CREATION_FAILED', {
+            requestId,
+            itemId: createdItemId,
+            error: subitemError.message,
+            stack: subitemError.stack
+          });
+        }
+      } else {
+        if (!subitemsColumn) {
+          log('warn', 'NO_SUBITEMS_COLUMN', { requestId, itemId: createdItemId });
+        }
+        if (!doc.items || doc.items.length === 0) {
+          log('warn', 'NO_LINE_ITEMS', { 
+            requestId, 
+            itemId: createdItemId,
+            hasItems: !!doc.items,
+            itemsLength: doc.items?.length || 0
+          });
+        }
+      }
+    }
+    
+    log('info', 'ALL_ITEMS_PROCESSED', { requestId, documentCount: documents.length });
+    
+  } catch (error) {
+    log('error', 'CREATE_MONDAY_ITEMS_FAILED', {
+      requestId,
+      error: error.message,
+      stack: error.stack
+    });
+    throw error;
+  }
+}
+
+// 🔧 FIXED: Subitem creation function with proper indexing
+async function createSubitemsForLineItems(parentItemId, items, columns, requestId) {
+  try {
+    log('info', 'SUBITEM_CREATION_START', { requestId, parentItemId, lineItemCount: items.length });
+
+    // 1️⃣ Get the linked board ID from your Subtasks column
+    const subitemsColumn = columns.find(c => c.type === 'subtasks');
+    if (!subitemsColumn) {
+      log('error', 'NO_SUBTASKS_COLUMN_FOUND', { requestId });
+      return;
+    }
+
+    let settings = {};
+    try {
+      settings = JSON.parse(subitemsColumn.settings_str || '{}');
+    } catch (e) {
+      log('error', 'SETTINGS_PARSE_ERROR', { requestId, error: e.message });
+      return;
+    }
+
+    const subitemBoardId = Array.isArray(settings.boardIds)
+      ? settings.boardIds[0]
+      : settings.linked_board_id;
+    
+    if (!subitemBoardId) {
+      log('error', 'MISSING_SUBITEM_BOARD_ID', { requestId, settings });
+      return;
+    }
+
+    log('info', 'SUBITEM_BOARD_IDENTIFIED', { requestId, subitemBoardId });
+
+    // 2️⃣ Fetch that board's columns
+    const colsQuery = `
+      query {
+        boards(ids: [${subitemBoardId}]) {
+          columns { id title type }
+        }
+      }
+    `;
+    
+    const colsResponse = await axios.post('https://api.monday.com/v2', { query: colsQuery }, {
+      headers: { Authorization: `Bearer ${MONDAY_CONFIG.apiKey}` }
+    });
+    
+    const subitemColumns = colsResponse.data.data.boards[0].columns;
+    
+    log('info', 'SUBITEM_COLUMNS_FETCHED', {
+      requestId,
+      subitemBoardId,
+      columnCount: subitemColumns.length,
+      columns: subitemColumns.map(c => ({ 
+        id: c.id, 
+        title: c.title, 
+        type: c.type,
+        titleLowercase: c.title.trim().toLowerCase()
+      }))
+    });
+
+    // 3️⃣ Loop each line item and map into those columns
+    for (let i = 0; i < items.length; i++) {
+      const { item_number, quantity, unit_cost, description, source_page } = items[i];
+      const columnValues = {};
+      
+      // 🔧 FIXED: Use index-based naming and proper column mapping
+      const lineIndex = i + 1; // Start from 1, not 0
+      
+      subitemColumns.forEach(col => {
+        const title = col.title.trim().toLowerCase();
+        
+        // 🔧 FIXED: Look for "line number", "line #", "index", or similar for subitem indexing
+        if (title.includes('line number') || title.includes('line #') || title.includes('subitem') || title === 'index') {
+          columnValues[col.id] = lineIndex; // Use sequential index starting from 1
+        } else if (title === 'item number' || title.includes('item num')) {
+          columnValues[col.id] = item_number || '';
+        } else if (title === 'quantity' || title === 'qty') {
+          if (col.type === 'numbers') {
+            columnValues[col.id] = quantity || 0;
+          } else {
+            columnValues[col.id] = String(quantity || 0);
+          }
+        } else if (title === 'unit cost' || title.includes('unit cost')) {
+          if (col.type === 'numbers') {
+            columnValues[col.id] = unit_cost || 0;
+          } else {
+            columnValues[col.id] = String(unit_cost || 0);
+          }
+        } else if (title === 'description' || title.includes('desc')) {
+          columnValues[col.id] = description || '';
+        } else if (title.includes('source page') || title.includes('page')) {
+          columnValues[col.id] = source_page || '';
+        }
+      });
+
+      log('info', 'SUBITEM_COLUMN_MAPPING', {
+        requestId,
+        lineIndex: lineIndex,
+        itemNumber: item_number,
+        sourcePage: source_page,
+        columnValues
+      });
+
+      // 🔧 FIXED: Create subitem with index-based naming
+      const subitemName = `Line ${lineIndex}`;
+      const escapedName = subitemName.replace(/"/g, '\\"');
+      const columnValuesJson = JSON.stringify(columnValues);
+      
+      const mutation = `
+        mutation {
+          create_subitem(
+            parent_item_id: ${parentItemId}
+            item_name: "${escapedName}"
+            column_values: ${JSON.stringify(columnValuesJson)}
+          ) { 
+            id 
+            name
+          }
+        }
+      `;
+      
+      log('info', 'CREATING_SUBITEM', {
+        requestId,
+        lineIndex: lineIndex,
+        subitemName: escapedName
+      });
+      
+      const response = await axios.post('https://api.monday.com/v2', { query: mutation }, {
+        headers: {
+          Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
+          'Content-Type': 'application/json',
+          'API-Version': '2024-04'
+        }
+      });
+      
+      if (response.data.errors) {
+        log('error', 'SUBITEM_MUTATION_ERRORS', { 
+          requestId, 
+          lineIndex: lineIndex, 
+          errors: response.data.errors 
+        });
+        
+        // Try creating without column values if there are errors
+        const simpleQuery = `
+          mutation {
+            create_subitem(
+              parent_item_id: ${parentItemId}
+              item_name: "${escapedName}"
+            ) { 
+              id 
+              name
+            }
+          }
+        `;
+        
+        const retryResponse = await axios.post('https://api.monday.com/v2', { query: simpleQuery }, {
+          headers: {
+            Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
+            'Content-Type': 'application/json',
+            'API-Version': '2024-04'
+          }
+        });
+        
+        if (retryResponse.data.errors) {
+          log('error', 'SIMPLE_SUBITEM_ALSO_FAILED', {
+            requestId,
+            lineIndex: lineIndex,
+            errors: retryResponse.data.errors
+          });
+        } else {
+          log('info', 'SIMPLE_SUBITEM_SUCCESS', {
+            requestId,
+            lineIndex: lineIndex,
+            subitemId: retryResponse.data.data.create_subitem.id,
+            subitemName: escapedName
+          });
+        }
+      } else {
+        log('info', 'SUBITEM_CREATED', { 
+          requestId, 
+          lineIndex: lineIndex, 
+          subitemId: response.data.data.create_subitem.id,
+          subitemName: escapedName
+        });
+      }
+      
+      // Small pause to avoid rate limits
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+
+    log('info', 'ALL_SUBITEMS_CREATED', { requestId, parentItemId, lineItemCount: items.length });
+    
+  } catch (error) {
+    log('error', 'SUBITEM_CREATION_ERROR', {
+      requestId,
+      parentItemId,
+      error: error.message,
+      stack: error.stack
+    });
+    // Don't throw - continue with other processing
+  }
+}
+
+// 🔧 UPDATED: buildColumnValues function to include Source Request ID mapping
+function buildColumnValues(columns, doc, formatDate, instabaseRunId = null) {
+  const columnValues = {};
+  
+  // Map extracted data to Monday.com columns
+  columns.forEach(col => {
+    const title = col.title.toLowerCase();
+    const id = col.id;
+    const type = col.type;
+    
+    if (title.includes('supplier')) {
+      columnValues[id] = doc.supplier_name || '';
+    } else if (title === 'id') {
+      // 🔧 FIXED: Map Instabase Run ID to ID column (BEFORE generic number rule)
+      columnValues[id] = instabaseRunId || '';
+      console.log(`[DEBUG] Mapped Instabase Run ID: ${instabaseRunId} to ID column ${col.id}`);
+    } else if (title.includes('reference number') || title === 'reference number' || title.includes('reference')) {
+      columnValues[id] = doc.reference_number || '';
+      console.log(`[DEBUG] Mapped reference number: ${doc.reference_number} to column ${col.id}`);
+    } else if (title.includes('document number') || (title.includes('number') && !title.includes('total') && !title.includes('reference') && !title.includes('source') && !title.includes('id'))) {
+      // 🔧 FIXED: Exclude 'id' from generic number rule
+      columnValues[id] = doc.invoice_number || '';
+    } else if (title.includes('document type') || (title.includes('type') && !title.includes('document'))) {
+      if (type === 'dropdown') {
+        let settings = {};
+        try {
+          settings = JSON.parse(col.settings_str || '{}');
+        } catch (e) {
+          // Use default if parsing fails
+        }
+        
+        if (settings.labels && settings.labels.length > 0) {
+          const matchingLabel = settings.labels.find(label => 
+            label.name?.toLowerCase() === (doc.document_type || '').toLowerCase()
+          );
+          
+          if (matchingLabel) {
+            columnValues[id] = matchingLabel.name;
+          } else {
+            columnValues[id] = settings.labels[0].name;
+          }
+        }
+      } else {
+        columnValues[id] = doc.document_type || '';
+      }
+    } else if (title.includes('document date') || (title.includes('date') && !title.includes('due'))) {
+      columnValues[id] = formatDate(doc.document_date);
+    } else if (title === 'due date' || (title.includes('due date') && !title.includes('2') && !title.includes('3'))) {
+      const formattedDate = formatDate(doc.due_date);
+      if (formattedDate) {
+        columnValues[id] = formattedDate;
+      }
+    } else if (title.includes('due date 2')) {
+      const formattedDate = formatDate(doc.due_date_2);
+      if (formattedDate) {
+        columnValues[id] = formattedDate;
+      }
+    } else if (title.includes('due date 3')) {
+      const formattedDate = formatDate(doc.due_date_3);
+      if (formattedDate) {
+        columnValues[id] = formattedDate;
+      }
+    } else if (title.includes('total amount')) {
+      columnValues[id] = doc.total_amount || 0;
+    } else if (title.includes('tax amount')) {
+      columnValues[id] = doc.tax_amount || 0;
+    } else if (title.includes('extraction status') || title.includes('status')) {
+      if (type === 'status') {
+        columnValues[id] = { "index": 1 };
+      } else {
+        columnValues[id] = "Extracted";
+      }
+    }
+  });
+  
+  return columnValues;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8️⃣  HEALTH + TEST ROUTES
+// ----------------------------------------------------------------------------
+app.get('/health', (req, res) => {
+  res.json({ 
+    ok: true, 
+    timestamp: new Date().toISOString(),
+    service: 'digital-mailroom-webhook',
+    version: '4.0.0-multipage-reconstruction'
+  });
+});
+
+app.post('/test/process-item/:id', async (req, res) => {
+  const requestId = `test_${Date.now()}`;
+  try {
+    log('info', 'TEST_PROCESSING_START', { requestId, itemId: req.params.id });
+    
+    const files = await getMondayItemFilesWithPublicUrl(req.params.id, MONDAY_CONFIG.fileUploadsBoardId, requestId);
+    
+    if (files.length === 0) {
+      return res.json({ success: false, message: 'No PDF files found' });
+    }
+    
+    const { files: extracted, originalFiles, runId } = await processFilesWithInstabase(files, requestId);
+    const groups = groupPagesByInvoiceNumber(extracted, requestId);
+    await createMondayExtractedItems(groups, req.params.id, originalFiles, requestId, runId);
+    
+    res.json({ 
+      success: true, 
+      message: 'Processing completed with multi-page reconstruction',
+      requestId,
+      instabaseRunId: runId,
+      filesProcessed: files.length,
+      groupsCreated: groups.length,
+      itemsWithLineItems: groups.filter(g => g.items.length > 0).length,
+      multiPageReconstructions: groups.filter(g => g.isMultiPageReconstruction).length,
+      reconstructionDetails: groups.map(g => ({
+        invoiceNumber: g.invoice_number,
+        isMultiPage: g.isMultiPageReconstruction || false,
+        pageCount: g.originalPageCount || 1,
+        lineItemCount: g.items?.length || 0,
+        totalAmount: g.total_amount
+      }))
+    });
+  } catch (error) {
+    log('error', 'TEST_PROCESSING_ERROR', { requestId, error: error.message });
+    res.status(500).json({ error: error.message, requestId });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9️⃣  START SERVER
+// ----------------------------------------------------------------------------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Digital Mailroom Webhook Server v4.0.0-multipage-reconstruction`);
+  console.log(`📡 Listening on port ${PORT}`);
+  console.log(`🔗 Health check: http://localhost:${PORT}/health`);
+  console.log(`🧪 Test endpoint: POST /test/process-item/:id`);
+  console.log(`📅 Started at: ${new Date().toISOString()}`);
+  console.log(`🔧 Features: Multi-page document reconstruction, smart page merging`);
+});
+
+// -----------------------------------------------------------------------------
+//  🔧 MULTI-PAGE RECONSTRUCTION FEATURES:
+//  1. ✅ Smart filename-based page grouping
+//  2. ✅ Intelligent document reconstruction from split pages
+//  3. ✅ Line item aggregation across all pages
+//  4. ✅ Total/tax extraction from last pages
+//  5. ✅ Due date merging from any page containing them
+//  6. ✅ Invoice number detection with fallback strategies
+//  7. ✅ Enhanced logging for debugging multi-page processing
+//  8. ✅ Source page tracking for line items
+//  9. ✅ Robust error handling and recovery
+//  10. ✅ Run ID linking for Instabase traceability
+// -----------------------------------------------------------------------------
