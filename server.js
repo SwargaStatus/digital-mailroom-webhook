@@ -1,213 +1,240 @@
-// server.js  – Digital-Mailroom webhook (2025-06-25 “clarity” build)
-// ───────────────────────────────────────────────────────────────────
+/*  server.js – Digital-Mailroom webhook (stable June-25-2025 build)
+   ───────────────────────────────────────────────────────────────── */
+
 const express  = require('express');
 const axios    = require('axios');
 const FormData = require('form-data');
-const app = express();
+const app      = express();
 app.use(express.json());
 
-// ─── 1. CONFIG –– KEEP YOUR TOKENS SAFE IN REAL LIFE ──────────────
+/* ───── 1. CONFIG – hard-coded as requested ────────────────────── */
 const INSTABASE = {
   base : 'https://aihub.instabase.com',
   key  : 'jEmrseIwOb9YtmJ6GzPAywtz53KnpS',
   dep  : '0197a3fe-599d-7bac-a34b-81704cc83beb',
   hdr  : {
-    'IB-Context':'sturgeontire',
-    Authorization:'Bearer jEmrseIwOb9YtmJ6GzPAywtz53KnpS',
-    'Content-Type':'application/json'
+    'IB-Context'  : 'sturgeontire',
+    Authorization : 'Bearer jEmrseIwOb9YtmJ6GzPAywtz53KnpS',
+    'Content-Type': 'application/json'
   }
 };
+
 const MONDAY = {
-  key  : 'eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjUzMDYzOTcxOSwiYWFpIjoxMSwidWlkIjo2Nzg2NjA4MywiaWFkIjoiMjAyNS0wNi0yNFQyMjoxNjowMC42NTJaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6MjYyMDQ5OTgsInJnbiI6InVzZTEifQ.zv9EsISZnchs7WKSqN2t3UU1GwcLrzPGeaP7ssKIla8',
-  src  : '9445652448', // File Uploads
-  dst  : '9446325745'  // Extracted Documents
-};
-const AUTH_HDR = { Authorization:`Bearer ${MONDAY.key}` };
-
-// tiny helper
-const gql = async (q, vars={}) => {
-  const r = await axios.post('https://api.monday.com/v2', {query:q,variables:vars},{headers:AUTH_HDR});
-  if (r.data.errors) throw new Error(JSON.stringify(r.data.errors,null,2));
-  return r.data.data;
+  key     : 'eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjUzMDYzOTcxOSwiYWFpIjoxMSwidWlkIjo2Nzg2NjA4MywiaWFkIjoiMjAyNS0wNi0yNFQyMjoxNjowMC42NTJaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6MjYyMDQ5OTgsInJnbiI6InVzZTEifQ.zv9EsISZnchs7WKSqN2t3UU1GwcLrzPGeaP7ssKIla8',
+  uploads : '9445652448',   // File-Uploads board
+  output  : '9446325745'    // Extracted-Docs board
 };
 
-// ─── 2. WEBHOOK ────────────────────────────────────────────────────
-app.post('/webhook/monday-to-instabase', (req,res)=>{
-  if (req.body?.challenge) return res.json({challenge:req.body.challenge});
-  res.json({ok:true});
-  processEvent(req.body).catch(e=>console.error('💥',e));
+/* ───── 2. WEBHOOK ──────────────────────────────────────────────── */
+app.post('/webhook/monday-to-instabase', async (req, res) => {
+  if (req.body?.challenge) return res.json({ challenge: req.body.challenge });
+  res.json({ ok: true });               // respond fast – process later
+  try { await processEvent(req.body); }
+  catch (e) { console.error('❌ async error', e); }
 });
 
-// ─── 3. EVENT → PIPELINE ───────────────────────────────────────────
-async function processEvent(body){
+/* ───── 3. MAIN FLOW ────────────────────────────────────────────── */
+async function processEvent(body) {
   const ev = body.event;
-  if(!ev || ev.columnId!=='status' || ev.value?.label?.text!=='Processing') return;
+  if (!ev) return;
 
-  const itemId = ev.pulseId;
+  const { pulseId:itemId, columnId, value } = ev;
+  if (columnId !== 'status' || value?.label?.text !== 'Processing') return;
+
   console.log('▶️  Start item', itemId);
 
-  // 3-A  pull PDFs
-  const pdfs = await collectPdfAssets(itemId);
-  if(!pdfs.length) { console.log('🚫  No valid PDFs – abort'); return; }
+  /* 1️⃣  collect PDFs (assets + file-column + update attachments) */
+  const pdfAssets = await collectPdfAssets(itemId);
+  if (!pdfAssets.length) { console.log('🛈 No PDFs on item', itemId); return; }
 
-  // 3-B  Instabase
-  const {files, originals} = await instabaseRun(pdfs);
+  /* 2️⃣  Instabase OCR / extraction */
+  const { files: extracted, originals } = await instabaseRun(pdfAssets);
 
-  // 3-C  trivial doc object (one per file)
-  const docs = files.map(f=>({
+  /* 3️⃣  Very light grouping (1 doc ⇢ 1 file) – keep your old logic if needed */
+  const docs = extracted.map(f => ({
     invoice_number : f.original_file_name,
     document_type  : 'Invoice',
-    supplier_name  : '',
-    total_amount   : 0,  tax_amount:0,
-    document_date  : '', due_date : '',
-    items:[], pages:f.documents
+    items          : [],
+    pages          : f.documents
   }));
 
-  // 3-D  push to monday
-  await pushToMonday(docs, originals);
-  console.log('✅  Finished item', itemId);
+  /* 4️⃣  Write to “Extracted Documents” board */
+  await writeToMonday(docs, originals);
 }
 
-// ─── 4. HELPERS ────────────────────────────────────────────────────
-// 4-A  harvest every file on the item
-async function collectPdfAssets(itemId){
-  const pdfs=[];
+/* ───── 4-A.  Collect PDF assets ────────────────────────────────── */
+async function collectPdfAssets(itemId) {
+  const gql = q => axios.post(
+    'https://api.monday.com/v2',
+    { query: q },
+    { headers:{ Authorization:`Bearer ${MONDAY.key}` }, timeout: 10000 }
+  );
 
-  // assets attached to item
-  const i = await gql(`query{ items(ids:[${itemId}]){ assets{id name url public_url file_extension}
-                              column_values{id type value}
-                              updates{ assets{id name url public_url file_extension}}}}`);
-  const item = i.items[0];
+  /* a) item.assets */
+  const q1 = `query { items (ids:[${itemId}]) {
+                 assets { id name file_extension public_url url }
+                 column_values { id type value text }
+               } }`;
+  const { data } = await gql(q1);
+  const item    = data.data.items?.[0] || {};
+  const list    = [];
 
-  const dumpAssets = (arr,label)=>{
-    console.log(`   • ${arr.length} assets in ${label}`);
-    arr.forEach(a=>console.log(`     · ${a.id}  ${a.name}`));
-  };
+  console.log('   •', item.assets?.length || 0, 'assets in item.assets');
+  item.assets?.forEach(a=>console.log('     ·', a.id, a.name));
 
-  dumpAssets(item.assets,'item.assets');
+  (item.assets||[]).forEach(a => list.push(a));
 
-  // file columns
-  let colAssets=[];
-  for(const c of item.column_values.filter(c=>c.type==='file' && c.value)){
-    try{
-      const val = JSON.parse(c.value);
-      (val.assets||val.files||[]).forEach(a=>colAssets.push(a));
-    }catch{/*ignore*/}
+  /* b) any FILE column that embeds an asset but wasn’t in item.assets */
+  const fileCols = (item.column_values||[])
+    .filter(c => c.type==='file')
+    .map(c => { try { return JSON.parse(c.value||'{}'); } catch{return {}; }})
+    .flatMap(v => v.files || []);
+  console.log('   •', fileCols.length, 'assets in file columns');
+  fileCols.forEach(a=>console.log('     ·', a.assetId, a.fileName));
+  list.push(...fileCols.map(f => ({
+    id:f.assetId, name:f.fileName, file_extension:f.fileExtension
+  })));
+
+  /* c) assets attached to updates */
+  const qUpdates = `query { updates (item_id:${itemId}) { assets {
+                     id name file_extension public_url url } } }`;
+  const upRes = await gql(qUpdates);
+  const updAssets = upRes.data.data.updates.flatMap(u => u.assets || []);
+  console.log('   •', updAssets.length, 'assets in updates');
+  updAssets.forEach(a=>console.log('     ·', a.id, a.name));
+  list.push(...updAssets);
+
+  /* d) de-duplicate on id */
+  const uniq = Object.values(
+    list.reduce((acc,a)=>{ acc[a.id]=acc[a.id]||a; return acc;}, {})
+  ).filter(a => (a.file_extension||'').toLowerCase()==='pdf');
+
+  /* e) ensure we have a usable URL */
+  const needURL = uniq.filter(a => !(a.public_url||a.url));
+  if (needURL.length) {
+    const ids = needURL.map(a=>a.id).join(',');
+    const q2 = `query { assets (ids:[${ids}]) { id public_url url } }`;
+    const { data:{data:{assets}} } = await gql(q2);
+    const map = Object.fromEntries(assets.map(a=>[a.id, a]));
+    needURL.forEach(a => Object.assign(a, map[a.id]||{}));
   }
-  dumpAssets(colAssets,'file columns');
 
-  // updates
-  const upAssets = item.updates.flatMap(u=>u.assets||[]);
-  dumpAssets(upAssets,'updates');
+  const ready = uniq.filter(a => a.public_url || a.url)
+                    .map(a => ({
+                      name       : a.name,
+                      public_url : a.public_url || a.url,
+                      id         : a.id
+                    }));
 
-  const all = [...item.assets,...colAssets,...upAssets];
-
-  // second query to get signed URLs where missing
-  const missing = all.filter(a=>!a.public_url && !a.url).map(a=>a.id);
-  if(missing.length){
-    const m = await gql(`query{ assets(ids:[${missing.join(',')}]){id url public_url file_extension}}`);
-    const byId = Object.fromEntries(m.assets.map(a=>[a.id,a]));
-    all.forEach(a=>{ if(!a.url && byId[a.id]) Object.assign(a,byId[a.id]); });
-  }
-
-  // keep only PDFs
-  all.filter(a=>{
-    const name=a.name.toLowerCase();
-    const ext =(a.file_extension||'').toLowerCase();
-    const ok = name.endsWith('.pdf') || ext==='pdf';
-    if(ok) pdfs.push({name:a.name, public_url:a.public_url||a.url, assetId:a.id});
-    else   console.log('      (skip non-PDF)',a.name);
-  });
-
-  console.log(`   → ${pdfs.length} PDF(s) ready`);
-  return pdfs;
+  console.log('   →', ready.length, 'PDF(s) ready');
+  return ready;
 }
 
-// 4-B  Instabase batch ▸ run ▸ results
-async function instabaseRun(files){
+/* ───── 4-B.  Instabase run ─────────────────────────────────────── */
+async function instabaseRun(files) {
+  const ib = INSTABASE;
+
+  /* batch */
   console.log('☁️  Instabase - create batch');
-  const batch = await axios.post(`${INSTABASE.base}/api/v2/batches`,
-                                 {workspace:'nileshn_sturgeontire.com'},
-                                 {headers:INSTABASE.hdr});
+  const batch = await axios.post(`${ib.base}/api/v2/batches`,
+                { workspace:'nileshn_sturgeontire.com' },
+                { headers: ib.hdr, timeout:10000 });
   const batchId = batch.data.id;
 
-  const originals=[];
-  for(const f of files){
-    const buf = Buffer.from((await axios.get(f.public_url,{responseType:'arraybuffer'})).data);
-    originals.push({name:f.name, buffer:buf});
-    await axios.put(`${INSTABASE.base}/api/v2/batches/${batchId}/files/${encodeURIComponent(f.name)}`,
-                    buf,{headers:{...INSTABASE.hdr,'Content-Type':'application/octet-stream'}});
-    console.log('   ↑ uploaded',f.name);
+  const originals = [];
+
+  /* upload */
+  for (const f of files) {
+    console.log('   ↑ uploading', f.name);
+    const buf = Buffer.from((await axios.get(f.public_url,
+                     { responseType:'arraybuffer', timeout:20000 })).data);
+    originals.push({ name:f.name, buffer:buf });
+
+    await axios.put(
+      `${ib.base}/api/v2/batches/${batchId}/files/${encodeURIComponent(f.name)}`,
+      buf,
+      { headers:{ ...ib.hdr, 'Content-Type':'application/octet-stream' },
+        timeout: 30000 }
+    );
   }
 
-  const run = await axios.post(`${INSTABASE.base}/api/v2/apps/deployments/${INSTABASE.dep}/runs`,
-                               {batch_id:batchId},{headers:INSTABASE.hdr});
-  const runId = run.data.id;
-  console.log('   ▶ run',runId);
+  /* run */
+  const runRes = await axios.post(
+    `${ib.base}/api/v2/apps/deployments/${ib.dep}/runs`,
+    { batch_id:batchId },
+    { headers: ib.hdr, timeout:10000 }
+  );
+  const runId = runRes.data.id;
 
-  let status='RUNNING', t=0;
-  while(['RUNNING','PENDING'].includes(status) && t<60){
+  /* poll */
+  let status='RUNNING', n=0;
+  while(['RUNNING','PENDING'].includes(status) && n<60){
     await new Promise(r=>setTimeout(r,5000));
-    status = (await axios.get(`${INSTABASE.base}/api/v2/apps/runs/${runId}`,
-                              {headers:INSTABASE.hdr})).data.status;
-    t++; process.stdout.write(`      … ${status}\r`);
+    status = (await axios.get(`${ib.base}/api/v2/apps/runs/${runId}`,
+              { headers:ib.hdr, timeout:10000 })).data.status;
+    n++;
   }
-  if(status!=='COMPLETE') throw new Error('Instabase failed: '+status);
-  console.log('\n   ✔ finished');
+  if(status!=='COMPLETE') throw new Error('Instabase run failed: '+status);
 
-  const res = await axios.get(`${INSTABASE.base}/api/v2/apps/runs/${runId}/results`,
-                              {headers:INSTABASE.hdr});
-  return {files:res.data.files, originals};
+  const res = await axios.get(`${ib.base}/api/v2/apps/runs/${runId}/results`,
+              { headers:ib.hdr, timeout:20000 });
+  return { files: res.data.files, originals };
 }
 
-// 4-C  push one row per doc, attach first PDF
-async function pushToMonday(docs, originals){
-  // fetch column metadata once
-  const meta = await gql(`query{ boards(ids:[${MONDAY.dst}]){ columns{id title type} }}`);
-  const cols = meta.boards[0].columns;
-  const numCol = cols.find(c=>/document number/i.test(c.title));
+/* ───── 4-C.  Write results to monday board ─────────────────────── */
+async function writeToMonday(docs, originals){
+  const auth = { Authorization:`Bearer ${MONDAY.key}` };
+
+  /* board columns */
+  const meta = await axios.post('https://api.monday.com/v2',
+    { query:`query{ boards(ids:[${MONDAY.output}]){ columns{id title type} }}`},
+    { headers:auth, timeout:10000 });
+  const cols = meta.data.data.boards[0].columns;
+  const numCol = cols.find(c=>/Document Number/i.test(c.title));
   const fileCol= cols.find(c=>c.type==='file');
 
   for(const d of docs){
-    const colVals = { [numCol.id] : d.invoice_number };
-    const created = await gql(
-      `mutation($v:JSON!){ create_item(board_id:${MONDAY.dst},
-                   item_name:"${d.document_type} ${d.invoice_number}",
-                   column_values:$v){ id }}`, { v: JSON.stringify(colVals) }
-    );
-    const id = created.create_item.id;
-    console.log('   ➕ row',id);
+    const vals = { [numCol.id]: d.invoice_number };
+
+    const create = await axios.post('https://api.monday.com/v2',{
+      query:`mutation{ create_item(board_id:${MONDAY.output},
+        item_name:"${d.document_type} ${d.invoice_number}",
+        column_values:${JSON.stringify(JSON.stringify(vals))}){id}}`
+    },{ headers:auth, timeout:10000 });
+
+    const itemId = create.data.data.create_item.id;
 
     if(fileCol && originals.length){
-      await uploadFile(id, originals[0], fileCol.id);
+      await uploadFileToMonday(itemId, originals[0], fileCol.id);
     }
   }
 }
 
-// 4-D  robust /v2/file uploader
-async function uploadFile(itemId, file, colId){
+/* ───── 4-D.  File upload helper ────────────────────────────────── */
+async function uploadFileToMonday(itemId, {buffer,name}, colId){
   const ops = {
-    query:`mutation ($file:File!,$item_id:Int!,$column_id:String!){
-             add_file_to_column(file:$file,item_id:$item_id,column_id:$column_id){id}}`,
-    variables:{ file:null, item_id:itemId, column_id:colId }
+    query:`mutation ($file: File!, $itemId: Int!, $col: String!){
+             add_file_to_column(file:$file,item_id:$itemId,column_id:$col){id}}`,
+    variables:{ file:null, itemId:Number(itemId), col:colId }
   };
   const form = new FormData();
-  form.append('operations',JSON.stringify(ops));
-  form.append('map',JSON.stringify({'0':['variables.file']}));
-  form.append('0',file.buffer,{filename:file.name,contentType:'application/pdf'});
+  form.append('operations', JSON.stringify(ops));
+  form.append('map', JSON.stringify({ '0':['variables.file'] }));
+  form.append('0', buffer, { filename:name, contentType:'application/pdf' });
 
-  try{
-    const r = await axios.post('https://api.monday.com/v2/file',form,
-               {headers:{...form.getHeaders(), ...AUTH_HDR}});
-    console.log('     📎 attached', r.data.data.add_file_to_column.id);
-  }catch(e){
-    console.error('🟥 monday 400', JSON.stringify(e.response?.data||e, null, 2));
-    throw e;
-  }
+  const { data } = await axios.post(
+    'https://api.monday.com/v2/file',
+    form,
+    { headers:{ ...form.getHeaders(), Authorization:`Bearer ${MONDAY.key}` },
+      timeout:20000 }
+  );
+  if(data.errors) throw new Error(JSON.stringify(data.errors));
+  console.log('📎 PDF attached →', data.data.add_file_to_column.id);
 }
 
-// ─── 5. HOUSEKEEPING ───────────────────────────────────────────────
-app.get('/health',(q,s)=>s.json({status:'ok',ts:Date.now()}));
+/* ───── 5. misc ─────────────────────────────────────────────────── */
+app.get('/health',(req,res)=>res.json({ status:'healthy', ts:Date.now() }));
 const PORT = process.env.PORT||8080;
 app.listen(PORT,'0.0.0.0',()=>console.log('🚀 webhook on',PORT));
+
 module.exports = app;
