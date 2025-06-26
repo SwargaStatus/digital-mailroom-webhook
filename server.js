@@ -878,12 +878,12 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         }
       });
       
-      // Create the item
+      // Create the item - Use Run ID as the primary name/ID
       const mutation = `
         mutation {
           create_item(
             board_id: ${MONDAY_CONFIG.extractedDocsBoardId}
-            item_name: "${escapedDocumentType.toUpperCase()} ${escapedInvoiceNumber}"
+            item_name: "${instabaseRunId || 'RUN_PENDING'}"
             column_values: ${JSON.stringify(JSON.stringify(columnValues))}
           ) {
             id
