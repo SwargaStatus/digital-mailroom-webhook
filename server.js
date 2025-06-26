@@ -813,7 +813,12 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
     const subitemsColumn = columns.find(c => c.type === 'subtasks');
     const settings = JSON.parse(subitemsColumn.settings_str);
     log('info', 'SUBTASKS_COLUMN_PARSED_SETTINGS', { requestId, settings });
-    const subitemBoardId = settings.linkedBoardId || settings.linked_board_id;
+    // Instabase now returns an array `boardIds` → take the first one:
+    const subitemBoardId = settings.boardIds?.[0];
+    if (!subitemBoardId) {
+      log('error', 'MISSING_SUBITEM_BOARD_ID', { requestId, settings });
+      return;
+    }
 
     // 2️⃣ Fetch that board’s columns:
     const colsQ = `
