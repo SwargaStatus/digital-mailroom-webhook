@@ -2,6 +2,30 @@ function groupPagesByInvoiceNumber(extractedFiles) {
   console.log('=== GROUPING DEBUG ===');
   console.log('Input files:', extractedFiles?.length || 0);
   
+  // 🚨 IMMEDIATE DEBUG - Let's see what we're working with
+  if (extractedFiles && extractedFiles.length > 0) {
+    console.log('📄 FILE 0 EXISTS, checking documents...');
+    const file = extractedFiles[0];
+    if (file.documents && file.documents.length > 0) {
+      console.log(`📄 FOUND ${file.documents.length} DOCUMENTS`);
+      
+      file.documents.forEach((doc, docIndex) => {
+        console.log(`📄 DOC ${docIndex} - Fields available:`, Object.keys(doc.fields || {}));
+        
+        // Check field 7 specifically
+        const field7 = doc.fields?.['7'];
+        console.log(`📄 DOC ${docIndex} - Field 7: exists=${!!field7}, hasValue=${!!field7?.value}, type=${typeof field7?.value}`);
+        
+        if (field7?.value && Array.isArray(field7.value)) {
+          console.log(`📄 DOC ${docIndex} - Field 7 is array with ${field7.value.length} items!`);
+          if (field7.value.length > 0) {
+            console.log(`📄 DOC ${docIndex} - First item in field 7:`, JSON.stringify(field7.value[0]));
+          }
+        }
+      });
+    }
+  }
+  
   const documentGroups = {};
   
   if (!extractedFiles || extractedFiles.length === 0) {
