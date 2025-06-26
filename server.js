@@ -740,189 +740,11 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         }
       }
       
-      // 🔧 FIXED: Enhanced subitem creation with proper validation
-      log('info', 'SUBITEM_PROCESSING_START', {
-        requestId,
-        itemId: createdItemId,
-        hasItems: !!(doc.items && doc.items.length > 0),
-        itemCount: doc.items?.length || 0,
-        hasSubitemsColumn: !!subitemsColumn
-      });
-      
-      // Create subitems if we have line items and subitems column exists
-      if (subitemsColumn && doc.items && doc.items.length > 0) {
-        try {
-          log('info', 'CREATING_SUBITEMS', { 
-            requestId, 
-            itemId: createdItemId,
-            lineItemCount: doc.items.length 
-          });
-          
-          await createSubitemsForLineItems(createdItemId, doc.items, columns, requestId);
-          
-        } catch (subitemError) {
-          log('error', 'SUBITEM_CREATION_FAILED', {
-            requestId,
-            itemId: createdItemId,
-            error: subitemError.message,
-            stack: subitemError.stack
-          });
-        }
-      } else {
-        if (!subitemsColumn) {
-          log('warn', 'NO_SUBITEMS_COLUMN', { requestId, itemId: createdItemId });
-        }
-        if (!doc.items || doc.items.length === 0) {
-          log('warn', 'NO_LINE_ITEMS', { 
-            requestId, 
-            itemId: createdItemId,
-            hasItems: !!doc.items,
-            itemsLength: doc.items?.length || 0
-          });
-        }
-      }
-    }
-    
-    log('info', 'ALL_ITEMS_PROCESSED', { requestId, documentCount: documents.length });
-    
-  } catch (error) {
-    log('error', 'CREATE_MONDAY_ITEMS_FAILED', {
-      requestId,
-      error: error.message,
-      stack: error.stack
-    });
+} catch (error) {
+    log('error', 'CREATE_MONDAY_ITEMS_FAILED', { requestId, error: error.message, stack: error.stack });
     throw error;
   }
-}
-
-// 🔧 COMPLETELY REWRITTEN: Subitem creation function
-async function createSubitemsForLineItems(parentItemId, items, columns, requestId) {
-  try {
-    log('info', 'SUBITEM_CREATION_START', { requestId, parentItemId, lineItemCount: items.length });
-
-    // 1️⃣ Read your “subtasks” column’s settings and pull the linked board ID
-    const subitemsColumn = columns.find(c => c.type === 'subtasks');
-    const settings = JSON.parse(subitemsColumn.settings_str);
-    log('info', 'SUBTASKS_COLUMN_PARSED_SETTINGS', { requestId, settings });
-    // Monday’s API now uses an array `boardIds`
-    const subitemBoardId = Array.isArray(settings.boardIds)
-      ? settings.boardIds[0]
-      : settings.linked_board_id;
-    if (!subitemBoardId) {
-      log('error', 'MISSING_SUBITEM_BOARD_ID', { requestId, settings });
-      return;
-    }
-
-    // 2️⃣ Fetch that board’s columns
-    const colsQ = `
-      query {
-        boards(ids: [${subitemBoardId}]) {
-          columns { id title type }
-        }
-      }
-    `;
-    const colsRes = await axios.post('https://api.monday.com/v2', { query: colsQ }, {
-      headers: { Authorization: `Bearer ${MONDAY_CONFIG.apiKey}` }
-    });
-    const subitemColumns = colsRes.data.data.boards[0].columns;
-
-    // 3️⃣ Loop each line item and map into your target subitem columns
-    for (let i = 0; i < items.length; i++) {
-      const { item_number, quantity, unit_cost } = items[i];
-      const columnValues = {};
-      subitemColumns.forEach(col => {
-        const t = col.title.trim().toLowerCase();
-        if (t === 'item number') columnValues[col.id] = item_number;
-        if (t === 'quantity')    columnValues[col.id] = quantity;
-        if (t === 'unit cost')   columnValues[col.id] = unit_cost;
-      });
-
-      // 4️⃣ Fire the create_subitem mutation
-      const m = `
-        mutation {
-          create_subitem(
-            parent_item_id: ${parentItemId}
-            item_name: "${item_number}"
-            column_values: ${JSON.stringify(JSON.stringify(columnValues))}
-          ) { id }
-        }
-      `;
-      await axios.post('https://api.monday.com/v2', { query: m }, {
-        headers: {
-          Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
-          'API-Version': '2024-04'
-        }
-      });
-
-      // small delay to avoid rate limiting
-      await new Promise(r => setTimeout(r, 250));
-    }
-
-    log('info', 'ALL_SUBITEMS_CREATED', { requestId, parentItemId, lineItemCount: items.length });
-  } catch (error) {
-    log('error', 'SUBITEM_CREATION_ERROR', { requestId, parentItemId, error: error.message });
-  }
-}
-
-function buildColumnValues(columns, doc, formatDate) {
-  const columnValues = {};
-  
-  // Map extracted data to Monday.com columns
-  columns.forEach(col => {
-    const title = col.title.toLowerCase();
-    const id = col.id;
-    const type = col.type;
-    
-    if (title.includes('supplier')) {
-      columnValues[id] = doc.supplier_name || '';
-    } else if (title.includes('document number') || (title.includes('number') && !title.includes('total'))) {
-      columnValues[id] = doc.invoice_number || '';
-    } else if (title.includes('document type') || (title.includes('type') && !title.includes('document'))) {
-      if (type === 'dropdown') {
-        let settings = {};
-        try {
-          settings = JSON.parse(col.settings_str || '{}');
-        } catch (e) {
-          // Use default if parsing fails
-        }
-        
-        if (settings.labels && settings.labels.length > 0) {
-          const matchingLabel = settings.labels.find(label => 
-            label.name?.toLowerCase() === (doc.document_type || '').toLowerCase()
-          );
-          
-          if (matchingLabel) {
-            columnValues[id] = matchingLabel.name;
-          } else {
-            columnValues[id] = settings.labels[0].name;
-          }
-        }
-      } else {
-        columnValues[id] = doc.document_type || '';
-      }
-    } else if (title.includes('document date') || (title.includes('date') && !title.includes('due'))) {
-      columnValues[id] = formatDate(doc.document_date);
-    } else if (title === 'due date' || (title.includes('due date') && !title.includes('2') && !title.includes('3'))) {
-      columnValues[id] = formatDate(doc.due_date);
-    } else if (title.includes('due date 2')) {
-      columnValues[id] = formatDate(doc.due_date_2);
-    } else if (title.includes('due date 3')) {
-      columnValues[id] = formatDate(doc.due_date_3);
-    } else if (title.includes('total amount')) {
-      columnValues[id] = doc.total_amount || 0;
-    } else if (title.includes('tax amount')) {
-      columnValues[id] = doc.tax_amount || 0;
-    } else if (title.includes('extraction status') || title.includes('status')) {
-      if (type === 'status') {
-        columnValues[id] = { "index": 1 };
-      } else {
-        columnValues[id] = "Extracted";
-      }
-    }
-  });
-  
-  return columnValues;
-}
+}   // ← closes async function createMondayExtractedItems
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 8️⃣  HEALTH + TEST ROUTES
@@ -1044,8 +866,77 @@ app.post('/test/debug-extraction/:id', async (req, res) => {
     log('error', 'DEBUG_EXTRACTION_ERROR', { requestId, error: error.message });
     res.status(500).json({ error: error.message, requestId });
   }
+}
 });
+// 🔧 FINAL: Subitem creation (after you’ve confirmed the mapping)
+// ─────────────────────────────────────────────────────────────────────────────
+async function createSubitemsForLineItems(parentItemId, items, columns, requestId) {
+  log('info', 'SUBITEM_CREATION_START', { requestId, parentItemId, lineItemCount: items.length });
 
+  // 1️⃣ Get the linked board ID from your Subtasks column
+  const subitemsColumn = columns.find(c => c.type === 'subtasks');
+  const settings = JSON.parse(subitemsColumn.settings_str);
+  const subitemBoardId = Array.isArray(settings.boardIds)
+    ? settings.boardIds[0]
+    : settings.linked_board_id;
+  if (!subitemBoardId) {
+    log('error', 'MISSING_SUBITEM_BOARD_ID', { requestId, settings });
+    return;
+  }
+
+  // 2️⃣ Fetch that board’s columns
+  const colsQ = `
+    query {
+      boards(ids: [${subitemBoardId}]) {
+        columns { id title type }
+      }
+    }
+  `;
+  const colsRes = await axios.post('https://api.monday.com/v2', { query: colsQ }, {
+    headers: { Authorization: `Bearer ${MONDAY_CONFIG.apiKey}` }
+  });
+  const subitemColumns = colsRes.data.data.boards[0].columns;
+
+  // 3️⃣ Loop each line item and map into those columns
+  for (let i = 0; i < items.length; i++) {
+    const { item_number, quantity, unit_cost } = items[i];
+    const columnValues = {};
+    subitemColumns.forEach(col => {
+      const t = col.title.trim().toLowerCase();
+      if (t === 'item number') columnValues[col.id] = item_number;
+      if (t === 'quantity')    columnValues[col.id] = quantity;
+      if (t === 'unit cost')   columnValues[col.id] = unit_cost;
+    });
+
+    // 4️⃣ Create the subitem
+    const escapedValues = JSON.stringify(columnValues).replace(/"/g, '\\"');
+    const m = `
+      mutation {
+        create_subitem(
+          parent_item_id: ${parentItemId}
+          item_name: "${item_number}"
+          column_values: "${escapedValues}"
+        ) { id }
+      }
+    `;
+    const res = await axios.post('https://api.monday.com/v2', { query: m }, {
+      headers: {
+        Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'Content-Type': 'application/json',
+        'API-Version': '2024-04'
+      }
+    });
+    if (res.data.errors) {
+      log('error','SUBITEM_MUTATION_ERRORS',{ requestId, lineIndex: i+1, errors: res.data.errors });
+    } else {
+      log('info','SUBITEM_CREATED',{ requestId, lineIndex: i+1, id: res.data.data.create_subitem.id });
+    }
+    // small pause to avoid rate limits
+    await new Promise(r => setTimeout(r, 250));
+  }
+
+  log('info', 'ALL_SUBITEMS_CREATED', { requestId, parentItemId, lineItemCount: items.length });
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // 9️⃣  START SERVER
 // ----------------------------------------------------------------------------
