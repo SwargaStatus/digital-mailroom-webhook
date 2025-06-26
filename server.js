@@ -355,9 +355,11 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
         log('info', 'FIELD_7_MISSING', { requestId, docIndex });
       }
       
-      // Check ALL fields for potential line items data
+      // Check ALL fields for potential due date data
       Object.keys(fields).forEach(fieldKey => {
         const fieldValue = fields[fieldKey]?.value;
+        
+        // Log arrays
         if (Array.isArray(fieldValue) && fieldValue.length > 0) {
           log('info', 'ARRAY_FIELD_FOUND', {
             requestId,
@@ -365,6 +367,16 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
             arrayLength: fieldValue.length,
             firstElement: fieldValue[0],
             fullArray: fieldValue
+          });
+        }
+        
+        // Log potential date fields
+        if (fieldValue && typeof fieldValue === 'string' && 
+            (fieldValue.includes('2025') || fieldValue.includes('2024') || fieldValue.includes('2026'))) {
+          log('info', 'POTENTIAL_DATE_FIELD', {
+            requestId,
+            fieldKey,
+            value: fieldValue
           });
         }
       });
@@ -386,7 +398,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
       const terms = fields['4']?.value || '';
       const documentDate = fields['5']?.value || '';
       
-      // 🔧 FIXED: Extract due dates from Field 6 (can be table format)
+      // 🔧 FIXED: Extract due dates from Field 6 (can be table format with header row)
       const raw6 = fields['6'];
       let dueDates = { due_date: '', due_date_2: '', due_date_3: '' };
       
@@ -397,13 +409,14 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
           try {
             const parsed = JSON.parse(v.trim());
             if (Array.isArray(parsed)) {
-              // Handle array of due dates
-              dueDates.due_date = parsed[0] || '';
-              dueDates.due_date_2 = parsed[1] || '';
-              dueDates.due_date_3 = parsed[2] || '';
-              log('info', 'DUE_DATES_PARSED_FROM_JSON_ARRAY', { 
+              // Handle array of due dates - skip header row (index 0)
+              dueDates.due_date = parsed[1] || '';     // Row 1 = first due date
+              dueDates.due_date_2 = parsed[2] || '';   // Row 2 = second due date  
+              dueDates.due_date_3 = parsed[3] || '';   // Row 3 = third due date
+              log('info', 'DUE_DATES_PARSED_FROM_JSON_ARRAY_SKIP_HEADER', { 
                 requestId, 
-                dueDates: parsed,
+                rawArray: parsed,
+                header: parsed[0],
                 mappedDates: dueDates
               });
             } else {
@@ -417,34 +430,37 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
             log('info', 'DUE_DATE_AS_STRING', { requestId, dueDate: dueDates.due_date });
           }
         } else if (Array.isArray(v)) {
-          // Direct array of due dates
-          dueDates.due_date = v[0] || '';
-          dueDates.due_date_2 = v[1] || '';
-          dueDates.due_date_3 = v[2] || '';
-          log('info', 'DUE_DATES_DIRECT_ARRAY', { 
+          // Direct array of due dates - skip header row (index 0)
+          dueDates.due_date = v[1] || '';     // Row 1 = first due date
+          dueDates.due_date_2 = v[2] || '';   // Row 2 = second due date
+          dueDates.due_date_3 = v[3] || '';   // Row 3 = third due date
+          log('info', 'DUE_DATES_DIRECT_ARRAY_SKIP_HEADER', { 
             requestId, 
-            dueDates: v,
+            rawArray: v,
+            header: v[0],
             mappedDates: dueDates
           });
         } else if (v?.tables && Array.isArray(v.tables[0]?.rows)) {
-          // Table format - extract dates from rows
+          // Table format - extract dates from rows, skip header row (index 0)
           const rows = v.tables[0].rows;
-          dueDates.due_date = rows[0] || '';
-          dueDates.due_date_2 = rows[1] || '';
-          dueDates.due_date_3 = rows[2] || '';
-          log('info', 'DUE_DATES_FROM_TABLE', { 
+          dueDates.due_date = rows[1] || '';     // Row 1 = first due date
+          dueDates.due_date_2 = rows[2] || '';   // Row 2 = second due date
+          dueDates.due_date_3 = rows[3] || '';   // Row 3 = third due date
+          log('info', 'DUE_DATES_FROM_TABLE_SKIP_HEADER', { 
             requestId, 
             tableRows: rows,
+            header: rows[0],
             mappedDates: dueDates
           });
         } else if (v?.rows) {
-          // Direct rows format
-          dueDates.due_date = v.rows[0] || '';
-          dueDates.due_date_2 = v.rows[1] || '';
-          dueDates.due_date_3 = v.rows[2] || '';
-          log('info', 'DUE_DATES_FROM_ROWS', { 
+          // Direct rows format - skip header row (index 0)
+          dueDates.due_date = v.rows[1] || '';     // Row 1 = first due date
+          dueDates.due_date_2 = v.rows[2] || '';   // Row 2 = second due date
+          dueDates.due_date_3 = v.rows[3] || '';   // Row 3 = third due date
+          log('info', 'DUE_DATES_FROM_ROWS_SKIP_HEADER', { 
             requestId, 
             rows: v.rows,
+            header: v.rows[0],
             mappedDates: dueDates
           });
         } else {
@@ -512,7 +528,9 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
         supplier,
         totalAmount,
         hasItemsData: !!itemsData,
-        itemsDataLength: Array.isArray(itemsData) ? itemsData.length : 'N/A'
+        itemsDataLength: Array.isArray(itemsData) ? itemsData.length : 'N/A',
+        dueDatesExtracted: dueDates,
+        field6Raw: fields['6']?.value
       });
       
       if (!invoiceNumber || invoiceNumber === 'none' || invoiceNumber === 'unknown') {
