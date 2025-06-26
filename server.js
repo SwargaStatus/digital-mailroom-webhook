@@ -1,6 +1,6 @@
-// Digital Mailroom Webhook — FULLY FIXED VERSION with Working Subitems
+// Digital Mailroom Webhook — FINAL VERSION with Source ID & Subitem Index Fixes
 // -----------------------------------------------------------------------------
-// This version fixes all subitem creation issues and line item processing
+// This version fixes Source Request ID linking and subitem indexing
 // -----------------------------------------------------------------------------
 
 const express   = require('express');
@@ -742,7 +742,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 7️⃣  ENHANCED MONDAY ITEMS CREATION WITH FIXED SUBITEMS
+// 7️⃣  ENHANCED MONDAY ITEMS CREATION WITH FIXED SOURCE ID & SUBITEM INDEXING
 // ----------------------------------------------------------------------------
 async function createMondayExtractedItems(documents, sourceItemId, originalFiles, requestId, instabaseRunId) {
   try {
@@ -774,6 +774,21 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
     
     const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
     
+    // 🔧 FIXED: Find the actual "Source Request ID" column instead of "name"
+    const sourceRequestIdColumn = columns.find(col => 
+      col.title.toLowerCase().includes('source request id') || 
+      col.title.toLowerCase().includes('source id') ||
+      col.title.toLowerCase() === 'source request id'
+    );
+    
+    log('info', 'SOURCE_REQUEST_ID_COLUMN_SEARCH', {
+      requestId,
+      foundColumn: !!sourceRequestIdColumn,
+      columnId: sourceRequestIdColumn?.id,
+      columnTitle: sourceRequestIdColumn?.title,
+      allColumns: columns.map(c => ({ id: c.id, title: c.title, type: c.type }))
+    });
+    
     // Validate subitems column exists
     const subitemsColumn = columns.find(col => col.type === 'subtasks');
     log('info', 'BOARD_VALIDATION', {
@@ -782,13 +797,20 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
       hasSubitemsColumn: !!subitemsColumn,
       subitemsColumnId: subitemsColumn?.id,
       subitemsColumnTitle: subitemsColumn?.title,
-      allColumns: columns.map(c => ({ id: c.id, title: c.title, type: c.type }))
+      hasSourceRequestIdColumn: !!sourceRequestIdColumn
     });
     
     if (!subitemsColumn) {
       log('error', 'MISSING_SUBITEMS_COLUMN', {
         requestId,
         error: 'Board missing subitems column - cannot create subitems'
+      });
+    }
+    
+    if (!sourceRequestIdColumn) {
+      log('warn', 'MISSING_SOURCE_REQUEST_ID_COLUMN', {
+        requestId,
+        warning: 'No Source Request ID column found - cannot link Instabase run ID'
       });
     }
     
@@ -843,7 +865,7 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         }
       };
       
-      const columnValues = buildColumnValues(columns, doc, formatDate);
+      const columnValues = buildColumnValues(columns, doc, formatDate, instabaseRunId);
       
       log('info', 'COLUMN_VALUES_MAPPED', { 
         requestId, 
@@ -895,16 +917,16 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         invoiceNumber: doc.invoice_number
       });
       
-      // 🔧 NEW: Update the Source Request ID column with Instabase Run ID
-      if (instabaseRunId) {
+      // 🔧 FIXED: Update the correct Source Request ID column with Instabase Run ID
+      if (instabaseRunId && sourceRequestIdColumn) {
         try {
           const updateMutation = `
             mutation {
               change_column_value(
                 item_id: ${createdItemId}
                 board_id: ${MONDAY_CONFIG.extractedDocsBoardId}
-                column_id: "name"
-                value: "${escapedDocumentType.toUpperCase()} ${escapedInvoiceNumber} (${instabaseRunId})"
+                column_id: "${sourceRequestIdColumn.id}"
+                value: "${instabaseRunId}"
               ) {
                 id
               }
@@ -920,10 +942,12 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
             }
           });
           
-          log('info', 'INSTABASE_RUN_ID_LINKED', {
+          log('info', 'INSTABASE_RUN_ID_LINKED_SUCCESS', {
             requestId,
             itemId: createdItemId,
-            instabaseRunId: instabaseRunId
+            instabaseRunId: instabaseRunId,
+            columnId: sourceRequestIdColumn.id,
+            columnTitle: sourceRequestIdColumn.title
           });
         } catch (linkError) {
           log('error', 'FAILED_TO_LINK_RUN_ID', {
@@ -931,6 +955,13 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
             itemId: createdItemId,
             error: linkError.message
           });
+        }
+      } else {
+        if (!instabaseRunId) {
+          log('warn', 'NO_INSTABASE_RUN_ID', { requestId, itemId: createdItemId });
+        }
+        if (!sourceRequestIdColumn) {
+          log('warn', 'NO_SOURCE_REQUEST_ID_COLUMN', { requestId, itemId: createdItemId });
         }
       }
       
@@ -1005,7 +1036,7 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
   }
 }
 
-// 🔧 FIXED: Subitem creation function
+// 🔧 FIXED: Subitem creation function with proper indexing
 async function createSubitemsForLineItems(parentItemId, items, columns, requestId) {
   try {
     log('info', 'SUBITEM_CREATION_START', { requestId, parentItemId, lineItemCount: items.length });
@@ -1068,9 +1099,16 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
       const { item_number, quantity, unit_cost, description } = items[i];
       const columnValues = {};
       
+      // 🔧 FIXED: Use index-based naming and proper column mapping
+      const lineIndex = i + 1; // Start from 1, not 0
+      
       subitemColumns.forEach(col => {
         const title = col.title.trim().toLowerCase();
-        if (title === 'item number' || title.includes('item num')) {
+        
+        // 🔧 FIXED: Look for "line number", "line #", "index", or similar for subitem indexing
+        if (title.includes('line number') || title.includes('line #') || title.includes('subitem') || title === 'index') {
+          columnValues[col.id] = lineIndex; // Use sequential index starting from 1
+        } else if (title === 'item number' || title.includes('item num')) {
           columnValues[col.id] = item_number || '';
         } else if (title === 'quantity' || title === 'qty') {
           if (col.type === 'numbers') {
@@ -1091,13 +1129,13 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
 
       log('info', 'SUBITEM_COLUMN_MAPPING', {
         requestId,
-        lineIndex: i + 1,
+        lineIndex: lineIndex,
         itemNumber: item_number,
         columnValues
       });
 
-      // 4️⃣ Create the subitem
-      const subitemName = item_number || `Line Item ${i + 1}`;
+      // 🔧 FIXED: Create subitem with index-based naming
+      const subitemName = `Line ${lineIndex}`;
       const escapedName = subitemName.replace(/"/g, '\\"');
       const columnValuesJson = JSON.stringify(columnValues);
       
@@ -1116,7 +1154,7 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
       
       log('info', 'CREATING_SUBITEM', {
         requestId,
-        lineIndex: i + 1,
+        lineIndex: lineIndex,
         subitemName: escapedName,
         mutation
       });
@@ -1132,7 +1170,7 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
       if (response.data.errors) {
         log('error', 'SUBITEM_MUTATION_ERRORS', { 
           requestId, 
-          lineIndex: i + 1, 
+          lineIndex: lineIndex, 
           errors: response.data.errors 
         });
         
@@ -1160,13 +1198,13 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
         if (retryResponse.data.errors) {
           log('error', 'SIMPLE_SUBITEM_ALSO_FAILED', {
             requestId,
-            lineIndex: i + 1,
+            lineIndex: lineIndex,
             errors: retryResponse.data.errors
           });
         } else {
           log('info', 'SIMPLE_SUBITEM_SUCCESS', {
             requestId,
-            lineIndex: i + 1,
+            lineIndex: lineIndex,
             subitemId: retryResponse.data.data.create_subitem.id,
             subitemName: escapedName
           });
@@ -1174,7 +1212,7 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
       } else {
         log('info', 'SUBITEM_CREATED', { 
           requestId, 
-          lineIndex: i + 1, 
+          lineIndex: lineIndex, 
           subitemId: response.data.data.create_subitem.id,
           subitemName: escapedName
         });
@@ -1197,7 +1235,8 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
   }
 }
 
-function buildColumnValues(columns, doc, formatDate) {
+// 🔧 UPDATED: buildColumnValues function to include Source Request ID mapping
+function buildColumnValues(columns, doc, formatDate, instabaseRunId = null) {
   const columnValues = {};
   
   // Map extracted data to Monday.com columns
@@ -1213,10 +1252,14 @@ function buildColumnValues(columns, doc, formatDate) {
     
     if (title.includes('supplier')) {
       columnValues[id] = doc.supplier_name || '';
+    } else if (title.includes('source request id') || title.includes('source id')) {
+      // 🔧 FIXED: Map Instabase Run ID to Source Request ID column
+      columnValues[id] = instabaseRunId || '';
+      console.log(`[DEBUG] Mapped Instabase Run ID: ${instabaseRunId} to Source Request ID column ${col.id}`);
     } else if (title.includes('reference number') || title === 'reference number' || title.includes('reference')) {
       columnValues[id] = doc.reference_number || '';
       console.log(`[DEBUG] Mapped reference number: ${doc.reference_number} to column ${col.id}`);
-    } else if (title.includes('document number') || (title.includes('number') && !title.includes('total') && !title.includes('reference'))) {
+    } else if (title.includes('document number') || (title.includes('number') && !title.includes('total') && !title.includes('reference') && !title.includes('source'))) {
       columnValues[id] = doc.invoice_number || '';
     } else if (title.includes('document type') || (title.includes('type') && !title.includes('document'))) {
       if (type === 'dropdown') {
@@ -1285,7 +1328,7 @@ app.get('/health', (req, res) => {
     ok: true, 
     timestamp: new Date().toISOString(),
     service: 'digital-mailroom-webhook',
-    version: '2.0.0-fixed'
+    version: '3.0.0-final'
   });
 });
 
@@ -1318,6 +1361,10 @@ app.get('/test/subitem-board-structure', async (req, res) => {
     
     const mainColumns = mainBoardResponse.data.data.boards[0].columns;
     const subitemsColumn = mainColumns.find(col => col.type === 'subtasks');
+    const sourceRequestIdColumn = mainColumns.find(col => 
+      col.title.toLowerCase().includes('source request id') || 
+      col.title.toLowerCase().includes('source id')
+    );
     
     if (!subitemsColumn) {
       return res.json({ 
@@ -1387,7 +1434,12 @@ app.get('/test/subitem-board-structure', async (req, res) => {
           id: subitemsColumn.id,
           title: subitemsColumn.title,
           settings: settings
-        }
+        },
+        sourceRequestIdColumn: sourceRequestIdColumn ? {
+          id: sourceRequestIdColumn.id,
+          title: sourceRequestIdColumn.title,
+          type: sourceRequestIdColumn.type
+        } : null
       },
       subitemBoard: {
         id: subitemBoardId,
@@ -1519,23 +1571,21 @@ app.post('/test/process-item/:id', async (req, res) => {
 // ----------------------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Digital Mailroom Webhook Server v2.0.0-fixed`);
+  console.log(`🚀 Digital Mailroom Webhook Server v3.0.0-final`);
   console.log(`📡 Listening on port ${PORT}`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
   console.log(`🧪 Test endpoint: POST /test/process-item/:id`);
   console.log(`🔬 Debug endpoint: POST /test/debug-extraction/:id`);
-  console.log(`📋 Board structure: GET /test/board-structure`);
+  console.log(`📋 Board structure: GET /test/subitem-board-structure`);
   console.log(`📅 Started at: ${new Date().toISOString()}`);
 });
 
 // -----------------------------------------------------------------------------
-//  🔧 FIXES APPLIED:
-//  1. Fixed all syntax errors and missing closing braces
-//  2. Enhanced Field 7 extraction with JSON string parsing
-//  3. Proper subitem creation with board structure validation
-//  4. Enhanced error handling and fallback subitem creation
-//  5. Added comprehensive debug endpoints
-//  6. Improved column mapping for subitems
-//  7. Better handling of different data types in line items
-//  8. Complete logging system for debugging
+//  🔧 FINAL FIXES APPLIED:
+//  1. ✅ FIXED Source Request ID linking - now finds the correct column by title
+//  2. ✅ FIXED Subitem indexing - uses "Line 1", "Line 2", etc. instead of item numbers
+//  3. ✅ Enhanced column mapping to include Source Request ID in buildColumnValues
+//  4. ✅ Improved logging for both Source Request ID and subitem creation
+//  5. ✅ Updated test endpoints to show Source Request ID column info
+//  6. ✅ Better error handling and fallbacks for missing columns
 // -----------------------------------------------------------------------------
