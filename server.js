@@ -1,4 +1,188 @@
-// Digital‑Mailroom Webhook — FIXED VERSION with PDF upload working
+function groupPagesByInvoiceNumber(extractedFiles) {
+  console.log('=== GROUPING DEBUG ===');
+  console.log('Input files:', extractedFiles?.length || 0);
+  
+  const documentGroups = {};
+  
+  if (!extractedFiles || extractedFiles.length === 0) {
+    console.log('No extracted files to process');
+    return [];
+  }
+  
+  extractedFiles.forEach((file, fileIndex) => {
+    console.log(`Processing file ${fileIndex}: ${file.original_file_name}`);
+    
+    if (!file.documents || file.documents.length === 0) {
+      console.log('  No documents found in file');
+      return;
+    }
+    
+    file.documents.forEach((doc, docIndex) => {
+      console.log(`  Processing document ${docIndex}`);
+      const fields = doc.fields || {};
+      console.log(`  Available fields:`, Object.keys(fields));
+      
+      // Extract field values based on Instabase field mapping
+      const invoiceNumber = fields['0']?.value || 'unknown';
+      const pageType = fields['1']?.value || 'unknown';
+      const documentType = fields['2']?.value || 'invoice';
+      const supplier = fields['3']?.value || '';
+      const terms = fields['4']?.value || '';
+      const documentDate = fields['5']?.value || '';
+      const dueDateData = fields['6']?.value || '';
+      const itemsData = fields['7']?.value || [];
+      const totalAmount = fields['8']?.value || 0;
+      const taxAmount = fields['9']?.value || 0;
+      
+      console.log(`  Extracted data:`);
+      console.log(`    Invoice Number: "${invoiceNumber}"`);
+      console.log(`    Page Type: "${pageType}"`);
+      console.log(`    Document Type: "${documentType}"`);
+      console.log(`    Supplier: "${supplier}"`);
+      console.log(`    Total: "${totalAmount}"`);
+      
+      // 🔍 DEBUG: Let's see what's in field 7 (items data) - expecting table format
+      console.log(`  === ITEMS DATA DEBUG ===`);
+      console.log(`    Raw items data (field 7):`, JSON.stringify(itemsData, null, 2));
+      console.log(`    Items data type:`, typeof itemsData);
+      console.log(`    Items data length:`, Array.isArray(itemsData) ? itemsData.length : 'not array');
+      if (Array.isArray(itemsData) && itemsData.length > 0) {
+        console.log(`    First row sample:`, JSON.stringify(itemsData[0], null, 2));
+        console.log(`    Table structure detected with ${itemsData.length} rows`);
+      }
+      console.log(`  === END ITEMS DATA DEBUG ===`);
+      
+      if (!invoiceNumber || invoiceNumber === 'none' || invoiceNumber === 'unknown') {
+        console.log(`  Skipping document - no valid invoice number`);
+        return;
+      }
+      
+      // Create new group if it doesn't exist
+      if (!documentGroups[invoiceNumber]) {
+        documentGroups[invoiceNumber] = {
+          invoice_number: invoiceNumber,
+          document_type: documentType,
+          supplier_name: supplier,
+          total_amount: 0,
+          tax_amount: 0,
+          document_date: documentDate,
+          due_date: '',
+          due_date_2: '',
+          due_date_3: '',
+          terms: terms,
+          items: [],
+          pages: [],
+          confidence: 0
+        };
+        console.log(`  Created new group for invoice: ${invoiceNumber}`);
+      }
+      
+      const group = documentGroups[invoiceNumber];
+      group.pages.push({
+        page_type: pageType,
+        file_name: file.original_file_name,
+        fields: fields
+      });
+      
+      // Update group data with main page info
+      if (pageType === 'main' || !group.supplier_name) {
+        if (supplier) {
+          group.supplier_name = supplier;
+        }
+        
+        if (totalAmount) {
+          const totalStr = String(totalAmount).replace(/[^0-9.-]/g, '');
+          group.total_amount = parseFloat(totalStr) || 0;
+        }
+        
+        if (taxAmount) {
+          const taxStr = String(taxAmount).replace(/[^0-9.-]/g, '');
+          group.tax_amount = parseFloat(taxStr) || 0;
+        }
+        
+        if (documentDate) {
+          group.document_date = documentDate;
+        }
+        
+        if (terms) {
+          group.terms = terms;
+        }
+      }
+      
+      // 🔧 FIXED: Process line items from TABLE format (field 7)
+      console.log(`  === PROCESSING LINE ITEMS TABLE FOR ${pageType} PAGE ===`);
+      if (itemsData && Array.isArray(itemsData) && itemsData.length > 0) {
+        console.log(`  Found items table with ${itemsData.length} rows on ${pageType} page`);
+        
+        // Process each row of the table
+        const processedItems = [];
+        
+        itemsData.forEach((row, rowIndex) => {
+          console.log(`    Processing table row ${rowIndex}:`, JSON.stringify(row, null, 2));
+          
+          // Handle different possible table structures
+          let itemNumber = '';
+          let unitCost = 0;
+          let quantity = 0;
+          
+          if (Array.isArray(row)) {
+            // If row is an array [itemNumber, unitCost, quantity] or similar
+            itemNumber = String(row[0] || '').trim();
+            unitCost = parseFloat(row[1]) || 0;
+            quantity = parseFloat(row[2]) || 0;
+            
+            console.log(`      Array format - Item: "${itemNumber}", Cost: ${unitCost}, Qty: ${quantity}`);
+          } else if (typeof row === 'object' && row !== null) {
+            // If row is an object with properties
+            itemNumber = String(row['Item Number'] || row.item_number || row.itemNumber || row.number || '').trim();
+            unitCost = parseFloat(row['Unit Cost'] || row.unit_cost || row.unitCost || row.cost || row.price || 0);
+            quantity = parseFloat(row.Quantity || row.quantity || row.qty || 0);
+            
+            console.log(`      Object format - Item: "${itemNumber}", Cost: ${unitCost}, Qty: ${quantity}`);
+          }
+          
+          // Only add if we have meaningful data
+          if (itemNumber && (unitCost > 0 || quantity > 0)) {
+            const processedItem = {
+              item_number: itemNumber,
+              description: '', // Not in this table format
+              quantity: quantity,
+              unit_cost: unitCost,
+              amount: quantity * unitCost
+            };
+            
+            processedItems.push(processedItem);
+            console.log(`      ✅ Added item: ${itemNumber} (${quantity} × ${unitCost} = ${processedItem.amount})`);
+          } else {
+            console.log(`      ⚠️  Skipped row ${rowIndex} - insufficient data`);
+          }
+        });
+        
+        // Add items to the group (prioritize main page, but accept any page with items)
+        if (processedItems.length > 0 && (pageType === 'main' || group.items.length === 0)) {
+          group.items = processedItems;
+          console.log(`  ✅ Added ${processedItems.length} line items to invoice ${invoiceNumber}`);
+        }
+      } else {
+        console.log(`  No items table found on ${pageType} page`);
+      }
+      console.log(`  === END LINE ITEMS PROCESSING ===`);
+    });
+  });
+  
+  console.log(`=== GROUPING RESULT ===`);
+  console.log(`Found ${Object.keys(documentGroups).length} document groups:`);
+  Object.keys(documentGroups).forEach(key => {
+    const group = documentGroups[key];
+    console.log(`  Group "${key}": ${group.pages.length} pages, ${group.items.length} items`);
+    if (group.items.length > 0) {
+      console.log(`    Items: ${group.items.map(item => `${item.item_number}(${item.quantity}×${item.unit_cost})`).join(', ')}`);
+    }
+  });
+  console.log('=== END GROUPING DEBUG ===');
+  
+  return Object.values(documentGroups);
+}// Digital‑Mailroom Webhook — FIXED VERSION with PDF upload working
 // -----------------------------------------------------------------------------
 // This is the corrected server that fixes the PDF upload issue
 // -----------------------------------------------------------------------------
