@@ -382,36 +382,24 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
       const raw7 = fields['7'];
       let itemsData = [];
       
-      if (raw7) {
-        // Try multiple possible nested structures where Instabase might store table data
-        if (Array.isArray(raw7.value)) {
-          // Direct array
-          itemsData = raw7.value;
-          log('info', 'ITEMS_FOUND_DIRECT_ARRAY', { requestId, itemCount: itemsData.length });
-        } else if (raw7.value?.tables?.[0]?.rows) {
-          // Nested in tables structure
-          itemsData = raw7.value.tables[0].rows;
-          log('info', 'ITEMS_FOUND_IN_TABLES', { requestId, itemCount: itemsData.length });
-        } else if (raw7.value?.rows) {
-          // Direct rows property
-          itemsData = raw7.value.rows;
-          log('info', 'ITEMS_FOUND_IN_ROWS', { requestId, itemCount: itemsData.length });
-        } else if (raw7.tables?.[0]?.rows) {
-          // Tables at root level
-          itemsData = raw7.tables[0].rows;
-          log('info', 'ITEMS_FOUND_ROOT_TABLES', { requestId, itemCount: itemsData.length });
-        } else if (raw7.rows) {
-          // Rows at root level
-          itemsData = raw7.rows;
-          log('info', 'ITEMS_FOUND_ROOT_ROWS', { requestId, itemCount: itemsData.length });
-        } else {
-          log('info', 'NO_RECOGNIZABLE_TABLE_STRUCTURE', { 
-            requestId, 
-            field7Keys: Object.keys(raw7),
-            field7ValueKeys: raw7.value ? Object.keys(raw7.value) : 'No value object'
-          });
-        }
+      // 1) Direct array?
+      if (Array.isArray(raw7?.value)) {
+        itemsData = raw7.value;
       }
+      
+      // 2) Instabase “tables” object?
+      else if (Array.isArray(raw7?.value?.tables)) {
+        itemsData = raw7.value.tables[0]?.rows || [];
+      }
+      
+      // 3) Sometimes at the root:
+      else if (Array.isArray(raw7?.tables)) {
+        itemsData = raw7.tables[0]?.rows || [];
+      }
+      
+      log('info', 'RESOLVED itemsData.length =', itemsData.length););
+              }
+            }
       
       const totalAmount = fields['8']?.value || 0;
       const taxAmount = fields['9']?.value || 0;
