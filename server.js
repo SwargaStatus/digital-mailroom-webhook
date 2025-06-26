@@ -378,25 +378,29 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
       const documentDate = fields['5']?.value || '';
       const dueDateData = fields['6']?.value || '';
       
-      // 🔧 FIXED: Extract line items from the correct nested structure
+    // 🔧 FIXED: grab List outputs robustly
       const raw7 = fields['7'];
       let itemsData = [];
       
-      // 1) Direct array?
-      if (Array.isArray(raw7?.value)) {
+      // 1) Direct array of primitives?
+      if (raw7?.value && Array.isArray(raw7.value)) {
         itemsData = raw7.value;
+      
+      // 2) Table rows under value.tables[0].rows?
+      } else if (raw7?.value?.tables?.[0]?.rows) {
+        itemsData = raw7.value.tables[0].rows.map(row =>
+          // if cells are objects, pull out the text
+          row.map(cell => cell.text ?? String(cell))
+        );
+      
+      // 3) Fallback: any root‐level tables property
+      } else if (raw7?.tables?.[0]?.rows) {
+        itemsData = raw7.tables[0].rows.map(row =>
+          row.map(cell => cell.text ?? String(cell))
+        );
       }
       
-      // 2) Instabase “tables” object?
-      else if (Array.isArray(raw7?.value?.tables)) {
-        itemsData = raw7.value.tables[0]?.rows || [];
-      }
-      
-      // 3) Sometimes at the root:
-      else if (Array.isArray(raw7?.tables)) {
-        itemsData = raw7.tables[0]?.rows || [];
-      }
-      
+      // Now itemsData is an array of arrays (rows) or primitives
       log('info', 'RESOLVED itemsData.length =', itemsData.length);
       
       const totalAmount = fields['8']?.value || 0;
