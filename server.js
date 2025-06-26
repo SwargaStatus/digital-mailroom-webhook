@@ -378,30 +378,33 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
       const documentDate = fields['5']?.value || '';
       const dueDateData = fields['6']?.value || '';
       
-    // 🔧 FIXED: grab List outputs robustly
+    // 🔧 NORMALIZE Instabase “list” output into a real Array
       const raw7 = fields['7'];
       let itemsData = [];
-      
-      // 1) Direct array of primitives?
-      if (raw7?.value && Array.isArray(raw7.value)) {
+
+      // A) It might come back as a JSON-string of rows → parse it
+      if (typeof raw7?.value === 'string' && raw7.value.trim().startsWith('[')) {
+        try {
+          itemsData = JSON.parse(raw7.value);
+          log('info','PARSED string→itemsData.length =', itemsData.length);
+        } catch (e) {
+          log('error','JSON.parse failed on list value',{ requestId, error: e.message });
+        }
+
+      // B) Or as a direct array under value
+      } else if (Array.isArray(raw7?.value)) {
         itemsData = raw7.value;
-      
-      // 2) Table rows under value.tables[0].rows?
-      } else if (raw7?.value?.tables?.[0]?.rows) {
-        itemsData = raw7.value.tables[0].rows.map(row =>
-          // if cells are objects, pull out the text
-          row.map(cell => cell.text ?? String(cell))
-        );
-      
-      // 3) Fallback: any root‐level tables property
-      } else if (raw7?.tables?.[0]?.rows) {
-        itemsData = raw7.tables[0].rows.map(row =>
-          row.map(cell => cell.text ?? String(cell))
-        );
+
+      // C) Or nested under value.tables[0].rows
+      } else if (Array.isArray(raw7?.value?.tables)) {
+        itemsData = raw7.value.tables[0]?.rows || [];
+
+      // D) Or under top-level tables
+      } else if (Array.isArray(raw7?.tables)) {
+        itemsData = raw7.tables[0]?.rows || [];
       }
-      
-      // Now itemsData is an array of arrays (rows) or primitives
-      log('info', 'RESOLVED itemsData.length =', itemsData.length);
+
+      log('info','RESOLVED itemsData.length =', itemsData.length);
       
       const totalAmount = fields['8']?.value || 0;
       const taxAmount = fields['9']?.value || 0;
