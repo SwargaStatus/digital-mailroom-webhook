@@ -811,7 +811,9 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
 
     // 1️⃣ Read your “subtasks” column’s linked board ID:
     const subitemsColumn = columns.find(c => c.type === 'subtasks');
-    const subitemBoardId   = JSON.parse(subitemsColumn.settings_str).linked_board_id;
+    const settings = JSON.parse(subitemsColumn.settings_str);
+    log('info', 'SUBTASKS_COLUMN_PARSED_SETTINGS', { requestId, settings });
+    const subitemBoardId = settings.linkedBoardId || settings.linked_board_id;
 
     // 2️⃣ Fetch that board’s columns:
     const colsQ = `
