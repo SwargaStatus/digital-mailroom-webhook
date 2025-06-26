@@ -554,6 +554,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
           invoice_number: invoiceNumber,
           document_type: documentType,
           supplier_name: supplier,
+          reference_number: referenceNumber,
           total_amount: 0,
           tax_amount: 0,
           document_date: documentDate,
@@ -578,6 +579,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
       // Update group data with main page info
       if (pageType === 'main' || !group.supplier_name) {
         if (supplier) group.supplier_name = supplier;
+        if (referenceNumber) group.reference_number = referenceNumber;
         if (totalAmount) {
           const totalStr = String(totalAmount).replace(/[^0-9.-]/g, '');
           group.total_amount = parseFloat(totalStr) || 0;
@@ -1164,9 +1166,17 @@ function buildColumnValues(columns, doc, formatDate) {
     const id = col.id;
     const type = col.type;
     
+    // 🔧 DEBUG: Log each column mapping attempt
+    if (title.includes('reference')) {
+      console.log(`[DEBUG] Found reference column: ${col.title} (${col.id}) - value: ${doc.reference_number}`);
+    }
+    
     if (title.includes('supplier')) {
       columnValues[id] = doc.supplier_name || '';
-    } else if (title.includes('document number') || (title.includes('number') && !title.includes('total'))) {
+    } else if (title.includes('reference number') || title === 'reference number' || title.includes('reference')) {
+      columnValues[id] = doc.reference_number || '';
+      console.log(`[DEBUG] Mapped reference number: ${doc.reference_number} to column ${col.id}`);
+    } else if (title.includes('document number') || (title.includes('number') && !title.includes('total') && !title.includes('reference'))) {
       columnValues[id] = doc.invoice_number || '';
     } else if (title.includes('document type') || (title.includes('type') && !title.includes('document'))) {
       if (type === 'dropdown') {
