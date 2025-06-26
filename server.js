@@ -774,12 +774,41 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
       const escapedDocumentType = (doc.document_type || '').replace(/"/g, '\\"');
       
       const formatDate = (dateStr) => {
-        if (!dateStr) return '';
+        if (!dateStr || dateStr === 'Due Date' || dateStr === 'undefined' || dateStr === 'null') {
+          return '';
+        }
         try {
-          const date = new Date(dateStr);
+          // Handle various date formats
+          let date;
+          if (typeof dateStr === 'string') {
+            // Clean the date string
+            const cleanDate = dateStr.trim();
+            if (cleanDate.match(/^\d{4}-\d{2}-\d{2}$/)) {
+              // Already in YYYY-MM-DD format
+              return cleanDate;
+            }
+            date = new Date(cleanDate);
+          } else {
+            date = new Date(dateStr);
+          }
+          
+          if (isNaN(date.getTime())) {
+            log('warn', 'INVALID_DATE_FORMAT', { 
+              requestId, 
+              originalDate: dateStr,
+              reason: 'Date parsing failed'
+            });
+            return '';
+          }
+          
           return date.toISOString().split('T')[0];
         } catch (e) {
-          return String(dateStr).slice(0, 10);
+          log('warn', 'DATE_FORMAT_ERROR', { 
+            requestId, 
+            originalDate: dateStr,
+            error: e.message
+          });
+          return '';
         }
       };
       
@@ -788,7 +817,12 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
       log('info', 'COLUMN_VALUES_MAPPED', { 
         requestId, 
         invoiceNumber: doc.invoice_number,
-        columnValues 
+        columnValues,
+        docDueDates: {
+          due_date: doc.due_date,
+          due_date_2: doc.due_date_2,
+          due_date_3: doc.due_date_3
+        }
       });
       
       // Create the item
@@ -1132,11 +1166,23 @@ function buildColumnValues(columns, doc, formatDate) {
     } else if (title.includes('document date') || (title.includes('date') && !title.includes('due'))) {
       columnValues[id] = formatDate(doc.document_date);
     } else if (title === 'due date' || (title.includes('due date') && !title.includes('2') && !title.includes('3'))) {
-      columnValues[id] = formatDate(doc.due_date);
+      // 🔧 FIXED: Only set due date if it's a valid date, not empty
+      const formattedDate = formatDate(doc.due_date);
+      if (formattedDate) {
+        columnValues[id] = formattedDate;
+      }
     } else if (title.includes('due date 2')) {
-      columnValues[id] = formatDate(doc.due_date_2);
+      // 🔧 FIXED: Only set due date 2 if it's a valid date, not empty
+      const formattedDate = formatDate(doc.due_date_2);
+      if (formattedDate) {
+        columnValues[id] = formattedDate;
+      }
     } else if (title.includes('due date 3')) {
-      columnValues[id] = formatDate(doc.due_date_3);
+      // 🔧 FIXED: Only set due date 3 if it's a valid date, not empty
+      const formattedDate = formatDate(doc.due_date_3);
+      if (formattedDate) {
+        columnValues[id] = formattedDate;
+      }
     } else if (title.includes('total amount')) {
       columnValues[id] = doc.total_amount || 0;
     } else if (title.includes('tax amount')) {
