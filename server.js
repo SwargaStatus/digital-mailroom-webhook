@@ -398,6 +398,16 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
       const terms = fields['4']?.value || '';
       const documentDate = fields['5']?.value || '';
       
+      // 🔧 NEW: Extract Reference Number from Field 10
+      const referenceNumber = fields['10']?.value || '';
+      
+      log('info', 'REFERENCE_NUMBER_EXTRACTED', {
+        requestId,
+        docIndex,
+        referenceNumber,
+        field10Raw: fields['10']
+      });
+      
       // 🔧 FIXED: Extract due dates from Field 6 (can be table format with header row)
       const raw6 = fields['6'];
       let dueDates = { due_date: '', due_date_2: '', due_date_3: '' };
