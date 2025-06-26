@@ -1,6 +1,7 @@
-// Digital Mailroom Webhook — FINAL VERSION with Multi-Page Document Reconstruction
+// Digital Mailroom Webhook — FINAL VERSION with Multi-Page Document Reconstruction + PO Number Support
 // -----------------------------------------------------------------------------
 // This version intelligently merges split PDF pages back into complete documents
+// and includes PO Number tracking for line items
 // -----------------------------------------------------------------------------
 
 const express   = require('express');
@@ -633,12 +634,49 @@ function extractDueDatesFromField(raw6, requestId, pageIndex) {
   return dueDates;
 }
 
-// 🔧 NEW: Helper function to extract line items from a single page
+// 🔧 UPDATED: Helper function to extract line items from a single page - NOW WITH PO SUPPORT
 function extractLineItemsFromPage(page, requestId, pageIndex) {
   const fields = page.fields || {};
-  const raw7 = fields['7'];
+  const raw7 = fields['7'];  // Line items field
+  const raw11 = fields['11']; // NEW: PO Number field (you'll need to configure this in Instabase)
   let itemsData = [];
+  let poNumber = '';
   
+  // Extract PO number from this page/section
+  if (raw11) {
+    const v = raw11?.value;
+    if (typeof v === 'string' && v.startsWith('SP')) {
+      poNumber = v.trim();
+    } else if (Array.isArray(v) && v.length > 0) {
+      // Find first SP code in array
+      const spCode = v.find(item => typeof item === 'string' && item.startsWith('SP'));
+      poNumber = spCode || '';
+    }
+  }
+  
+  // Fallback: Look for PO in any field that contains SP codes
+  if (!poNumber) {
+    Object.keys(fields).forEach(fieldKey => {
+      const fieldValue = fields[fieldKey]?.value;
+      if (typeof fieldValue === 'string' && fieldValue.startsWith('SP')) {
+        poNumber = fieldValue.trim();
+      } else if (Array.isArray(fieldValue)) {
+        const spCode = fieldValue.find(item => typeof item === 'string' && item.startsWith('SP'));
+        if (spCode) {
+          poNumber = spCode;
+        }
+      }
+    });
+  }
+  
+  log('info', 'PO_NUMBER_EXTRACTED', {
+    requestId,
+    pageIndex,
+    poNumber: poNumber || 'NOT_FOUND',
+    extractedFrom: raw11 ? 'field_11' : 'fallback_search'
+  });
+  
+  // Extract line items (existing logic)
   if (raw7) {
     const v = raw7?.value;
     
@@ -688,20 +726,26 @@ function extractLineItemsFromPage(page, requestId, pageIndex) {
       let unitCost = 0;
       let quantity = 0;
       let description = '';
+      let itemPoNumber = '';  // NEW: Item-specific PO number
       
       if (Array.isArray(row)) {
         itemNumber = String(row[0] || '').trim();
         unitCost = parseFloat(row[1]) || 0;
         quantity = parseFloat(row[2]) || 0;
         description = String(row[3] || '').trim();
+        itemPoNumber = String(row[4] || '').trim(); // NEW: PO from 5th column if available
       } else if (typeof row === 'object' && row !== null) {
         itemNumber = String(row['Item Number'] || row.item_number || row.itemNumber || row.number || row.item || '').trim();
         unitCost = parseFloat(row['Unit Cost'] || row.unit_cost || row.unitCost || row.cost || row.price || 0);
         quantity = parseFloat(row.Quantity || row.quantity || row.qty || row.amount || 0);
         description = String(row.Description || row.description || row.desc || row.item_description || '').trim();
+        itemPoNumber = String(row['PO Number'] || row.po_number || row.poNumber || row.po || '').trim(); // NEW
       } else {
         itemNumber = String(row || '').trim();
       }
+      
+      // Use item-specific PO if available, otherwise use page-level PO
+      const finalPoNumber = itemPoNumber || poNumber;
       
       if (itemNumber || (unitCost > 0) || (quantity > 0)) {
         processedItems.push({
@@ -710,7 +754,8 @@ function extractLineItemsFromPage(page, requestId, pageIndex) {
           quantity: quantity,
           unit_cost: unitCost,
           amount: quantity * unitCost,
-          source_page: pageIndex + 1
+          source_page: pageIndex + 1,
+          po_number: finalPoNumber  // NEW: Add PO number to each item
         });
       }
     });
@@ -967,7 +1012,7 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
   }
 }
 
-// 🔧 FIXED: Subitem creation function with proper indexing
+// 🔧 UPDATED: Subitem creation function with PO Number support
 async function createSubitemsForLineItems(parentItemId, items, columns, requestId) {
   try {
     log('info', 'SUBITEM_CREATION_START', { requestId, parentItemId, lineItemCount: items.length });
@@ -1027,18 +1072,16 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
 
     // 3️⃣ Loop each line item and map into those columns
     for (let i = 0; i < items.length; i++) {
-      const { item_number, quantity, unit_cost, description, source_page } = items[i];
+      const { item_number, quantity, unit_cost, description, source_page, po_number } = items[i]; // NEW: Extract po_number
       const columnValues = {};
       
-      // 🔧 FIXED: Use index-based naming and proper column mapping
-      const lineIndex = i + 1; // Start from 1, not 0
+      const lineIndex = i + 1;
       
       subitemColumns.forEach(col => {
         const title = col.title.trim().toLowerCase();
         
-        // 🔧 FIXED: Look for "line number", "line #", "index", or similar for subitem indexing
         if (title.includes('line number') || title.includes('line #') || title.includes('subitem') || title === 'index') {
-          columnValues[col.id] = lineIndex; // Use sequential index starting from 1
+          columnValues[col.id] = lineIndex;
         } else if (title === 'item number' || title.includes('item num')) {
           columnValues[col.id] = item_number || '';
         } else if (title === 'quantity' || title === 'qty') {
@@ -1057,6 +1100,8 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
           columnValues[col.id] = description || '';
         } else if (title.includes('source page') || title.includes('page')) {
           columnValues[col.id] = source_page || '';
+        } else if (title.includes('po number') || title === 'po' || title.includes('purchase order')) { // NEW: PO Number mapping
+          columnValues[col.id] = po_number || '';
         }
       });
 
@@ -1065,10 +1110,10 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
         lineIndex: lineIndex,
         itemNumber: item_number,
         sourcePage: source_page,
+        poNumber: po_number,  // NEW: Log PO number
         columnValues
       });
 
-      // 🔧 FIXED: Create subitem with index-based naming
       const subitemName = `Line ${lineIndex}`;
       const escapedName = subitemName.replace(/"/g, '\\"');
       const columnValuesJson = JSON.stringify(columnValues);
@@ -1089,7 +1134,8 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
       log('info', 'CREATING_SUBITEM', {
         requestId,
         lineIndex: lineIndex,
-        subitemName: escapedName
+        subitemName: escapedName,
+        poNumber: po_number  // NEW: Log PO number
       });
       
       const response = await axios.post('https://api.monday.com/v2', { query: mutation }, {
@@ -1147,7 +1193,8 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
           requestId, 
           lineIndex: lineIndex, 
           subitemId: response.data.data.create_subitem.id,
-          subitemName: escapedName
+          subitemName: escapedName,
+          poNumber: po_number  // NEW: Log PO number
         });
       }
       
@@ -1254,7 +1301,7 @@ app.get('/health', (req, res) => {
     ok: true, 
     timestamp: new Date().toISOString(),
     service: 'digital-mailroom-webhook',
-    version: '4.0.0-multipage-reconstruction'
+    version: '4.1.0-multipage-reconstruction-with-po-support'
   });
 });
 
@@ -1275,7 +1322,7 @@ app.post('/test/process-item/:id', async (req, res) => {
     
     res.json({ 
       success: true, 
-      message: 'Processing completed with multi-page reconstruction',
+      message: 'Processing completed with multi-page reconstruction and PO number support',
       requestId,
       instabaseRunId: runId,
       filesProcessed: files.length,
@@ -1287,7 +1334,8 @@ app.post('/test/process-item/:id', async (req, res) => {
         isMultiPage: g.isMultiPageReconstruction || false,
         pageCount: g.originalPageCount || 1,
         lineItemCount: g.items?.length || 0,
-        totalAmount: g.total_amount
+        totalAmount: g.total_amount,
+        itemsWithPO: g.items?.filter(item => item.po_number).length || 0  // NEW: Count items with PO
       }))
     });
   } catch (error) {
@@ -1301,16 +1349,16 @@ app.post('/test/process-item/:id', async (req, res) => {
 // ----------------------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Digital Mailroom Webhook Server v4.0.0-multipage-reconstruction`);
+  console.log(`🚀 Digital Mailroom Webhook Server v4.1.0-multipage-reconstruction-with-po-support`);
   console.log(`📡 Listening on port ${PORT}`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
   console.log(`🧪 Test endpoint: POST /test/process-item/:id`);
   console.log(`📅 Started at: ${new Date().toISOString()}`);
-  console.log(`🔧 Features: Multi-page document reconstruction, smart page merging`);
+  console.log(`🔧 Features: Multi-page document reconstruction, smart page merging, PO number tracking`);
 });
 
 // -----------------------------------------------------------------------------
-//  🔧 MULTI-PAGE RECONSTRUCTION FEATURES:
+//  🔧 MULTI-PAGE RECONSTRUCTION + PO NUMBER FEATURES:
 //  1. ✅ Smart filename-based page grouping
 //  2. ✅ Intelligent document reconstruction from split pages
 //  3. ✅ Line item aggregation across all pages
@@ -1321,4 +1369,7 @@ app.listen(PORT, '0.0.0.0', () => {
 //  8. ✅ Source page tracking for line items
 //  9. ✅ Robust error handling and recovery
 //  10. ✅ Run ID linking for Instabase traceability
+//  11. ✅ NEW: PO Number extraction and tracking for each line item
+//  12. ✅ NEW: SP code detection and fallback search mechanisms
+//  13. ✅ NEW: Enhanced subitem creation with PO number support
 // -----------------------------------------------------------------------------
