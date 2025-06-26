@@ -397,9 +397,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
         itemsData = raw7.tables[0]?.rows || [];
       }
       
-      log('info', 'RESOLVED itemsData.length =', itemsData.length););
-              }
-            }
+      log('info', 'RESOLVED itemsData.length =', itemsData.length);
       
       const totalAmount = fields['8']?.value || 0;
       const taxAmount = fields['9']?.value || 0;
