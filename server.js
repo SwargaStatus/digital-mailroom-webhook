@@ -88,46 +88,57 @@ async function getMondayItemFilesWithPublicUrl(itemId, boardId) {
                .map(a => ({ name:a.name, public_url:a.public_url, assetId:a.id }));
 }
 
-// 🔧 FIXED: PDF Upload function with correct variable types
+// 🔧 FIXED: PDF Upload function with correct Monday.com multipart format
 async function uploadPdfToMondayItem(itemId, buffer, filename, columnId) {
   try {
     console.log(`Attempting to upload PDF: ${filename} to item ${itemId}, column ${columnId}`);
+    console.log(`Buffer size: ${buffer.length} bytes`);
     
-    // Create the form data properly
+    // Create the form data using Monday.com's multipart spec
     const form = new FormData();
     
-    // Use the correct mutation format for Monday.com file uploads
-    const query = `
-      mutation ($file: File!, $item_id: ID!, $column_id: String!) {
-        add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
-          id
+    // Monday.com requires this specific multipart format
+    const operations = {
+      query: `
+        mutation ($file: File!, $item_id: ID!, $column_id: String!) {
+          add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
+            id
+          }
         }
+      `,
+      variables: {
+        file: null,
+        item_id: String(itemId),
+        column_id: columnId
       }
-    `;
-    
-    // CRITICAL FIX: Use String for item_id, not Int
-    const variables = {
-      file: null,
-      item_id: String(itemId),  // ← This was the issue! Must be String, not Int
-      column_id: columnId
     };
     
-    form.append('query', query);
-    form.append('variables', JSON.stringify(variables));
-    form.append('file', buffer, {
+    // The map tells Monday.com which file corresponds to which variable
+    const map = {
+      "0": ["variables.file"]
+    };
+    
+    // Append in the correct order that Monday.com expects
+    form.append('operations', JSON.stringify(operations));
+    form.append('map', JSON.stringify(map));
+    form.append('0', buffer, {
       filename: filename,
       contentType: 'application/pdf'
     });
 
+    console.log('Sending file upload request to Monday.com...');
+    
     const response = await axios.post('https://api.monday.com/v2/file', form, {
       headers: {
         ...form.getHeaders(),
         'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`
       },
-      timeout: 30000,
+      timeout: 60000,
       maxBodyLength: Infinity,
       maxContentLength: Infinity
     });
+
+    console.log('Monday.com file upload response:', JSON.stringify(response.data, null, 2));
 
     if (response.data.errors) {
       console.error('PDF Upload errors:', JSON.stringify(response.data.errors, null, 2));
@@ -138,6 +149,10 @@ async function uploadPdfToMondayItem(itemId, buffer, filename, columnId) {
     }
   } catch (error) {
     console.error('Error uploading PDF:', error.message);
+    if (error.response) {
+      console.error('Response status:', error.response.status);
+      console.error('Response data:', JSON.stringify(error.response.data, null, 2));
+    }
     throw error;
   }
 }
