@@ -800,21 +800,23 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
   try {
     log('info', 'SUBITEM_CREATION_START', { requestId, parentItemId, lineItemCount: items.length });
 
-    // 1️⃣ Read your “subtasks” column’s linked board ID:
+    // 1️⃣ Read your “subtasks” column’s settings and pull the linked board ID
     const subitemsColumn = columns.find(c => c.type === 'subtasks');
     const settings = JSON.parse(subitemsColumn.settings_str);
     log('info', 'SUBTASKS_COLUMN_PARSED_SETTINGS', { requestId, settings });
-    // Instabase now returns an array `boardIds` → take the first one:
-    const subitemBoardId = settings.boardIds?.[0];
+    // Monday’s API now uses an array `boardIds`
+    const subitemBoardId = Array.isArray(settings.boardIds)
+      ? settings.boardIds[0]
+      : settings.linked_board_id;
     if (!subitemBoardId) {
       log('error', 'MISSING_SUBITEM_BOARD_ID', { requestId, settings });
       return;
     }
 
-    // 2️⃣ Fetch that board’s columns:
+    // 2️⃣ Fetch that board’s columns
     const colsQ = `
       query {
-        boards(ids:[${subitemBoardId}]) {
+        boards(ids: [${subitemBoardId}]) {
           columns { id title type }
         }
       }
@@ -824,7 +826,7 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
     });
     const subitemColumns = colsRes.data.data.boards[0].columns;
 
-    // 3️⃣ Loop each line item and map it into your three target columns:
+    // 3️⃣ Loop each line item and map into your target subitem columns
     for (let i = 0; i < items.length; i++) {
       const { item_number, quantity, unit_cost } = items[i];
       const columnValues = {};
@@ -835,7 +837,7 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
         if (t === 'unit cost')   columnValues[col.id] = unit_cost;
       });
 
-      // 4️⃣ Fire the create_subitem mutation:
+      // 4️⃣ Fire the create_subitem mutation
       const m = `
         mutation {
           create_subitem(
@@ -851,7 +853,9 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
           'API-Version': '2024-04'
         }
       });
-      await new Promise(r => setTimeout(r, 250)); // small delay
+
+      // small delay to avoid rate limiting
+      await new Promise(r => setTimeout(r, 250));
     }
 
     log('info', 'ALL_SUBITEMS_CREATED', { requestId, parentItemId, lineItemCount: items.length });
