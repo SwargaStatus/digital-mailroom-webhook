@@ -41,15 +41,37 @@ function groupPagesByInvoiceNumber(extractedFiles) {
       console.log(`    Supplier: "${supplier}"`);
       console.log(`    Total: "${totalAmount}"`);
       
-      // 🔍 DEBUG: Let's see what's in field 7 (items data) - expecting table format
+      // 🔍 CRITICAL DEBUG: Let's see what's in field 7 (items data) - expecting table format
       console.log(`  === ITEMS DATA DEBUG ===`);
-      console.log(`    Raw items data (field 7):`, JSON.stringify(itemsData, null, 2));
+      console.log(`    Field 7 exists:`, fields['7'] !== undefined);
+      console.log(`    Field 7 value:`, fields['7']?.value);
+      console.log(`    Field 7 raw:`, JSON.stringify(fields['7'], null, 2));
+      console.log(`    Items data variable:`, JSON.stringify(itemsData, null, 2));
       console.log(`    Items data type:`, typeof itemsData);
+      console.log(`    Items data is array:`, Array.isArray(itemsData));
       console.log(`    Items data length:`, Array.isArray(itemsData) ? itemsData.length : 'not array');
       if (Array.isArray(itemsData) && itemsData.length > 0) {
         console.log(`    First row sample:`, JSON.stringify(itemsData[0], null, 2));
         console.log(`    Table structure detected with ${itemsData.length} rows`);
       }
+      
+      // 🔍 Let's also check ALL fields for anything that looks like line items
+      console.log(`  === ALL FIELDS SEARCH FOR LINE ITEMS ===`);
+      Object.keys(fields).forEach(fieldKey => {
+        const fieldValue = fields[fieldKey]?.value;
+        const isArray = Array.isArray(fieldValue);
+        const hasData = isArray && fieldValue.length > 0;
+        
+        console.log(`    Field ${fieldKey}: type=${typeof fieldValue}, isArray=${isArray}, length=${isArray ? fieldValue.length : 'N/A'}`);
+        
+        if (hasData) {
+          console.log(`      ⭐ POTENTIAL ITEMS DATA in field ${fieldKey}:`, JSON.stringify(fieldValue).substring(0, 300));
+          if (fieldValue.length > 0) {
+            console.log(`      First item in field ${fieldKey}:`, JSON.stringify(fieldValue[0], null, 2));
+          }
+        }
+      });
+      console.log(`  === END ALL FIELDS SEARCH ===`);
       console.log(`  === END ITEMS DATA DEBUG ===`);
       
       if (!invoiceNumber || invoiceNumber === 'none' || invoiceNumber === 'unknown') {
