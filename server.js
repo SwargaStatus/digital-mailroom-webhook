@@ -323,6 +323,35 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
         field7Length: Array.isArray(fields['7']?.value) ? fields['7'].value.length : 'N/A'
       });
       
+      // 🔧 ENHANCED FIELD 7 DEBUGGING
+      if (fields['7']) {
+        log('info', 'FIELD_7_DETAILED', {
+          requestId,
+          docIndex,
+          field7Exists: true,
+          field7Raw: fields['7'],
+          field7Value: fields['7']?.value,
+          field7ValueType: typeof fields['7']?.value,
+          field7ValueStringified: JSON.stringify(fields['7']?.value)
+        });
+      } else {
+        log('info', 'FIELD_7_MISSING', { requestId, docIndex });
+      }
+      
+      // Check ALL fields for potential line items data
+      Object.keys(fields).forEach(fieldKey => {
+        const fieldValue = fields[fieldKey]?.value;
+        if (Array.isArray(fieldValue) && fieldValue.length > 0) {
+          log('info', 'ARRAY_FIELD_FOUND', {
+            requestId,
+            fieldKey,
+            arrayLength: fieldValue.length,
+            firstElement: fieldValue[0],
+            fullArray: fieldValue
+          });
+        }
+      });
+      
       // Extract field values
       const invoiceNumber = fields['0']?.value || 'unknown';
       const pageType = fields['1']?.value || 'unknown';
@@ -401,20 +430,53 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
         hasItemsData: !!itemsData,
         itemsDataType: typeof itemsData,
         itemsDataIsArray: Array.isArray(itemsData),
-        itemsDataLength: Array.isArray(itemsData) ? itemsData.length : 'N/A'
+        itemsDataLength: Array.isArray(itemsData) ? itemsData.length : 'N/A',
+        itemsDataContent: itemsData
       });
       
+      // Try to find line items in ANY field that contains arrays
+      let foundLineItems = [];
+      let sourceField = null;
+      
+      // First try Field 7 (our expected field)
       if (itemsData && Array.isArray(itemsData) && itemsData.length > 0) {
+        foundLineItems = itemsData;
+        sourceField = '7';
+        log('info', 'LINE_ITEMS_FROM_FIELD_7', { requestId, itemCount: itemsData.length });
+      } else {
+        // Search all fields for arrays that might contain line items
+        Object.keys(fields).forEach(fieldKey => {
+          const fieldValue = fields[fieldKey]?.value;
+          if (Array.isArray(fieldValue) && fieldValue.length > 0 && !foundLineItems.length) {
+            // Check if this looks like line items data
+            const firstItem = fieldValue[0];
+            if (typeof firstItem === 'object' || Array.isArray(firstItem)) {
+              foundLineItems = fieldValue;
+              sourceField = fieldKey;
+              log('info', 'LINE_ITEMS_FOUND_IN_ALTERNATE_FIELD', {
+                requestId,
+                fieldKey,
+                itemCount: fieldValue.length,
+                sampleItem: firstItem
+              });
+            }
+          }
+        });
+      }
+      
+      if (foundLineItems.length > 0) {
         log('info', 'PROCESSING_LINE_ITEMS', { 
           requestId, 
           pageType,
-          tableRowCount: itemsData.length,
-          firstRowSample: itemsData[0]
+          sourceField,
+          tableRowCount: foundLineItems.length,
+          firstRowSample: foundLineItems[0],
+          allItems: foundLineItems
         });
         
         const processedItems = [];
         
-        itemsData.forEach((row, rowIndex) => {
+        foundLineItems.forEach((row, rowIndex) => {
           log('info', 'PROCESSING_ROW', {
             requestId,
             rowIndex,
@@ -476,7 +538,8 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
             requestId, 
             invoiceNumber,
             itemCount: processedItems.length,
-            pageType
+            pageType,
+            sourceField
           });
         }
       } else {
