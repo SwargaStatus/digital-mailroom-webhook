@@ -94,44 +94,44 @@ async function uploadPdfToMondayItem(itemId, buffer, filename, columnId) {
     console.log(`Attempting to upload PDF: ${filename} to item ${itemId}, column ${columnId}`);
     console.log(`Buffer size: ${buffer.length} bytes`);
     
-    // Create the form data using Monday.com's multipart spec
+    // Create the form data using Monday.com's exact specification
     const form = new FormData();
     
-    // Monday.com requires this specific multipart format
-    const operations = {
-      query: `
-        mutation ($file: File!, $item_id: ID!, $column_id: String!) {
-          add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
-            id
-          }
-        }
-      `,
-      variables: {
-        file: null,
-        item_id: String(itemId),
-        column_id: columnId
+    // Monday.com requires this exact format based on their documentation
+    const query = `mutation($file: File!, $item_id: ID!, $column_id: String!) {
+      add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
+        id
       }
+    }`;
+    
+    const variables = {
+      item_id: String(itemId),
+      column_id: columnId
     };
     
-    // The map tells Monday.com which file corresponds to which variable
     const map = {
-      "0": ["variables.file"]
+      "file": "variables.file"
     };
     
-    // Append in the correct order that Monday.com expects
-    form.append('operations', JSON.stringify(operations));
+    // Append in the exact order Monday.com expects
+    form.append('query', query);
+    form.append('variables', JSON.stringify(variables));
     form.append('map', JSON.stringify(map));
-    form.append('0', buffer, {
+    form.append('file', buffer, {
       filename: filename,
       contentType: 'application/pdf'
     });
 
     console.log('Sending file upload request to Monday.com...');
+    console.log('Query:', query);
+    console.log('Variables:', variables);
+    console.log('Map:', map);
     
     const response = await axios.post('https://api.monday.com/v2/file', form, {
       headers: {
         ...form.getHeaders(),
-        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'API-Version': '2024-04'
       },
       timeout: 60000,
       maxBodyLength: Infinity,
