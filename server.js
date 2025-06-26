@@ -437,48 +437,161 @@ async function createMondayExtractedItems(documents, originalFiles){
 
 async function createSubitemsForLineItems(parentItemId, items) {
   try {
+    console.log(`Creating ${items.length} subitems for parent item ${parentItemId}...`);
+    
+    // First, let's get the subitem board structure to find column IDs
+    const subitemBoardQuery = `
+      query {
+        boards(ids: [${MONDAY_CONFIG.extractedDocsBoardId}]) {
+          id
+          name
+          columns {
+            id
+            title
+            type
+          }
+        }
+      }
+    `;
+    
+    const subitemBoardResponse = await axios.post('https://api.monday.com/v2', {
+      query: subitemBoardQuery
+    }, {
+      headers: {
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const allColumns = subitemBoardResponse.data.data?.boards?.[0]?.columns || [];
+    console.log('=== ALL BOARD COLUMNS (including subitem columns) ===');
+    allColumns.forEach(col => {
+      console.log(`  ${col.title}: ID = "${col.id}", Type = ${col.type}`);
+    });
+    
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
       
-      const itemNumber = String(item.item_number || '').replace(/"/g, '\\"');
-      const description = String(item.description || itemNumber || `Item ${i + 1}`).replace(/"/g, '\\"');
-      const quantity = item.quantity || 0;
-      const unitCost = item.unit_cost || 0;
-      const amount = item.amount || (quantity * unitCost);
+      // Clean and prepare data
+      const itemNumber = String(item.item_number || '').replace(/"/g, '\\"').substring(0, 50);
+      const quantity = parseFloat(item.quantity) || 0;
+      const unitCost = parseFloat(item.unit_cost) || 0;
       
-      const subitemName = `${itemNumber}: ${description.substring(0, 40)}${description.length > 40 ? '...' : ''}`;
+      // Create meaningful subitem name
+      const subitemName = itemNumber || `Line Item ${i + 1}`;
       
-      console.log(`Creating subitem: ${subitemName} (Qty: ${quantity}, Cost: ${unitCost})`);
+      console.log(`Creating subitem ${i + 1}: ${subitemName}`);
+      console.log(`  Item Number: "${itemNumber}"`);
+      console.log(`  Quantity: ${quantity}`);
+      console.log(`  Unit Cost: ${unitCost}`);
       
+      // Map to your subitem columns (we'll update these IDs once we see them in logs)
+      const subitemColumnValues = {};
+      
+      // Find the actual column IDs from your board
+      allColumns.forEach(col => {
+        const title = col.title.toLowerCase();
+        
+        if (title.includes('item num') || title === 'item number') {
+          subitemColumnValues[col.id] = itemNumber;
+          console.log(`  Mapping Item Number to column ${col.id}: "${itemNumber}"`);
+        } else if (title.includes('quantity') || title === 'quantity') {
+          subitemColumnValues[col.id] = quantity;
+          console.log(`  Mapping Quantity to column ${col.id}: ${quantity}`);
+        } else if (title.includes('unit cost') || title === 'unit cost') {
+          subitemColumnValues[col.id] = unitCost;
+          console.log(`  Mapping Unit Cost to column ${col.id}: ${unitCost}`);
+        }
+      });
+      
+      console.log(`Final column values for subitem ${i + 1}:`, subitemColumnValues);
+      
+      // Convert to JSON string format that Monday.com expects
+      const columnValuesJson = JSON.stringify(subitemColumnValues);
+      
+      // Create the subitem mutation
       const subitemMutation = `
         mutation {
           create_subitem(
             parent_item_id: ${parentItemId}
-            item_name: "${subitemName}"
+            item_name: "${subitemName.replace(/"/g, '\\"')}"
+            column_values: ${JSON.stringify(columnValuesJson)}
           ) {
             id
             name
+            board {
+              id
+            }
           }
         }
       `;
+      
+      console.log(`Executing subitem mutation for item ${i + 1}...`);
+      console.log(`Query:`, subitemMutation);
       
       const subitemResponse = await axios.post('https://api.monday.com/v2', {
         query: subitemMutation
       }, {
         headers: {
           'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
-          'Content-Type': 'application/json'
-        }
+          'Content-Type': 'application/json',
+          'API-Version': '2024-04'
+        },
+        timeout: 30000
       });
       
+      console.log(`Subitem response for item ${i + 1}:`, JSON.stringify(subitemResponse.data, null, 2));
+      
       if (subitemResponse.data.errors) {
-        console.error('Subitem creation errors:', subitemResponse.data.errors);
+        console.error(`Subitem creation errors for item ${i + 1}:`, JSON.stringify(subitemResponse.data.errors, null, 2));
+        
+        // Try creating without column values if there are errors
+        console.log(`Retrying subitem ${i + 1} without column values...`);
+        
+        const simpleSubitemMutation = `
+          mutation {
+            create_subitem(
+              parent_item_id: ${parentItemId}
+              item_name: "${subitemName.replace(/"/g, '\\"')}"
+            ) {
+              id
+              name
+            }
+          }
+        `;
+        
+        const retryResponse = await axios.post('https://api.monday.com/v2', {
+          query: simpleSubitemMutation
+        }, {
+          headers: {
+            'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+            'Content-Type': 'application/json',
+            'API-Version': '2024-04'
+          }
+        });
+        
+        if (retryResponse.data.errors) {
+          console.error(`Retry also failed for item ${i + 1}:`, JSON.stringify(retryResponse.data.errors, null, 2));
+        } else {
+          console.log(`✅ Created simple subitem ${i + 1}: ${subitemName} (ID: ${retryResponse.data.data.create_subitem.id})`);
+        }
       } else {
-        console.log(`✅ Created subitem: ${subitemName}`);
+        console.log(`✅ Created subitem ${i + 1}: ${subitemName} (ID: ${subitemResponse.data.data.create_subitem.id})`);
       }
+      
+      // Small delay between subitem creations to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 500));
     }
+    
+    console.log(`✅ Completed creating subitems for parent item ${parentItemId}`);
+    
   } catch (error) {
-    console.error('Error creating subitems:', error);
+    console.error('Error creating subitems:', error.message);
+    if (error.response) {
+      console.error('Response status:', error.response.status);
+      console.error('Response data:', JSON.stringify(error.response.data, null, 2));
+    }
+    // Don't throw error - continue with other processing
   }
 }
 
