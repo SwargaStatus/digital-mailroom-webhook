@@ -1,5 +1,6 @@
 function groupPagesByInvoiceNumber(extractedFiles) {
   console.log('=== GROUPING DEBUG ===');
+  console.log('🚨🚨🚨 NEW CODE DEPLOYED - TESTING SUBITEMS 🚨🚨🚨');
   console.log('Input files:', extractedFiles?.length || 0);
   
   // 🚨 IMMEDIATE DEBUG - Let's see what we're working with
