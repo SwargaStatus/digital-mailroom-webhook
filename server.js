@@ -23,6 +23,159 @@ const INSTABASE_CONFIG = {
     'Authorization': 'Bearer jEmrseIwOb9YtmJ6GzPAywtz53KnpS',
     'Content-Type':  'application/json'
   }
+
+// 🔧 NEW: Function to update the original item status
+async function updateOriginalItemStatus(itemId, boardId, status, requestId) {
+  try {
+    log('info', 'UPDATING_ORIGINAL_ITEM_STATUS', { 
+      requestId, 
+      itemId, 
+      boardId, 
+      newStatus: status 
+    });
+
+    // First, get the board structure to find the status column
+    const boardQuery = `
+      query {
+        boards(ids: [${boardId}]) {
+          id
+          name
+          columns {
+            id
+            title
+            type
+            settings_str
+          }
+        }
+      }
+    `;
+    
+    const boardResponse = await axios.post('https://api.monday.com/v2', {
+      query: boardQuery
+    }, {
+      headers: {
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
+    const statusColumn = columns.find(col => 
+      col.type === 'status' && col.title.toLowerCase().includes('status')
+    );
+    
+    if (!statusColumn) {
+      log('warn', 'NO_STATUS_COLUMN_FOUND', { 
+        requestId, 
+        itemId,
+        availableColumns: columns.map(c => ({ id: c.id, title: c.title, type: c.type }))
+      });
+      return;
+    }
+
+    log('info', 'STATUS_COLUMN_FOUND', {
+      requestId,
+      columnId: statusColumn.id,
+      columnTitle: statusColumn.title
+    });
+
+    // Parse the status column settings to find the status labels
+    let statusSettings = {};
+    try {
+      statusSettings = JSON.parse(statusColumn.settings_str || '{}');
+    } catch (e) {
+      log('error', 'STATUS_SETTINGS_PARSE_ERROR', { requestId, error: e.message });
+      return;
+    }
+
+    // Find the index of the desired status
+    let statusIndex = 0; // Default to first status
+    if (statusSettings.labels && Array.isArray(statusSettings.labels)) {
+      const matchingLabel = statusSettings.labels.find(label => 
+        label.name && label.name.toLowerCase() === status.toLowerCase()
+      );
+      
+      if (matchingLabel) {
+        statusIndex = statusSettings.labels.indexOf(matchingLabel);
+      } else {
+        // If exact match not found, try partial match
+        const partialMatch = statusSettings.labels.find(label => 
+          label.name && label.name.toLowerCase().includes(status.toLowerCase())
+        );
+        
+        if (partialMatch) {
+          statusIndex = statusSettings.labels.indexOf(partialMatch);
+        } else {
+          log('warn', 'STATUS_LABEL_NOT_FOUND', {
+            requestId,
+            requestedStatus: status,
+            availableLabels: statusSettings.labels.map(l => l.name)
+          });
+          // Use a reasonable default based on status
+          if (status.toLowerCase() === 'complete') {
+            statusIndex = statusSettings.labels.length > 1 ? 1 : 0; // Try second option
+          } else if (status.toLowerCase() === 'failed') {
+            statusIndex = statusSettings.labels.length > 2 ? 2 : 0; // Try third option
+          }
+        }
+      }
+    }
+
+    log('info', 'STATUS_INDEX_DETERMINED', {
+      requestId,
+      statusIndex,
+      requestedStatus: status,
+      availableLabels: statusSettings.labels?.map(l => l.name) || []
+    });
+
+    // Update the item status
+    const updateMutation = `
+      mutation {
+        change_column_value(
+          item_id: ${itemId}
+          board_id: ${boardId}
+          column_id: "${statusColumn.id}"
+          value: "{\\"index\\": ${statusIndex}}"
+        ) {
+          id
+          name
+        }
+      }
+    `;
+
+    const updateResponse = await axios.post('https://api.monday.com/v2', {
+      query: updateMutation
+    }, {
+      headers: {
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (updateResponse.data.errors) {
+      log('error', 'STATUS_UPDATE_FAILED', {
+        requestId,
+        itemId,
+        errors: updateResponse.data.errors
+      });
+    } else {
+      log('info', 'STATUS_UPDATE_SUCCESS', {
+        requestId,
+        itemId,
+        newStatus: status,
+        statusIndex: statusIndex
+      });
+    }
+
+  } catch (error) {
+    log('error', 'STATUS_UPDATE_ERROR', {
+      requestId,
+      itemId,
+      error: error.message,
+      stack: error.stack
+    });
+    // Don't throw - this shouldn't stop the main processing
+  }
 };
 
 const MONDAY_CONFIG = {
@@ -110,6 +263,9 @@ async function processWebhookData(body, requestId) {
     
     await createMondayExtractedItems(groups, itemId, originalFiles, requestId, runId);
     
+    // 🔧 NEW: Update original item status to "Complete" after successful processing
+    await updateOriginalItemStatus(itemId, ev.boardId, 'Complete', requestId);
+    
     log('info', 'PROCESSING_COMPLETE', { requestId, itemId });
   } catch (err) {
     log('error', 'BACKGROUND_PROCESSING_FAILED', { 
@@ -117,6 +273,16 @@ async function processWebhookData(body, requestId) {
       error: err.message, 
       stack: err.stack 
     });
+    
+    // 🔧 NEW: Update original item status to "Failed" if processing fails
+    try {
+      await updateOriginalItemStatus(ev.pulseId, ev.boardId, 'Failed', requestId);
+    } catch (statusError) {
+      log('error', 'FAILED_TO_UPDATE_STATUS_ON_ERROR', { 
+        requestId, 
+        error: statusError.message 
+      });
+    }
   }
 }
 
