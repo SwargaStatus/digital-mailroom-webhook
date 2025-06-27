@@ -1,654 +1,24 @@
-// Digital Mailroom Webhook — FINAL VERSION with Multi-Page Document Reconstruction + PO Number Support + Line Number
-// -----------------------------------------------------------------------------
-// This version intelligently merges split PDF pages back into complete documents
-// and includes PO Number tracking and Line Number extraction for subitems
-// -----------------------------------------------------------------------------
-
-const express   = require('express');
-const axios     = require('axios');
-const FormData  = require('form-data');
-
-const app = express();
-app.use(express.json());
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 1️⃣  CONFIG  –  **unchanged / hard‑coded**
-// ----------------------------------------------------------------------------
-const INSTABASE_CONFIG = {
-  baseUrl:       'https://aihub.instabase.com',
-  apiKey:        'jEmrseIwOb9YtmJ6GzPAywtz53KnpS',
-  deploymentId:  '0197a3fe-599d-7bac-a34b-81704cc83beb',
-  headers: {
-    'IB-Context':   'sturgeontire',
-    'Authorization': 'Bearer jEmrseIwOb9YtmJ6GzPAywtz53KnpS',
-    'Content-Type':  'application/json'
-  }
-};
-
-const MONDAY_CONFIG = {
-  apiKey:               'eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjUzMDYzOTcxOSwiYWFpIjoxMSwidWlkIjo2Nzg2NjA4MywiaWFkIjoiMjAyNS0wNi0yNFQyMjoxNjowMC42NTJaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6MjYyMDQ5OTgsInJnbiI6InVzZTEifQ.zv9EsISZnchs7WKSqN2t3UU1GwcLrzPGeaP7ssKIla8',
-  fileUploadsBoardId:   '9445652448',
-  extractedDocsBoardId: '9446325745'
-};
-
-// Helper logging with request ID
-function log(level, message, data = {}) {
-  const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] ${level.toUpperCase()}: ${message}`, data);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 2️⃣  WEBHOOK ENDPOINT
-// ----------------------------------------------------------------------------
-app.post('/webhook/monday-to-instabase', async (req, res) => {
-  const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-  
-  try {
-    log('info', 'WEBHOOK_RECEIVED', { requestId, body: req.body });
-
-    // Monday "challenge" handshake
-    if (req.body.challenge) {
-      log('info', 'CHALLENGE_RESPONSE', { requestId, challenge: req.body.challenge });
-      return res.json({ challenge: req.body.challenge });
-    }
-
-    res.json({ success: true, received: new Date().toISOString(), requestId });
-
-    // fire‑and‑forget ⇢ background processing
-    processWebhookData(req.body, requestId);
-  } catch (err) {
-    log('error', 'WEBHOOK_ERROR', { requestId, error: err.message, stack: err.stack });
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 3️⃣  MAIN BACKGROUND FLOW
-// ----------------------------------------------------------------------------
-async function processWebhookData(body, requestId) {
-  try {
-    log('info', 'PROCESSING_START', { requestId, event: body.event });
-    
-    const ev = body.event;
-    if (!ev) {
-      log('warn', 'NO_EVENT_DATA', { requestId });
-      return;
-    }
-    
-    if (ev.columnId !== 'status' || ev.value?.label?.text !== 'Processing') {
-      log('info', 'IGNORED_EVENT', { 
-        requestId, 
-        columnId: ev.columnId, 
-        status: ev.value?.label?.text 
-      });
-      return;
-    }
-
-    const itemId = ev.pulseId;
-    log('info', 'PROCESSING_ITEM', { requestId, itemId, boardId: ev.boardId });
-    
-    const pdfFiles = await getMondayItemFilesWithPublicUrl(itemId, ev.boardId, requestId);
-    if (!pdfFiles.length) {
-      log('warn', 'NO_PDF_FILES', { requestId, itemId });
-      return;
-    }
-
-    const { files: extracted, originalFiles, runId } = await processFilesWithInstabase(pdfFiles, requestId);
-    const groups = groupPagesByInvoiceNumber(extracted, requestId);
-    
-    // 🔧 DEBUG: Log the groups after processing to verify items are found
-    log('info', 'GROUPS_AFTER_PROCESSING', {
-      requestId,
-      groupCount: groups.length,
-      groups: groups.map(g => ({
-        invoiceNumber: g.invoice_number,
-        itemCount: g.items?.length || 0,
-        isMultiPage: g.isMultiPageReconstruction || false,
-        pageCount: g.originalPageCount || 1
-      }))
-    });
-    
-    await createMondayExtractedItems(groups, itemId, originalFiles, requestId, runId);
-    
-    log('info', 'PROCESSING_COMPLETE', { requestId, itemId });
-  } catch (err) {
-    log('error', 'BACKGROUND_PROCESSING_FAILED', { 
-      requestId, 
-      error: err.message, 
-      stack: err.stack 
-    });
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 4️⃣  MONDAY HELPERS
-// ----------------------------------------------------------------------------
-async function getMondayItemFilesWithPublicUrl(itemId, boardId, requestId) {
-  try {
-    log('info', 'FETCHING_FILES', { requestId, itemId, boardId });
-    
-    const query = `query { items(ids:[${itemId}]){ assets{id name file_extension file_size public_url} }}`;
-    const { data } = await axios.post('https://api.monday.com/v2', { query }, {
-      headers: { Authorization: `Bearer ${MONDAY_CONFIG.apiKey}` }
-    });
-    
-    const assets = data.data.items[0].assets;
-    const pdfFiles = assets.filter(a => 
-      (/pdf$/i).test(a.file_extension) || (/\.pdf$/i).test(a.name)
-    ).map(a => ({ 
-      name: a.name, 
-      public_url: a.public_url, 
-      assetId: a.id 
-    }));
-    
-    log('info', 'FILES_FOUND', { requestId, fileCount: pdfFiles.length, files: pdfFiles.map(f => f.name) });
-    return pdfFiles;
-  } catch (error) {
-    log('error', 'FETCH_FILES_ERROR', { requestId, error: error.message });
-    throw error;
-  }
-}
-
-// 🔧 FIXED: PDF Upload function with correct Monday.com multipart format
-async function uploadPdfToMondayItem(itemId, buffer, filename, columnId, requestId) {
-  try {
-    log('info', 'PDF_UPLOAD_START', { requestId, itemId, filename, columnId, bufferSize: buffer.length });
-    
-    // Create the form data using Monday.com's exact specification
-    const form = new FormData();
-    
-    const query = `mutation($file: File!, $item_id: ID!, $column_id: String!) {
-      add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
-        id
-      }
-    }`;
-    
-    const variables = {
-      item_id: String(itemId),
-      column_id: columnId
-    };
-    
-    const map = {
-      "file": "variables.file"
-    };
-    
-    // Append in the exact order Monday.com expects
-    form.append('query', query);
-    form.append('variables', JSON.stringify(variables));
-    form.append('map', JSON.stringify(map));
-    form.append('file', buffer, {
-      filename: filename,
-      contentType: 'application/pdf'
-    });
-    
-    const response = await axios.post('https://api.monday.com/v2/file', form, {
-      headers: {
-        ...form.getHeaders(),
-        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
-        'API-Version': '2024-04'
-      },
-      timeout: 60000,
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity
-    });
-
-    if (response.data.errors) {
-      log('error', 'PDF_UPLOAD_ERROR', { requestId, errors: response.data.errors });
-      throw new Error(`PDF upload failed: ${JSON.stringify(response.data.errors)}`);
-    } else {
-      log('info', 'PDF_UPLOAD_SUCCESS', { requestId, fileId: response.data.data.add_file_to_column.id });
-      return response.data.data.add_file_to_column.id;
-    }
-  } catch (error) {
-    log('error', 'PDF_UPLOAD_EXCEPTION', { requestId, error: error.message });
-    throw error;
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 5️⃣  INSTABASE PROCESSING (FULL VERSION)
-// ----------------------------------------------------------------------------
-async function processFilesWithInstabase(files, requestId) {
-  try {
-    log('info', 'INSTABASE_START', { requestId, fileCount: files.length });
-    
-    // Create batch
-    const batchRes = await axios.post(`${INSTABASE_CONFIG.baseUrl}/api/v2/batches`,
-                                     { workspace:'nileshn_sturgeontire.com' },
-                                     { headers: INSTABASE_CONFIG.headers });
-    const batchId = batchRes.data.id;
-    log('info', 'BATCH_CREATED', { requestId, batchId });
-
-    const originalFiles = [];
-    
-    // Upload files to batch
-    for (const f of files) {
-      log('info', 'UPLOADING_FILE', { requestId, fileName: f.name });
-      const { data } = await axios.get(f.public_url, { responseType:'arraybuffer' });
-      const buffer = Buffer.from(data);
-      
-      originalFiles.push({ name: f.name, buffer: buffer });
-      
-      await axios.put(`${INSTABASE_CONFIG.baseUrl}/api/v2/batches/${batchId}/files/${f.name}`,
-                      data,
-                      { headers:{ ...INSTABASE_CONFIG.headers, 'Content-Type':'application/octet-stream' } });
-      log('info', 'FILE_UPLOADED', { requestId, fileName: f.name });
-    }
-
-    // Start processing run
-    log('info', 'STARTING_PROCESSING', { requestId, batchId });
-    const runResponse = await axios.post(
-      `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/deployments/${INSTABASE_CONFIG.deploymentId}/runs`,
-      { batch_id: batchId },
-      { headers: INSTABASE_CONFIG.headers }
-    );
-    
-    const runId = runResponse.data.id;
-    log('info', 'RUN_STARTED', { requestId, runId });
-
-    // Poll for completion
-    let status = 'RUNNING';
-    let attempts = 0;
-    const maxAttempts = 60; // 5 minutes
-
-    while (status === 'RUNNING' || status === 'PENDING') {
-      if (attempts >= maxAttempts) {
-        throw new Error('Processing timeout after 5 minutes');
-      }
-
-      await new Promise(resolve => setTimeout(resolve, 5000));
-
-      const statusResponse = await axios.get(
-        `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}`,
-        { headers: INSTABASE_CONFIG.headers }
-      );
-
-      status = statusResponse.data.status;
-      attempts++;
-      log('info', 'PROCESSING_STATUS', { requestId, status, attempt: attempts });
-
-      if (status === 'ERROR' || status === 'FAILED') {
-        throw new Error(`Instabase processing failed with status: ${status}`);
-      }
-    }
-
-    if (status !== 'COMPLETE') {
-      throw new Error(`Processing ended with unexpected status: ${status}`);
-    }
-
-    log('info', 'PROCESSING_COMPLETE', { requestId, runId });
-
-    // Get results
-    const resultsResponse = await axios.get(
-      `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}/results`,
-      { headers: INSTABASE_CONFIG.headers }
-    );
-
-    log('info', 'RESULTS_RECEIVED', { requestId, fileCount: resultsResponse.data.files?.length || 0 });
-    
-    return { 
-      files: resultsResponse.data.files, 
-      originalFiles: originalFiles,
-      runId: runId  // Return the run ID so we can link it
-    };
-    
-  } catch (error) {
-    log('error', 'INSTABASE_ERROR', { requestId, error: error.message });
-    throw error;
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 6️⃣  ENHANCED GROUPING WITH INTELLIGENT MULTI-PAGE DOCUMENT MERGING
-// ----------------------------------------------------------------------------
-function groupPagesByInvoiceNumber(extractedFiles, requestId) {
-  log('info', 'GROUPING_START', { 
-    requestId, 
-    inputFiles: extractedFiles?.length || 0 
-  });
-  
-  const documentGroups = {};
-  
-  if (!extractedFiles || extractedFiles.length === 0) {
-    log('warn', 'NO_FILES_TO_GROUP', { requestId });
-    return [];
-  }
-  
-  // 🔧 NEW: First pass - collect all pages by filename
-  const pagesByFilename = {};
-  
-  extractedFiles.forEach((file, fileIndex) => {
-    log('info', 'PROCESSING_FILE', { 
-      requestId, 
-      fileIndex, 
-      fileName: file.original_file_name 
-    });
-    
-    if (!file.documents || file.documents.length === 0) {
-      log('warn', 'NO_DOCUMENTS_IN_FILE', { requestId, fileIndex });
-      return;
-    }
-    
-    // Group pages by filename
-    if (!pagesByFilename[file.original_file_name]) {
-      pagesByFilename[file.original_file_name] = [];
-    }
-    
-    file.documents.forEach((doc, docIndex) => {
-      const fields = doc.fields || {};
-      
-      pagesByFilename[file.original_file_name].push({
-        fileIndex,
-        docIndex,
-        fields,
-        fileName: file.original_file_name
-      });
-    });
-  });
-  
-  log('info', 'PAGES_GROUPED_BY_FILENAME', {
-    requestId,
-    filenames: Object.keys(pagesByFilename),
-    pagesByFile: Object.keys(pagesByFilename).map(filename => ({
-      filename,
-      pageCount: pagesByFilename[filename].length
-    }))
-  });
-  
-  // 🔧 NEW: Second pass - intelligent document reconstruction
-  Object.keys(pagesByFilename).forEach(filename => {
-    const pages = pagesByFilename[filename];
-    
-    log('info', 'RECONSTRUCTING_DOCUMENT', {
-      requestId,
-      filename,
-      totalPages: pages.length
-    });
-    
-    // Find the page with the invoice number (usually page 1, but not always)
-    let masterPage = null;
-    let invoiceNumber = null;
-    
-    // Strategy 1: Look for explicit invoice number
-    for (const page of pages) {
-      const candidateInvoiceNumber = page.fields['0']?.value;
-      if (candidateInvoiceNumber && 
-          candidateInvoiceNumber !== 'unknown' && 
-          candidateInvoiceNumber !== 'none' && 
-          candidateInvoiceNumber !== '') {
-        masterPage = page;
-        invoiceNumber = candidateInvoiceNumber;
-        log('info', 'FOUND_INVOICE_NUMBER', {
-          requestId,
-          filename,
-          invoiceNumber,
-          pageIndex: pages.indexOf(page)
-        });
-        break;
-      }
-    }
-    
-    // Strategy 2: If no invoice number found, use filename as identifier
-    if (!invoiceNumber) {
-      // Extract potential invoice number from filename
-      const filenameMatch = filename.match(/(\d{8,})/); // Look for 8+ digit numbers
-      if (filenameMatch) {
-        invoiceNumber = filenameMatch[1];
-        masterPage = pages[0]; // Use first page as master
-        log('info', 'EXTRACTED_INVOICE_FROM_FILENAME', {
-          requestId,
-          filename,
-          extractedInvoiceNumber: invoiceNumber
-        });
-      } else {
-        // Fallback: use filename without extension
-        invoiceNumber = filename.replace(/\.[^/.]+$/, "");
-        masterPage = pages[0];
-        log('info', 'USING_FILENAME_AS_INVOICE', {
-          requestId,
-          filename,
-          invoiceNumber
-        });
-      }
-    }
-    
-    if (!masterPage) {
-      log('warn', 'NO_MASTER_PAGE_FOUND', { requestId, filename });
-      return;
-    }
-    
-    // 🔧 NEW: Merge all pages for this document
-    const mergedDocument = reconstructMultiPageDocument(pages, masterPage, requestId, filename);
-    
-    if (mergedDocument) {
-      documentGroups[invoiceNumber] = mergedDocument;
-      log('info', 'DOCUMENT_RECONSTRUCTED', {
-        requestId,
-        invoiceNumber,
-        filename,
-        totalPages: pages.length,
-        lineItemCount: mergedDocument.items?.length || 0,
-        totalAmount: mergedDocument.total_amount
-      });
-    }
-  });
-  
-  const resultGroups = Object.values(documentGroups);
-  log('info', 'GROUPING_COMPLETE', {
-    requestId,
-    groupCount: resultGroups.length,
-    groupsWithItems: resultGroups.filter(g => g.items.length > 0).length
-  });
-  
-  resultGroups.forEach(group => {
-    log('info', 'GROUP_SUMMARY', {
-      requestId,
-      invoiceNumber: group.invoice_number,
-      pageCount: group.pages.length,
-      itemCount: group.items.length,
-      totalAmount: group.total_amount
-    });
-  });
-  
-  return resultGroups;
-}
-
-// 🔧 ENHANCED: Function to intelligently reconstruct multi-page documents
-function reconstructMultiPageDocument(pages, masterPage, requestId, filename) {
-  log('info', 'RECONSTRUCTING_MULTI_PAGE_DOC', {
-    requestId,
-    filename,
-    pageCount: pages.length,
-    masterPageIndex: pages.indexOf(masterPage),
-    pageTypes: pages.map(p => p.fields['1']?.value || 'unknown')
-  });
-  
-  const masterFields = masterPage.fields;
-  
-  // Extract basic info from master page
-  const invoiceNumber = masterFields['0']?.value || filename.replace(/\.[^/.]+$/, "");
-  const documentType = masterFields['2']?.value || 'invoice';
-  const supplier = masterFields['3']?.value || '';
-  const terms = masterFields['4']?.value || '';
-  const documentDate = masterFields['5']?.value || '';
-  const referenceNumber = masterFields['10']?.value || '';
-  
-  // 🔧 NEW: Merge due dates from all pages (prioritize non-empty values)
-  let mergedDueDates = { due_date: '', due_date_2: '', due_date_3: '' };
-  
-  pages.forEach((page, pageIndex) => {
-    const raw6 = page.fields['6'];
-    if (raw6) {
-      const dueDates = extractDueDatesFromField(raw6, requestId, pageIndex);
-      
-      // Merge due dates (keep first non-empty value found)
-      if (dueDates.due_date && !mergedDueDates.due_date) {
-        mergedDueDates.due_date = dueDates.due_date;
-      }
-      if (dueDates.due_date_2 && !mergedDueDates.due_date_2) {
-        mergedDueDates.due_date_2 = dueDates.due_date_2;
-      }
-      if (dueDates.due_date_3 && !mergedDueDates.due_date_3) {
-        mergedDueDates.due_date_3 = dueDates.due_date_3;
-      }
-    }
-  });
-  
-  // 🔧 NEW: Merge line items from all pages
-  const allLineItems = [];
-  
-  pages.forEach((page, pageIndex) => {
-    log('info', 'PROCESSING_PAGE_FOR_ITEMS', {
-      requestId,
-      filename,
-      pageIndex,
-      availableFields: Object.keys(page.fields)
-    });
-    
-    const pageItems = extractLineItemsFromPage(page, requestId, pageIndex);
-    if (pageItems.length > 0) {
-      allLineItems.push(...pageItems);
-      log('info', 'ITEMS_FOUND_ON_PAGE', {
-        requestId,
-        filename,
-        pageIndex,
-        itemCount: pageItems.length
-      });
-    }
-  });
-  
-  // 🔧 NEW: Find totals from any page (usually last page)
-  let totalAmount = 0;
-  let taxAmount = 0;
-  
-  // Search all pages for totals (prioritize later pages)
-  for (let i = pages.length - 1; i >= 0; i--) {
-    const page = pages[i];
-    const pageTotalAmount = page.fields['8']?.value;
-    const pageTaxAmount = page.fields['9']?.value;
-    
-    if (pageTotalAmount && !totalAmount) {
-      const totalStr = String(pageTotalAmount).replace(/[^0-9.-]/g, '');
-      totalAmount = parseFloat(totalStr) || 0;
-      log('info', 'TOTAL_FOUND_ON_PAGE', {
-        requestId,
-        filename,
-        pageIndex: i,
-        totalAmount,
-        rawValue: pageTotalAmount
-      });
-    }
-    
-    if (pageTaxAmount && !taxAmount) {
-      const taxStr = String(pageTaxAmount).replace(/[^0-9.-]/g, '');
-      taxAmount = parseFloat(taxStr) || 0;
-      log('info', 'TAX_FOUND_ON_PAGE', {
-        requestId,
-        filename,
-        pageIndex: i,
-        taxAmount,
-        rawValue: pageTaxAmount
-      });
-    }
-    
-    // If we found both, we can stop
-    if (totalAmount && taxAmount) break;
-  }
-  
-  const reconstructedDocument = {
-    invoice_number: invoiceNumber,
-    document_type: documentType,
-    supplier_name: supplier,
-    reference_number: referenceNumber,
-    total_amount: totalAmount,
-    tax_amount: taxAmount,
-    document_date: documentDate,
-    due_date: mergedDueDates.due_date,
-    due_date_2: mergedDueDates.due_date_2,
-    due_date_3: mergedDueDates.due_date_3,
-    terms: terms,
-    items: allLineItems,
-    pages: pages.map((page, index) => ({
-      page_type: page.fields['1']?.value || `page_${index + 1}`,
-      file_name: filename,
-      fields: page.fields
-    })),
-    confidence: 0,
-    isMultiPageReconstruction: true,
-    originalPageCount: pages.length,
-    reconstructionStrategy: 'filename_grouping_with_content_merging'
-  };
-  
-  log('info', 'DOCUMENT_RECONSTRUCTION_COMPLETE', {
-    requestId,
-    filename,
-    invoiceNumber,
-    totalAmount,
-    taxAmount,
-    lineItemCount: allLineItems.length,
-    pageCount: pages.length,
-    dueDatesFound: Object.values(mergedDueDates).filter(d => d).length
-  });
-  
-  return reconstructedDocument;
-}
-
-// 🔧 NEW: Helper function to extract due dates from field 6
-function extractDueDatesFromField(raw6, requestId, pageIndex) {
-  let dueDates = { due_date: '', due_date_2: '', due_date_3: '' };
-  
-  if (!raw6) return dueDates;
-  
-  const v = raw6?.value;
-  
-  if (typeof v === 'string') {
-    try {
-      const parsed = JSON.parse(v.trim());
-      if (Array.isArray(parsed)) {
-        dueDates.due_date = parsed[1] || '';
-        dueDates.due_date_2 = parsed[2] || '';
-        dueDates.due_date_3 = parsed[3] || '';
-      } else {
-        dueDates.due_date = String(parsed);
-      }
-    } catch (e) {
-      dueDates.due_date = String(v);
-    }
-  } else if (Array.isArray(v)) {
-    dueDates.due_date = v[1] || '';
-    dueDates.due_date_2 = v[2] || '';
-    dueDates.due_date_3 = v[3] || '';
-  } else if (v?.tables && Array.isArray(v.tables[0]?.rows)) {
-    const rows = v.tables[0].rows;
-    dueDates.due_date = rows[1] || '';
-    dueDates.due_date_2 = rows[2] || '';
-    dueDates.due_date_3 = rows[3] || '';
-  } else if (v?.rows) {
-    dueDates.due_date = v.rows[1] || '';
-    dueDates.due_date_2 = v.rows[2] || '';
-    dueDates.due_date_3 = v.rows[3] || '';
-  } else {
-    dueDates.due_date = String(v);
-  }
-  
-  return dueDates;
-}
-
-// 🔧 UPDATED: Helper function to extract line items from a single page - NOW WITH LINE NUMBER & PO SUPPORT
+// 🔧 UPDATED: Helper function to extract line items - UPDATED FIELD MAPPING
 function extractLineItemsFromPage(page, requestId, pageIndex) {
   const fields = page.fields || {};
-  const raw7 = fields['7'];  // Line items field
-  const raw11 = fields['11']; // PO Number field
+  const raw5 = fields['5'];  // 🔧 UPDATED: Line items moved from field 7 to field 5
+  const raw8 = fields['8'];  // 🔧 UPDATED: PO Number moved from field 11 to field 8 (Reference Number)
   let itemsData = [];
   let poNumber = '';
   
-  // Extract PO number from this page/section
-  if (raw11) {
-    const v = raw11?.value;
+  log('info', 'EXTRACTING_LINE_ITEMS_START', {
+    requestId,
+    pageIndex,
+    availableFields: Object.keys(fields),
+    fieldsWithValues: Object.keys(fields).filter(key => fields[key]?.value)
+  });
+  
+  // Extract PO number from reference field (field 8)
+  if (raw8) {
+    const v = raw8?.value;
     if (typeof v === 'string' && v.startsWith('SP')) {
       poNumber = v.trim();
     } else if (Array.isArray(v) && v.length > 0) {
-      // Find first SP code in array
       const spCode = v.find(item => typeof item === 'string' && item.startsWith('SP'));
       poNumber = spCode || '';
     }
@@ -673,41 +43,58 @@ function extractLineItemsFromPage(page, requestId, pageIndex) {
     requestId,
     pageIndex,
     poNumber: poNumber || 'NOT_FOUND',
-    extractedFrom: raw11 ? 'field_11' : 'fallback_search'
+    extractedFrom: raw8 ? 'field_8' : 'fallback_search'
   });
   
-  // Extract line items (existing logic)
-  if (raw7) {
-    const v = raw7?.value;
+  // 🔧 UPDATED: Extract line items from field 5 (was field 7)
+  if (raw5) {
+    const v = raw5?.value;
+    
+    log('info', 'CHECKING_FIELD_5_FOR_ITEMS', {
+      requestId,
+      pageIndex,
+      valueType: typeof v,
+      isArray: Array.isArray(v),
+      hasValue: !!v,
+      valuePreview: Array.isArray(v) ? `Array(${v.length})` : String(v).substring(0, 100)
+    });
     
     if (typeof v === 'string') {
       try {
         itemsData = JSON.parse(v.trim());
+        log('info', 'ITEMS_FOUND_IN_STRING_FIELD_5', { requestId, pageIndex, itemCount: itemsData.length });
       } catch (e) {
         log('error', 'JSON_PARSE_FAILED', { requestId, pageIndex, error: e.message });
       }
     } else if (Array.isArray(v)) {
       itemsData = v;
+      log('info', 'ITEMS_FOUND_IN_ARRAY_FIELD_5', { requestId, pageIndex, itemCount: v.length });
     } else if (v?.tables && Array.isArray(v.tables[0]?.rows)) {
       itemsData = v.tables[0].rows;
-    } else if (v?.rows) {
+      log('info', 'ITEMS_FOUND_IN_TABLE_FIELD_5', { requestId, pageIndex, itemCount: v.tables[0].rows.length });
+    } else if (v?.rows && Array.isArray(v.rows)) {
       itemsData = v.rows;
-    } else if (raw7.tables?.[0]?.rows) {
-      itemsData = raw7.tables[0].rows;
-    } else if (raw7.rows) {
-      itemsData = raw7.rows;
+      log('info', 'ITEMS_FOUND_IN_ROWS_FIELD_5', { requestId, pageIndex, itemCount: v.rows.length });
+    } else if (raw5.tables?.[0]?.rows) {
+      itemsData = raw5.tables[0].rows;
+      log('info', 'ITEMS_FOUND_IN_FIELD_5_TABLE', { requestId, pageIndex, itemCount: raw5.tables[0].rows.length });
+    } else if (raw5.rows) {
+      itemsData = raw5.rows;
+      log('info', 'ITEMS_FOUND_IN_FIELD_5_ROWS', { requestId, pageIndex, itemCount: raw5.rows.length });
     }
   }
   
-  // Try to find line items in ANY field that contains arrays
+  // Try to find line items in ANY field that contains arrays (fallback)
   if (!Array.isArray(itemsData) || itemsData.length === 0) {
+    log('info', 'DOING_COMPREHENSIVE_SEARCH', { requestId, pageIndex });
+    
     Object.keys(fields).forEach(fieldKey => {
       const fieldValue = fields[fieldKey]?.value;
       if (Array.isArray(fieldValue) && fieldValue.length > 0 && itemsData.length === 0) {
         const firstItem = fieldValue[0];
         if (typeof firstItem === 'object' || Array.isArray(firstItem)) {
           itemsData = fieldValue;
-          log('info', 'LINE_ITEMS_FOUND_IN_ALTERNATE_FIELD', {
+          log('info', 'LINE_ITEMS_FOUND_IN_COMPREHENSIVE_SEARCH', {
             requestId,
             pageIndex,
             fieldKey,
@@ -718,11 +105,34 @@ function extractLineItemsFromPage(page, requestId, pageIndex) {
     });
   }
   
+  if (!Array.isArray(itemsData) || itemsData.length === 0) {
+    log('warn', 'NO_LINE_ITEMS_FOUND_ON_PAGE', { 
+      requestId, 
+      pageIndex,
+      availableFields: Object.keys(fields).map(key => ({
+        key,
+        hasValue: !!fields[key]?.value,
+        valueType: typeof fields[key]?.value,
+        isArray: Array.isArray(fields[key]?.value)
+      }))
+    });
+    return [];
+  }
+  
+  log('info', 'RAW_ITEMS_DATA', {
+    requestId,
+    pageIndex,
+    itemsDataType: typeof itemsData,
+    itemsDataLength: itemsData.length,
+    firstItemSample: itemsData[0],
+    firstItemType: typeof itemsData[0]
+  });
+  
   const processedItems = [];
   
   if (Array.isArray(itemsData) && itemsData.length > 0) {
     itemsData.forEach((row, rowIndex) => {
-      let lineNumber = '';    // 🔧 NEW: Extract line number
+      let lineNumber = '';
       let itemNumber = '';
       let unitCost = 0;
       let quantity = 0;
@@ -730,14 +140,13 @@ function extractLineItemsFromPage(page, requestId, pageIndex) {
       let itemPoNumber = '';
       
       if (Array.isArray(row)) {
-        lineNumber = String(row[0] || '').trim();  // 🔧 NEW: Line number from first column
+        lineNumber = String(row[0] || '').trim();
         itemNumber = String(row[1] || '').trim();
         unitCost = parseFloat(row[2]) || 0;
         quantity = parseFloat(row[3]) || 0;
         description = String(row[4] || '').trim();
-        itemPoNumber = String(row[5] || '').trim(); // PO from 6th column if available
+        itemPoNumber = String(row[5] || '').trim();
       } else if (typeof row === 'object' && row !== null) {
-        // 🔧 NEW: Extract line number from object properties
         lineNumber = String(row['Line Number'] || row.line_number || row.lineNumber || row.line || '').trim();
         itemNumber = String(row['Item Number'] || row.item_number || row.itemNumber || row.number || row.item || row.Item || '').trim();
         unitCost = parseFloat(row['Unit Cost'] || row.unit_cost || row.unitCost || row.cost || row.price || 0);
@@ -757,8 +166,8 @@ function extractLineItemsFromPage(page, requestId, pageIndex) {
       const finalPoNumber = itemPoNumber || poNumber;
       
       if (lineNumber || itemNumber || (unitCost > 0) || (quantity > 0)) {
-        processedItems.push({
-          line_number: lineNumber || `Item ${rowIndex + 1}`,  // 🔧 NEW: Include line number
+        const processedItem = {
+          line_number: lineNumber || `Item ${rowIndex + 1}`,
           item_number: itemNumber || `Item ${rowIndex + 1}`,
           description: description,
           quantity: quantity,
@@ -766,10 +175,26 @@ function extractLineItemsFromPage(page, requestId, pageIndex) {
           amount: quantity * unitCost,
           source_page: pageIndex + 1,
           po_number: finalPoNumber
+        };
+        
+        processedItems.push(processedItem);
+        
+        log('info', 'LINE_ITEM_PROCESSED', {
+          requestId,
+          pageIndex,
+          rowIndex,
+          processedItem
         });
       }
     });
   }
+  
+  log('info', 'LINE_ITEMS_EXTRACTION_COMPLETE', {
+    requestId,
+    pageIndex,
+    originalItemCount: itemsData.length,
+    processedItemCount: processedItems.length
+  });
   
   return processedItems;
 }
@@ -854,10 +279,6 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         isMultiPage: doc.isMultiPageReconstruction || false,
         originalPageCount: doc.originalPageCount || 1
       });
-      
-      const escapedSupplier = (doc.supplier_name || '').replace(/"/g, '\\"');
-      const escapedInvoiceNumber = (doc.invoice_number || '').replace(/"/g, '\\"');
-      const escapedDocumentType = (doc.document_type || '').replace(/"/g, '\\"');
       
       const formatDate = (dateStr) => {
         if (!dateStr || dateStr === 'Due Date' || dateStr === 'undefined' || dateStr === 'null') {
@@ -1320,10 +741,15 @@ app.get('/health', (req, res) => {
     ok: true, 
     timestamp: new Date().toISOString(),
     service: 'digital-mailroom-webhook',
-    version: '4.1.1-line-number-support'
+    version: '4.1.2-updated-field-mapping'
   });
 });
 
+app.post('/test/process-item/:id', async (req, res) => {
+  const requestId = `test_${Date.now()}`;
+  try {
+    log('info', 'TEST_PROCESSING_START', { requestId, itemId: req.params.id });
+    
 app.post('/test/process-item/:id', async (req, res) => {
   const requestId = `test_${Date.now()}`;
   try {
@@ -1341,7 +767,7 @@ app.post('/test/process-item/:id', async (req, res) => {
     
     res.json({ 
       success: true, 
-      message: 'Processing completed with multi-page reconstruction, PO number support, and line number indexing',
+      message: 'Processing completed with updated field mapping, PO number support, and line number indexing',
       requestId,
       instabaseRunId: runId,
       filesProcessed: files.length,
@@ -1369,30 +795,759 @@ app.post('/test/process-item/:id', async (req, res) => {
 // ----------------------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Digital Mailroom Webhook Server v4.1.1-line-number-support`);
+  console.log(`🚀 Digital Mailroom Webhook Server v4.1.2-updated-field-mapping`);
   console.log(`📡 Listening on port ${PORT}`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
   console.log(`🧪 Test endpoint: POST /test/process-item/:id`);
   console.log(`📅 Started at: ${new Date().toISOString()}`);
-  console.log(`🔧 Features: Multi-page document reconstruction, smart page merging, PO number tracking, line number indexing`);
+  console.log(`🔧 Features: Multi-page document reconstruction, smart page merging, PO number tracking, line number indexing, updated field mapping`);
 });
 
 // -----------------------------------------------------------------------------
-//  🔧 MULTI-PAGE RECONSTRUCTION + PO NUMBER + LINE NUMBER FEATURES:
+//  🔧 UPDATED FIELD MAPPING + LINE NUMBER + PO NUMBER FEATURES:
 //  1. ✅ Smart filename-based page grouping
 //  2. ✅ Intelligent document reconstruction from split pages
 //  3. ✅ Line item aggregation across all pages
-//  4. ✅ Total/tax extraction from last pages
-//  5. ✅ Due date merging from any page containing them
+//  4. ✅ Total/tax extraction from updated field positions
+//  5. ✅ Due date merging from field 4 (was field 6)
 //  6. ✅ Invoice number detection with fallback strategies
 //  7. ✅ Enhanced logging for debugging multi-page processing
 //  8. ✅ Source page tracking for line items
 //  9. ✅ Robust error handling and recovery
 //  10. ✅ Run ID linking for Instabase traceability
-//  11. ✅ PO Number extraction and tracking for each line item
-//  12. ✅ SP code detection and fallback search mechanisms
-//  13. ✅ Enhanced subitem creation with PO number support
-//  14. ✅ NEW: Line Number extraction and indexing for subitems
-//  15. ✅ NEW: Use extracted Line Numbers as subitem names (Line 40, Line 60, etc.)
-//  16. ✅ NEW: Support for both array and object formats from Instabase
+//  11. ✅ PO Number extraction from field 8 (Reference Number)
+//  12. ✅ Line Number extraction and indexing for subitems
+//  13. ✅ UPDATED: Field mapping after page type removal:
+//       - Field 0: Document Number ✅
+//       - Field 1: Document Type ✅ (was field 2)
+//       - Field 2: Supplier ✅ (was field 3)
+//       - Field 3: Document Date ✅ (was field 5)
+//       - Field 4: Due Date ✅ (was field 6)
+//       - Field 5: Items ✅ (was field 7)
+//       - Field 6: Total ✅ (was field 8)
+//       - Field 7: Tax ✅ (was field 9)
+//       - Field 8: Reference Number ✅ (was field 10)
+//  14. ✅ Terms field removed completely
+//  15. ✅ Page type references removed
+//  16. ✅ Use extracted Line Numbers as subitem names (Line 40, Line 60, etc.)
+//  17. ✅ Support for both array and object formats from Instabase
+// -----------------------------------------------------------------------------// Digital Mailroom Webhook — FINAL VERSION with Updated Field Mapping + Line Number Support
 // -----------------------------------------------------------------------------
+// This version works with the updated Instabase field mapping (page type field removed)
+// and includes Line Number extraction for subitems
+// -----------------------------------------------------------------------------
+
+const express   = require('express');
+const axios     = require('axios');
+const FormData  = require('form-data');
+
+const app = express();
+app.use(express.json());
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1️⃣  CONFIG  –  **unchanged / hard‑coded**
+// ----------------------------------------------------------------------------
+const INSTABASE_CONFIG = {
+  baseUrl:       'https://aihub.instabase.com',
+  apiKey:        'jEmrseIwOb9YtmJ6GzPAywtz53KnpS',
+  deploymentId:  '0197a3fe-599d-7bac-a34b-81704cc83beb',
+  headers: {
+    'IB-Context':   'sturgeontire',
+    'Authorization': 'Bearer jEmrseIwOb9YtmJ6GzPAywtz53KnpS',
+    'Content-Type':  'application/json'
+  }
+};
+
+const MONDAY_CONFIG = {
+  apiKey:               'eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjUzMDYzOTcxOSwiYWFpIjoxMSwidWlkIjo2Nzg2NjA4MywiaWFkIjoiMjAyNS0wNi0yNFQyMjoxNjowMC42NTJaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6MjYyMDQ5OTgsInJnbiI6InVzZTEifQ.zv9EsISZnchs7WKSqN2t3UU1GwcLrzPGeaP7ssKIla8',
+  fileUploadsBoardId:   '9445652448',
+  extractedDocsBoardId: '9446325745'
+};
+
+// Helper logging with request ID
+function log(level, message, data = {}) {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${level.toUpperCase()}: ${message}`, data);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2️⃣  WEBHOOK ENDPOINT
+// ----------------------------------------------------------------------------
+app.post('/webhook/monday-to-instabase', async (req, res) => {
+  const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  
+  try {
+    log('info', 'WEBHOOK_RECEIVED', { requestId, body: req.body });
+
+    // Monday "challenge" handshake
+    if (req.body.challenge) {
+      log('info', 'CHALLENGE_RESPONSE', { requestId, challenge: req.body.challenge });
+      return res.json({ challenge: req.body.challenge });
+    }
+
+    res.json({ success: true, received: new Date().toISOString(), requestId });
+
+    // fire‑and‑forget ⇢ background processing
+    processWebhookData(req.body, requestId);
+  } catch (err) {
+    log('error', 'WEBHOOK_ERROR', { requestId, error: err.message, stack: err.stack });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3️⃣  MAIN BACKGROUND FLOW
+// ----------------------------------------------------------------------------
+async function processWebhookData(body, requestId) {
+  try {
+    log('info', 'PROCESSING_START', { requestId, event: body.event });
+    
+    const ev = body.event;
+    if (!ev) {
+      log('warn', 'NO_EVENT_DATA', { requestId });
+      return;
+    }
+    
+    if (ev.columnId !== 'status' || ev.value?.label?.text !== 'Processing') {
+      log('info', 'IGNORED_EVENT', { 
+        requestId, 
+        columnId: ev.columnId, 
+        status: ev.value?.label?.text 
+      });
+      return;
+    }
+
+    const itemId = ev.pulseId;
+    log('info', 'PROCESSING_ITEM', { requestId, itemId, boardId: ev.boardId });
+    
+    const pdfFiles = await getMondayItemFilesWithPublicUrl(itemId, ev.boardId, requestId);
+    if (!pdfFiles.length) {
+      log('warn', 'NO_PDF_FILES', { requestId, itemId });
+      return;
+    }
+
+    const { files: extracted, originalFiles, runId } = await processFilesWithInstabase(pdfFiles, requestId);
+    const groups = groupPagesByInvoiceNumber(extracted, requestId);
+    
+    // 🔧 DEBUG: Log the groups after processing to verify items are found
+    log('info', 'GROUPS_AFTER_PROCESSING', {
+      requestId,
+      groupCount: groups.length,
+      groups: groups.map(g => ({
+        invoiceNumber: g.invoice_number,
+        itemCount: g.items?.length || 0,
+        isMultiPage: g.isMultiPageReconstruction || false,
+        pageCount: g.originalPageCount || 1
+      }))
+    });
+    
+    await createMondayExtractedItems(groups, itemId, originalFiles, requestId, runId);
+    
+    log('info', 'PROCESSING_COMPLETE', { requestId, itemId });
+  } catch (err) {
+    log('error', 'BACKGROUND_PROCESSING_FAILED', { 
+      requestId, 
+      error: err.message, 
+      stack: err.stack 
+    });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4️⃣  MONDAY HELPERS
+// ----------------------------------------------------------------------------
+async function getMondayItemFilesWithPublicUrl(itemId, boardId, requestId) {
+  try {
+    log('info', 'FETCHING_FILES', { requestId, itemId, boardId });
+    
+    const query = `query { items(ids:[${itemId}]){ assets{id name file_extension file_size public_url} }}`;
+    const { data } = await axios.post('https://api.monday.com/v2', { query }, {
+      headers: { Authorization: `Bearer ${MONDAY_CONFIG.apiKey}` }
+    });
+    
+    const assets = data.data.items[0].assets;
+    const pdfFiles = assets.filter(a => 
+      (/pdf$/i).test(a.file_extension) || (/\.pdf$/i).test(a.name)
+    ).map(a => ({ 
+      name: a.name, 
+      public_url: a.public_url, 
+      assetId: a.id 
+    }));
+    
+    log('info', 'FILES_FOUND', { requestId, fileCount: pdfFiles.length, files: pdfFiles.map(f => f.name) });
+    return pdfFiles;
+  } catch (error) {
+    log('error', 'FETCH_FILES_ERROR', { requestId, error: error.message });
+    throw error;
+  }
+}
+
+// 🔧 FIXED: PDF Upload function with correct Monday.com multipart format
+async function uploadPdfToMondayItem(itemId, buffer, filename, columnId, requestId) {
+  try {
+    log('info', 'PDF_UPLOAD_START', { requestId, itemId, filename, columnId, bufferSize: buffer.length });
+    
+    // Create the form data using Monday.com's exact specification
+    const form = new FormData();
+    
+    const query = `mutation($file: File!, $item_id: ID!, $column_id: String!) {
+      add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
+        id
+      }
+    }`;
+    
+    const variables = {
+      item_id: String(itemId),
+      column_id: columnId
+    };
+    
+    const map = {
+      "file": "variables.file"
+    };
+    
+    // Append in the exact order Monday.com expects
+    form.append('query', query);
+    form.append('variables', JSON.stringify(variables));
+    form.append('map', JSON.stringify(map));
+    form.append('file', buffer, {
+      filename: filename,
+      contentType: 'application/pdf'
+    });
+    
+    const response = await axios.post('https://api.monday.com/v2/file', form, {
+      headers: {
+        ...form.getHeaders(),
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'API-Version': '2024-04'
+      },
+      timeout: 60000,
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity
+    });
+
+    if (response.data.errors) {
+      log('error', 'PDF_UPLOAD_ERROR', { requestId, errors: response.data.errors });
+      throw new Error(`PDF upload failed: ${JSON.stringify(response.data.errors)}`);
+    } else {
+      log('info', 'PDF_UPLOAD_SUCCESS', { requestId, fileId: response.data.data.add_file_to_column.id });
+      return response.data.data.add_file_to_column.id;
+    }
+  } catch (error) {
+    log('error', 'PDF_UPLOAD_EXCEPTION', { requestId, error: error.message });
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5️⃣  INSTABASE PROCESSING (FULL VERSION)
+// ----------------------------------------------------------------------------
+async function processFilesWithInstabase(files, requestId) {
+  try {
+    log('info', 'INSTABASE_START', { requestId, fileCount: files.length });
+    
+    // Create batch
+    const batchRes = await axios.post(`${INSTABASE_CONFIG.baseUrl}/api/v2/batches`,
+                                     { workspace:'nileshn_sturgeontire.com' },
+                                     { headers: INSTABASE_CONFIG.headers });
+    const batchId = batchRes.data.id;
+    log('info', 'BATCH_CREATED', { requestId, batchId });
+
+    const originalFiles = [];
+    
+    // Upload files to batch
+    for (const f of files) {
+      log('info', 'UPLOADING_FILE', { requestId, fileName: f.name });
+      const { data } = await axios.get(f.public_url, { responseType:'arraybuffer' });
+      const buffer = Buffer.from(data);
+      
+      originalFiles.push({ name: f.name, buffer: buffer });
+      
+      await axios.put(`${INSTABASE_CONFIG.baseUrl}/api/v2/batches/${batchId}/files/${f.name}`,
+                      data,
+                      { headers:{ ...INSTABASE_CONFIG.headers, 'Content-Type':'application/octet-stream' } });
+      log('info', 'FILE_UPLOADED', { requestId, fileName: f.name });
+    }
+
+    // Start processing run
+    log('info', 'STARTING_PROCESSING', { requestId, batchId });
+    const runResponse = await axios.post(
+      `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/deployments/${INSTABASE_CONFIG.deploymentId}/runs`,
+      { batch_id: batchId },
+      { headers: INSTABASE_CONFIG.headers }
+    );
+    
+    const runId = runResponse.data.id;
+    log('info', 'RUN_STARTED', { requestId, runId });
+
+    // Poll for completion
+    let status = 'RUNNING';
+    let attempts = 0;
+    const maxAttempts = 60; // 5 minutes
+
+    while (status === 'RUNNING' || status === 'PENDING') {
+      if (attempts >= maxAttempts) {
+        throw new Error('Processing timeout after 5 minutes');
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 5000));
+
+      const statusResponse = await axios.get(
+        `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}`,
+        { headers: INSTABASE_CONFIG.headers }
+      );
+
+      status = statusResponse.data.status;
+      attempts++;
+      log('info', 'PROCESSING_STATUS', { requestId, status, attempt: attempts });
+
+      if (status === 'ERROR' || status === 'FAILED') {
+        throw new Error(`Instabase processing failed with status: ${status}`);
+      }
+    }
+
+    if (status !== 'COMPLETE') {
+      throw new Error(`Processing ended with unexpected status: ${status}`);
+    }
+
+    log('info', 'PROCESSING_COMPLETE', { requestId, runId });
+
+    // Get results
+    const resultsResponse = await axios.get(
+      `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}/results`,
+      { headers: INSTABASE_CONFIG.headers }
+    );
+
+    log('info', 'RESULTS_RECEIVED', { requestId, fileCount: resultsResponse.data.files?.length || 0 });
+    
+    return { 
+      files: resultsResponse.data.files, 
+      originalFiles: originalFiles,
+      runId: runId  // Return the run ID so we can link it
+    };
+    
+  } catch (error) {
+    log('error', 'INSTABASE_ERROR', { requestId, error: error.message });
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6️⃣  ENHANCED GROUPING WITH INTELLIGENT MULTI-PAGE DOCUMENT MERGING
+// ----------------------------------------------------------------------------
+function groupPagesByInvoiceNumber(extractedFiles, requestId) {
+  log('info', 'GROUPING_START', { 
+    requestId, 
+    inputFiles: extractedFiles?.length || 0 
+  });
+  
+  const documentGroups = {};
+  
+  if (!extractedFiles || extractedFiles.length === 0) {
+    log('warn', 'NO_FILES_TO_GROUP', { requestId });
+    return [];
+  }
+  
+  // 🔧 NEW: First pass - collect all pages by filename
+  const pagesByFilename = {};
+  
+  extractedFiles.forEach((file, fileIndex) => {
+    log('info', 'PROCESSING_FILE', { 
+      requestId, 
+      fileIndex, 
+      fileName: file.original_file_name 
+    });
+    
+    if (!file.documents || file.documents.length === 0) {
+      log('warn', 'NO_DOCUMENTS_IN_FILE', { requestId, fileIndex });
+      return;
+    }
+    
+    // Group pages by filename
+    if (!pagesByFilename[file.original_file_name]) {
+      pagesByFilename[file.original_file_name] = [];
+    }
+    
+    file.documents.forEach((doc, docIndex) => {
+      const fields = doc.fields || {};
+      
+      pagesByFilename[file.original_file_name].push({
+        fileIndex,
+        docIndex,
+        fields,
+        fileName: file.original_file_name
+      });
+    });
+  });
+  
+  log('info', 'PAGES_GROUPED_BY_FILENAME', {
+    requestId,
+    filenames: Object.keys(pagesByFilename),
+    pagesByFile: Object.keys(pagesByFilename).map(filename => ({
+      filename,
+      pageCount: pagesByFilename[filename].length
+    }))
+  });
+  
+  // 🔧 NEW: Second pass - intelligent document reconstruction
+  Object.keys(pagesByFilename).forEach(filename => {
+    const pages = pagesByFilename[filename];
+    
+    log('info', 'RECONSTRUCTING_DOCUMENT', {
+      requestId,
+      filename,
+      totalPages: pages.length
+    });
+    
+    // Find the page with the invoice number (usually page 1, but not always)
+    let masterPage = null;
+    let invoiceNumber = null;
+    
+    // Strategy 1: Look for explicit invoice number
+    for (const page of pages) {
+      const candidateInvoiceNumber = page.fields['0']?.value;
+      if (candidateInvoiceNumber && 
+          candidateInvoiceNumber !== 'unknown' && 
+          candidateInvoiceNumber !== 'none' && 
+          candidateInvoiceNumber !== '') {
+        masterPage = page;
+        invoiceNumber = candidateInvoiceNumber;
+        log('info', 'FOUND_INVOICE_NUMBER', {
+          requestId,
+          filename,
+          invoiceNumber,
+          pageIndex: pages.indexOf(page)
+        });
+        break;
+      }
+    }
+    
+    // Strategy 2: If no invoice number found, use filename as identifier
+    if (!invoiceNumber) {
+      // Extract potential invoice number from filename
+      const filenameMatch = filename.match(/(\d{8,})/); // Look for 8+ digit numbers
+      if (filenameMatch) {
+        invoiceNumber = filenameMatch[1];
+        masterPage = pages[0]; // Use first page as master
+        log('info', 'EXTRACTED_INVOICE_FROM_FILENAME', {
+          requestId,
+          filename,
+          extractedInvoiceNumber: invoiceNumber
+        });
+      } else {
+        // Fallback: use filename without extension
+        invoiceNumber = filename.replace(/\.[^/.]+$/, "");
+        masterPage = pages[0];
+        log('info', 'USING_FILENAME_AS_INVOICE', {
+          requestId,
+          filename,
+          invoiceNumber
+        });
+      }
+    }
+    
+    if (!masterPage) {
+      log('warn', 'NO_MASTER_PAGE_FOUND', { requestId, filename });
+      return;
+    }
+    
+    // 🔧 NEW: Merge all pages for this document
+    const mergedDocument = reconstructMultiPageDocument(pages, masterPage, requestId, filename);
+    
+    if (mergedDocument) {
+      documentGroups[invoiceNumber] = mergedDocument;
+      log('info', 'DOCUMENT_RECONSTRUCTED', {
+        requestId,
+        invoiceNumber,
+        filename,
+        totalPages: pages.length,
+        lineItemCount: mergedDocument.items?.length || 0,
+        totalAmount: mergedDocument.total_amount
+      });
+    }
+  });
+  
+  const resultGroups = Object.values(documentGroups);
+  log('info', 'GROUPING_COMPLETE', {
+    requestId,
+    groupCount: resultGroups.length,
+    groupsWithItems: resultGroups.filter(g => g.items.length > 0).length
+  });
+  
+  resultGroups.forEach(group => {
+    log('info', 'GROUP_SUMMARY', {
+      requestId,
+      invoiceNumber: group.invoice_number,
+      pageCount: group.pages.length,
+      itemCount: group.items.length,
+      totalAmount: group.total_amount
+    });
+  });
+  
+  return resultGroups;
+}
+
+// 🔧 UPDATED: Function to intelligently reconstruct multi-page documents - UPDATED FIELD MAPPING
+function reconstructMultiPageDocument(pages, masterPage, requestId, filename) {
+  log('info', 'RECONSTRUCTING_MULTI_PAGE_DOC', {
+    requestId,
+    filename,
+    pageCount: pages.length,
+    masterPageIndex: pages.indexOf(masterPage)
+  });
+  
+  const masterFields = masterPage.fields;
+  
+  // 🔧 UPDATED: Extract basic info from master page with NEW field mapping (page type removed)
+  const invoiceNumber = masterFields['0']?.value || filename.replace(/\.[^/.]+$/, "");
+  const documentType = masterFields['1']?.value || 'invoice';  // Moved from field 2 to 1
+  const supplier = masterFields['2']?.value || '';             // Moved from field 3 to 2
+  const documentDate = masterFields['3']?.value || '';         // Moved from field 5 to 3
+  const referenceNumber = masterFields['8']?.value || '';      // Reference number now in field 8
+  
+  log('info', 'BASIC_INFO_EXTRACTED', {
+    requestId,
+    filename,
+    invoiceNumber,
+    documentType,
+    supplier,
+    documentDate,
+    referenceNumber
+  });
+  
+  // 🔧 UPDATED: Merge due dates from field 4 (was field 6)
+  let mergedDueDates = { due_date: '', due_date_2: '', due_date_3: '' };
+  
+  pages.forEach((page, pageIndex) => {
+    const raw4 = page.fields['4'];  // Due date moved from field 6 to field 4
+    if (raw4) {
+      const dueDates = extractDueDatesFromField(raw4, requestId, pageIndex);
+      
+      // Merge due dates (keep first non-empty value found)
+      if (dueDates.due_date && !mergedDueDates.due_date) {
+        mergedDueDates.due_date = dueDates.due_date;
+      }
+      if (dueDates.due_date_2 && !mergedDueDates.due_date_2) {
+        mergedDueDates.due_date_2 = dueDates.due_date_2;
+      }
+      if (dueDates.due_date_3 && !mergedDueDates.due_date_3) {
+        mergedDueDates.due_date_3 = dueDates.due_date_3;
+      }
+    }
+  });
+  
+  log('info', 'DUE_DATES_MERGED', {
+    requestId,
+    filename,
+    mergedDueDates
+  });
+  
+  // 🔧 UPDATED: Merge line items from field 5 (was field 7)
+  const allLineItems = [];
+  
+  pages.forEach((page, pageIndex) => {
+    log('info', 'PROCESSING_PAGE_FOR_ITEMS', {
+      requestId,
+      filename,
+      pageIndex,
+      availableFields: Object.keys(page.fields)
+    });
+    
+    const pageItems = extractLineItemsFromPage(page, requestId, pageIndex);
+    if (pageItems.length > 0) {
+      allLineItems.push(...pageItems);
+      log('info', 'ITEMS_FOUND_ON_PAGE', {
+        requestId,
+        filename,
+        pageIndex,
+        itemCount: pageItems.length,
+        items: pageItems.map(item => ({
+          line_number: item.line_number,
+          item_number: item.item_number,
+          description: item.description ? item.description.substring(0, 50) : ''
+        }))
+      });
+    }
+  });
+  
+  // 🔧 UPDATED: Find totals from field 6 and tax from field 7 (was fields 8 and 9)
+  let totalAmount = 0;
+  let taxAmount = 0;
+  
+  // Search all pages for totals (prioritize later pages)
+  for (let i = pages.length - 1; i >= 0; i--) {
+    const page = pages[i];
+    const pageTotalAmount = page.fields['6']?.value;  // Total moved from field 8 to field 6
+    const pageTaxAmount = page.fields['7']?.value;    // Tax moved from field 9 to field 7
+    
+    if (pageTotalAmount && !totalAmount) {
+      const totalStr = String(pageTotalAmount).replace(/[^0-9.-]/g, '');
+      totalAmount = parseFloat(totalStr) || 0;
+      log('info', 'TOTAL_FOUND_ON_PAGE', {
+        requestId,
+        filename,
+        pageIndex: i,
+        totalAmount,
+        rawValue: pageTotalAmount
+      });
+    }
+    
+    if (pageTaxAmount && !taxAmount) {
+      const taxStr = String(pageTaxAmount).replace(/[^0-9.-]/g, '');
+      taxAmount = parseFloat(taxStr) || 0;
+      log('info', 'TAX_FOUND_ON_PAGE', {
+        requestId,
+        filename,
+        pageIndex: i,
+        taxAmount,
+        rawValue: pageTaxAmount
+      });
+    }
+    
+    // If we found both, we can stop
+    if (totalAmount && taxAmount) break;
+  }
+  
+  const reconstructedDocument = {
+    invoice_number: invoiceNumber,
+    document_type: documentType,
+    supplier_name: supplier,
+    reference_number: referenceNumber,
+    total_amount: totalAmount,
+    tax_amount: taxAmount,
+    document_date: documentDate,
+    due_date: mergedDueDates.due_date,
+    due_date_2: mergedDueDates.due_date_2,
+    due_date_3: mergedDueDates.due_date_3,
+    terms: '',  // Terms removed
+    items: allLineItems,
+    pages: pages.map((page, index) => ({
+      page_type: `page_${index + 1}`,  // No longer extracting from field since removed
+      file_name: filename,
+      fields: page.fields
+    })),
+    confidence: 0,
+    isMultiPageReconstruction: true,
+    originalPageCount: pages.length,
+    reconstructionStrategy: 'filename_grouping_with_content_merging'
+  };
+  
+  log('info', 'DOCUMENT_RECONSTRUCTION_COMPLETE', {
+    requestId,
+    filename,
+    invoiceNumber,
+    totalAmount,
+    taxAmount,
+    lineItemCount: allLineItems.length,
+    pageCount: pages.length,
+    dueDatesFound: Object.values(mergedDueDates).filter(d => d).length
+  });
+  
+  return reconstructedDocument;
+}
+
+// 🔧 UPDATED: Helper function to extract due dates from field 4 (was field 6)
+function extractDueDatesFromField(raw4, requestId, pageIndex) {
+  let dueDates = { due_date: '', due_date_2: '', due_date_3: '' };
+  
+  if (!raw4) return dueDates;
+  
+  const v = raw4?.value;
+  
+  log('info', 'DUE_DATE_RAW_DATA', {
+    requestId,
+    pageIndex,
+    rawValue: v,
+    valueType: typeof v,
+    isArray: Array.isArray(v),
+    stringified: JSON.stringify(v)
+  });
+  
+  if (typeof v === 'string') {
+    try {
+      const parsed = JSON.parse(v.trim());
+      if (Array.isArray(parsed)) {
+        // Handle nested arrays like [["Due Date"], ["2025-06-16"]]
+        if (parsed.length > 0 && Array.isArray(parsed[0])) {
+          // Find the actual date values, skip header rows
+          const dateValues = parsed.filter(row => 
+            Array.isArray(row) && row.length > 0 && 
+            !String(row[0]).toLowerCase().includes('due date') &&
+            String(row[0]).match(/\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4}|\d{2}-\d{2}-\d{4}/)
+          );
+          
+          if (dateValues.length > 0) {
+            dueDates.due_date = dateValues[0][0] || '';
+            dueDates.due_date_2 = dateValues[1] ? dateValues[1][0] : '';
+            dueDates.due_date_3 = dateValues[2] ? dateValues[2][0] : '';
+          }
+        } else {
+          // Regular array format
+          dueDates.due_date = parsed[1] || '';
+          dueDates.due_date_2 = parsed[2] || '';
+          dueDates.due_date_3 = parsed[3] || '';
+        }
+      } else {
+        dueDates.due_date = String(parsed);
+      }
+    } catch (e) {
+      dueDates.due_date = String(v);
+    }
+  } else if (Array.isArray(v)) {
+    // Handle nested arrays like [["Due Date"], ["2025-06-16"]]
+    if (v.length > 0 && Array.isArray(v[0])) {
+      const dateValues = v.filter(row => 
+        Array.isArray(row) && row.length > 0 && 
+        !String(row[0]).toLowerCase().includes('due date') &&
+        String(row[0]).match(/\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4}|\d{2}-\d{2}-\d{4}/)
+      );
+      
+      if (dateValues.length > 0) {
+        dueDates.due_date = dateValues[0][0] || '';
+        dueDates.due_date_2 = dateValues[1] ? dateValues[1][0] : '';
+        dueDates.due_date_3 = dateValues[2] ? dateValues[2][0] : '';
+      }
+    } else {
+      // Regular array format - look for actual dates, not headers
+      const actualDates = v.filter(item => {
+        const str = String(item || '').toLowerCase();
+        return !str.includes('due date') && 
+               !str.includes('date') && 
+               str.match(/\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4}|\d{2}-\d{2}-\d{4}/);
+      });
+      
+      if (actualDates.length > 0) {
+        dueDates.due_date = actualDates[0] || '';
+        dueDates.due_date_2 = actualDates[1] || '';
+        dueDates.due_date_3 = actualDates[2] || '';
+      } else {
+        // Fallback to index-based if no dates found
+        dueDates.due_date = v[1] || '';
+        dueDates.due_date_2 = v[2] || '';
+        dueDates.due_date_3 = v[3] || '';
+      }
+    }
+  } else if (v?.tables && Array.isArray(v.tables[0]?.rows)) {
+    const rows = v.tables[0].rows;
+    dueDates.due_date = rows[1] || '';
+    dueDates.due_date_2 = rows[2] || '';
+    dueDates.due_date_3 = rows[3] || '';
+  } else if (v?.rows) {
+    dueDates.due_date = v.rows[1] || '';
+    dueDates.due_date_2 = v.rows[2] || '';
+    dueDates.due_date_3 = v.rows[3] || '';
+  } else {
+    dueDates.due_date = String(v);
+  }
+  
+  log('info', 'DUE_DATES_EXTRACTED', {
+    requestId,
+    pageIndex,
+    extractedDueDates: dueDates
+  });
+  
+  return dueDates;
+}
+
+// 🔧 UPDATED: Helper function to extract line items - UPDATED FIELD MAPPING
+function extractLineItemsFromPage(page, requestId, pageIndex) {
+  const fields = page
