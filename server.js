@@ -612,7 +612,7 @@ function reconstructMultiPageDocument(pages, masterPage, requestId, filename) {
   return reconstructedDocument;
 }
 
-// 🔧 UPDATED: Helper function to extract due dates from field 4 (was field 6)
+// 🔧 UPDATED: Helper function to extract due dates from field 4 (was field 6) - FIXED FOR NESTED ARRAYS
 function extractDueDatesFromField(raw4, requestId, pageIndex) {
   let dueDates = { due_date: '', due_date_2: '', due_date_3: '' };
   
@@ -620,15 +620,113 @@ function extractDueDatesFromField(raw4, requestId, pageIndex) {
   
   const v = raw4?.value;
   
+  log('info', 'DUE_DATE_RAW_DATA', {
+    requestId,
+    pageIndex,
+    rawValue: v,
+    valueType: typeof v,
+    isArray: Array.isArray(v),
+    stringified: JSON.stringify(v)
+  });
+  
   if (typeof v === 'string') {
-    dueDates.due_date = v.trim();
+    try {
+      // Try to parse as JSON first
+      const parsed = JSON.parse(v.trim());
+      if (Array.isArray(parsed)) {
+        // Handle nested arrays like [["Due Date"], ["2025-06-16"]]
+        if (parsed.length > 0 && Array.isArray(parsed[0])) {
+          // Find the actual date values, skip header rows
+          const dateValues = parsed.filter(row => 
+            Array.isArray(row) && row.length > 0 && 
+            !String(row[0]).toLowerCase().includes('due date') &&
+            String(row[0]).match(/\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4}|\d{2}-\d{2}-\d{4}/)
+          );
+          
+          log('info', 'FILTERED_DATE_VALUES', {
+            requestId,
+            pageIndex,
+            originalParsed: parsed,
+            dateValues: dateValues
+          });
+          
+          if (dateValues.length > 0) {
+            dueDates.due_date = dateValues[0][0] || '';
+            dueDates.due_date_2 = dateValues[1] ? dateValues[1][0] : '';
+            dueDates.due_date_3 = dateValues[2] ? dateValues[2][0] : '';
+          } else {
+            // Fallback: look for any date-like value in the array
+            for (const row of parsed) {
+              if (Array.isArray(row)) {
+                for (const cell of row) {
+                  const cellStr = String(cell || '');
+                  if (cellStr.match(/\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4}|\d{2}-\d{2}-\d{4}/)) {
+                    dueDates.due_date = cellStr;
+                    break;
+                  }
+                }
+                if (dueDates.due_date) break;
+              }
+            }
+          }
+        } else {
+          // Regular array format
+          dueDates.due_date = parsed[1] || '';
+          dueDates.due_date_2 = parsed[2] || '';
+          dueDates.due_date_3 = parsed[3] || '';
+        }
+      } else {
+        dueDates.due_date = String(parsed);
+      }
+    } catch (e) {
+      // If JSON parsing fails, treat as plain string
+      if (v.match(/\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4}|\d{2}-\d{2}-\d{4}/)) {
+        dueDates.due_date = v.trim();
+      }
+    }
   } else if (Array.isArray(v)) {
-    dueDates.due_date = v[0] || '';
-    dueDates.due_date_2 = v[1] || '';
-    dueDates.due_date_3 = v[2] || '';
+    // Handle nested arrays like [["Due Date"], ["2025-06-16"]]
+    if (v.length > 0 && Array.isArray(v[0])) {
+      const dateValues = v.filter(row => 
+        Array.isArray(row) && row.length > 0 && 
+        !String(row[0]).toLowerCase().includes('due date') &&
+        String(row[0]).match(/\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4}|\d{2}-\d{2}-\d{4}/)
+      );
+      
+      if (dateValues.length > 0) {
+        dueDates.due_date = dateValues[0][0] || '';
+        dueDates.due_date_2 = dateValues[1] ? dateValues[1][0] : '';
+        dueDates.due_date_3 = dateValues[2] ? dateValues[2][0] : '';
+      }
+    } else {
+      // Regular array format - look for actual dates, not headers
+      const actualDates = v.filter(item => {
+        const str = String(item || '').toLowerCase();
+        return !str.includes('due date') && 
+               !str.includes('date') && 
+               str.match(/\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4}|\d{2}-\d{2}-\d{4}/);
+      });
+      
+      if (actualDates.length > 0) {
+        dueDates.due_date = actualDates[0] || '';
+        dueDates.due_date_2 = actualDates[1] || '';
+        dueDates.due_date_3 = actualDates[2] || '';
+      } else {
+        // Fallback to index-based if no dates found
+        dueDates.due_date = v[1] || '';
+        dueDates.due_date_2 = v[2] || '';
+        dueDates.due_date_3 = v[3] || '';
+      }
+    }
   } else {
     dueDates.due_date = String(v);
   }
+  
+  log('info', 'DUE_DATES_EXTRACTED', {
+    requestId,
+    pageIndex,
+    extractedDueDates: dueDates
+  });
   
   return dueDates;
 }
