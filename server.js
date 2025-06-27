@@ -1,837 +1,4 @@
-// 🔧 UPDATED: Helper function to extract line items - UPDATED FIELD MAPPING
-function extractLineItemsFromPage(page, requestId, pageIndex) {
-  const fields = page.fields || {};
-  const raw5 = fields['5'];  // 🔧 UPDATED: Line items moved from field 7 to field 5
-  const raw8 = fields['8'];  // 🔧 UPDATED: PO Number moved from field 11 to field 8 (Reference Number)
-  let itemsData = [];
-  let poNumber = '';
-  
-  log('info', 'EXTRACTING_LINE_ITEMS_START', {
-    requestId,
-    pageIndex,
-    availableFields: Object.keys(fields),
-    fieldsWithValues: Object.keys(fields).filter(key => fields[key]?.value)
-  });
-  
-  // Extract PO number from reference field (field 8)
-  if (raw8) {
-    const v = raw8?.value;
-    if (typeof v === 'string' && v.startsWith('SP')) {
-      poNumber = v.trim();
-    } else if (Array.isArray(v) && v.length > 0) {
-      const spCode = v.find(item => typeof item === 'string' && item.startsWith('SP'));
-      poNumber = spCode || '';
-    }
-  }
-  
-  // Fallback: Look for PO in any field that contains SP codes
-  if (!poNumber) {
-    Object.keys(fields).forEach(fieldKey => {
-      const fieldValue = fields[fieldKey]?.value;
-      if (typeof fieldValue === 'string' && fieldValue.startsWith('SP')) {
-        poNumber = fieldValue.trim();
-      } else if (Array.isArray(fieldValue)) {
-        const spCode = fieldValue.find(item => typeof item === 'string' && item.startsWith('SP'));
-        if (spCode) {
-          poNumber = spCode;
-        }
-      }
-    });
-  }
-  
-  log('info', 'PO_NUMBER_EXTRACTED', {
-    requestId,
-    pageIndex,
-    poNumber: poNumber || 'NOT_FOUND',
-    extractedFrom: raw8 ? 'field_8' : 'fallback_search'
-  });
-  
-  // 🔧 UPDATED: Extract line items from field 5 (was field 7)
-  if (raw5) {
-    const v = raw5?.value;
-    
-    log('info', 'CHECKING_FIELD_5_FOR_ITEMS', {
-      requestId,
-      pageIndex,
-      valueType: typeof v,
-      isArray: Array.isArray(v),
-      hasValue: !!v,
-      valuePreview: Array.isArray(v) ? `Array(${v.length})` : String(v).substring(0, 100)
-    });
-    
-    if (typeof v === 'string') {
-      try {
-        itemsData = JSON.parse(v.trim());
-        log('info', 'ITEMS_FOUND_IN_STRING_FIELD_5', { requestId, pageIndex, itemCount: itemsData.length });
-      } catch (e) {
-        log('error', 'JSON_PARSE_FAILED', { requestId, pageIndex, error: e.message });
-      }
-    } else if (Array.isArray(v)) {
-      itemsData = v;
-      log('info', 'ITEMS_FOUND_IN_ARRAY_FIELD_5', { requestId, pageIndex, itemCount: v.length });
-    } else if (v?.tables && Array.isArray(v.tables[0]?.rows)) {
-      itemsData = v.tables[0].rows;
-      log('info', 'ITEMS_FOUND_IN_TABLE_FIELD_5', { requestId, pageIndex, itemCount: v.tables[0].rows.length });
-    } else if (v?.rows && Array.isArray(v.rows)) {
-      itemsData = v.rows;
-      log('info', 'ITEMS_FOUND_IN_ROWS_FIELD_5', { requestId, pageIndex, itemCount: v.rows.length });
-    } else if (raw5.tables?.[0]?.rows) {
-      itemsData = raw5.tables[0].rows;
-      log('info', 'ITEMS_FOUND_IN_FIELD_5_TABLE', { requestId, pageIndex, itemCount: raw5.tables[0].rows.length });
-    } else if (raw5.rows) {
-      itemsData = raw5.rows;
-      log('info', 'ITEMS_FOUND_IN_FIELD_5_ROWS', { requestId, pageIndex, itemCount: raw5.rows.length });
-    }
-  }
-  
-  // Try to find line items in ANY field that contains arrays (fallback)
-  if (!Array.isArray(itemsData) || itemsData.length === 0) {
-    log('info', 'DOING_COMPREHENSIVE_SEARCH', { requestId, pageIndex });
-    
-    Object.keys(fields).forEach(fieldKey => {
-      const fieldValue = fields[fieldKey]?.value;
-      if (Array.isArray(fieldValue) && fieldValue.length > 0 && itemsData.length === 0) {
-        const firstItem = fieldValue[0];
-        if (typeof firstItem === 'object' || Array.isArray(firstItem)) {
-          itemsData = fieldValue;
-          log('info', 'LINE_ITEMS_FOUND_IN_COMPREHENSIVE_SEARCH', {
-            requestId,
-            pageIndex,
-            fieldKey,
-            itemCount: fieldValue.length
-          });
-        }
-      }
-    });
-  }
-  
-  if (!Array.isArray(itemsData) || itemsData.length === 0) {
-    log('warn', 'NO_LINE_ITEMS_FOUND_ON_PAGE', { 
-      requestId, 
-      pageIndex,
-      availableFields: Object.keys(fields).map(key => ({
-        key,
-        hasValue: !!fields[key]?.value,
-        valueType: typeof fields[key]?.value,
-        isArray: Array.isArray(fields[key]?.value)
-      }))
-    });
-    return [];
-  }
-  
-  log('info', 'RAW_ITEMS_DATA', {
-    requestId,
-    pageIndex,
-    itemsDataType: typeof itemsData,
-    itemsDataLength: itemsData.length,
-    firstItemSample: itemsData[0],
-    firstItemType: typeof itemsData[0]
-  });
-  
-  const processedItems = [];
-  
-  if (Array.isArray(itemsData) && itemsData.length > 0) {
-    itemsData.forEach((row, rowIndex) => {
-      let lineNumber = '';
-      let itemNumber = '';
-      let unitCost = 0;
-      let quantity = 0;
-      let description = '';
-      let itemPoNumber = '';
-      
-      if (Array.isArray(row)) {
-        lineNumber = String(row[0] || '').trim();
-        itemNumber = String(row[1] || '').trim();
-        unitCost = parseFloat(row[2]) || 0;
-        quantity = parseFloat(row[3]) || 0;
-        description = String(row[4] || '').trim();
-        itemPoNumber = String(row[5] || '').trim();
-      } else if (typeof row === 'object' && row !== null) {
-        lineNumber = String(row['Line Number'] || row.line_number || row.lineNumber || row.line || '').trim();
-        itemNumber = String(row['Item Number'] || row.item_number || row.itemNumber || row.number || row.item || row.Item || '').trim();
-        unitCost = parseFloat(row['Unit Cost'] || row.unit_cost || row.unitCost || row.cost || row.price || 0);
-        quantity = parseFloat(row.Quantity || row.quantity || row.qty || row.amount || 0);
-        description = String(row.Description || row.description || row.desc || row.item_description || '').trim();
-        itemPoNumber = String(row['PO Number'] || row.po_number || row.poNumber || row.po || '').trim();
-        
-        // Handle null PO Numbers
-        if (itemPoNumber === 'null' || !itemPoNumber) {
-          itemPoNumber = '';
-        }
-      } else {
-        lineNumber = String(row || '').trim();
-      }
-      
-      // Use item-specific PO if available, otherwise use page-level PO
-      const finalPoNumber = itemPoNumber || poNumber;
-      
-      if (lineNumber || itemNumber || (unitCost > 0) || (quantity > 0)) {
-        const processedItem = {
-          line_number: lineNumber || `Item ${rowIndex + 1}`,
-          item_number: itemNumber || `Item ${rowIndex + 1}`,
-          description: description,
-          quantity: quantity,
-          unit_cost: unitCost,
-          amount: quantity * unitCost,
-          source_page: pageIndex + 1,
-          po_number: finalPoNumber
-        };
-        
-        processedItems.push(processedItem);
-        
-        log('info', 'LINE_ITEM_PROCESSED', {
-          requestId,
-          pageIndex,
-          rowIndex,
-          processedItem
-        });
-      }
-    });
-  }
-  
-  log('info', 'LINE_ITEMS_EXTRACTION_COMPLETE', {
-    requestId,
-    pageIndex,
-    originalItemCount: itemsData.length,
-    processedItemCount: processedItems.length
-  });
-  
-  return processedItems;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 7️⃣  ENHANCED MONDAY ITEMS CREATION WITH FIXED SOURCE ID & SUBITEM INDEXING
-// ----------------------------------------------------------------------------
-async function createMondayExtractedItems(documents, sourceItemId, originalFiles, requestId, instabaseRunId) {
-  try {
-    log('info', 'STAGE: Getting board structure', { requestId });
-    
-    const boardQuery = `
-      query {
-        boards(ids: [${MONDAY_CONFIG.extractedDocsBoardId}]) {
-          id
-          name
-          columns {
-            id
-            title
-            type
-            settings_str
-          }
-        }
-      }
-    `;
-    
-    const boardResponse = await axios.post('https://api.monday.com/v2', {
-      query: boardQuery
-    }, {
-      headers: {
-        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
-        'Content-Type': 'application/json'
-      }
-    });
-    
-    const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
-    
-    // 🔧 FIXED: Find the actual "Source Request ID" column instead of "name"
-    const sourceRequestIdColumn = columns.find(col => 
-      col.title.toLowerCase() === 'id'
-    );
-    
-    log('info', 'SOURCE_REQUEST_ID_COLUMN_SEARCH', {
-      requestId,
-      foundColumn: !!sourceRequestIdColumn,
-      columnId: sourceRequestIdColumn?.id,
-      columnTitle: sourceRequestIdColumn?.title,
-      allColumns: columns.map(c => ({ id: c.id, title: c.title, type: c.type }))
-    });
-    
-    // Validate subitems column exists
-    const subitemsColumn = columns.find(col => col.type === 'subtasks');
-    log('info', 'BOARD_VALIDATION', {
-      requestId,
-      totalColumns: columns.length,
-      hasSubitemsColumn: !!subitemsColumn,
-      subitemsColumnId: subitemsColumn?.id,
-      subitemsColumnTitle: subitemsColumn?.title,
-      hasSourceRequestIdColumn: !!sourceRequestIdColumn
-    });
-    
-    if (!subitemsColumn) {
-      log('error', 'MISSING_SUBITEMS_COLUMN', {
-        requestId,
-        error: 'Board missing subitems column - cannot create subitems'
-      });
-    }
-    
-    if (!sourceRequestIdColumn) {
-      log('warn', 'MISSING_SOURCE_REQUEST_ID_COLUMN', {
-        requestId,
-        warning: 'No Source Request ID column found - cannot link Instabase run ID'
-      });
-    }
-    
-    for (const doc of documents) {
-      log('info', 'CREATING_MONDAY_ITEM', {
-        requestId,
-        documentType: doc.document_type,
-        invoiceNumber: doc.invoice_number,
-        itemCount: doc.items?.length || 0,
-        isMultiPage: doc.isMultiPageReconstruction || false,
-        originalPageCount: doc.originalPageCount || 1
-      });
-      
-      const formatDate = (dateStr) => {
-        if (!dateStr || dateStr === 'Due Date' || dateStr === 'undefined' || dateStr === 'null') {
-          return '';
-        }
-        try {
-          // Handle various date formats
-          let date;
-          if (typeof dateStr === 'string') {
-            // Clean the date string
-            const cleanDate = dateStr.trim();
-            if (cleanDate.match(/^\d{4}-\d{2}-\d{2}$/)) {
-              // Already in YYYY-MM-DD format
-              return cleanDate;
-            }
-            date = new Date(cleanDate);
-          } else {
-            date = new Date(dateStr);
-          }
-          
-          if (isNaN(date.getTime())) {
-            log('warn', 'INVALID_DATE_FORMAT', { 
-              requestId, 
-              originalDate: dateStr,
-              reason: 'Date parsing failed'
-            });
-            return '';
-          }
-          
-          return date.toISOString().split('T')[0];
-        } catch (e) {
-          log('warn', 'DATE_FORMAT_ERROR', { 
-            requestId, 
-            originalDate: dateStr,
-            error: e.message
-          });
-          return '';
-        }
-      };
-      
-      const columnValues = buildColumnValues(columns, doc, formatDate, instabaseRunId);
-      
-      log('info', 'COLUMN_VALUES_MAPPED', { 
-        requestId, 
-        invoiceNumber: doc.invoice_number,
-        columnValues,
-        docDueDates: {
-          due_date: doc.due_date,
-          due_date_2: doc.due_date_2,
-          due_date_3: doc.due_date_3
-        }
-      });
-      
-      // Create the item - Use Run ID as the primary name/ID
-      const mutation = `
-        mutation {
-          create_item(
-            board_id: ${MONDAY_CONFIG.extractedDocsBoardId}
-            item_name: "${instabaseRunId || 'RUN_PENDING'}"
-            column_values: ${JSON.stringify(JSON.stringify(columnValues))}
-          ) {
-            id
-            name
-          }
-        }
-      `;
-      
-      const response = await axios.post('https://api.monday.com/v2', {
-        query: mutation
-      }, {
-        headers: {
-          'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
-          'Content-Type': 'application/json'
-        }
-      });
-      
-      if (response.data.errors) {
-        log('error', 'ITEM_CREATION_FAILED', {
-          requestId,
-          errors: response.data.errors
-        });
-        continue;
-      }
-      
-      const createdItemId = response.data.data.create_item.id;
-      log('info', 'ITEM_CREATED_SUCCESS', {
-        requestId,
-        itemId: createdItemId,
-        documentType: doc.document_type,
-        invoiceNumber: doc.invoice_number,
-        isMultiPageReconstruction: doc.isMultiPageReconstruction || false
-      });
-      
-      // Upload PDF file
-      if (originalFiles && originalFiles.length > 0) {
-        const fileColumn = columns.find(col => col.type === 'file');
-        if (fileColumn) {
-          try {
-            await uploadPdfToMondayItem(createdItemId, originalFiles[0].buffer, originalFiles[0].name, fileColumn.id, requestId);
-          } catch (uploadError) {
-            log('error', 'PDF_UPLOAD_FAILED', {
-              requestId,
-              itemId: createdItemId,
-              error: uploadError.message
-            });
-          }
-        }
-      }
-      
-      // 🔧 FIXED: Enhanced subitem creation with proper validation
-      log('info', 'SUBITEM_PROCESSING_START', {
-        requestId,
-        itemId: createdItemId,
-        hasItems: !!(doc.items && doc.items.length > 0),
-        itemCount: doc.items?.length || 0,
-        hasSubitemsColumn: !!subitemsColumn
-      });
-      
-      // Create subitems if we have line items and subitems column exists
-      if (subitemsColumn && doc.items && doc.items.length > 0) {
-        try {
-          log('info', 'CREATING_SUBITEMS', { 
-            requestId, 
-            itemId: createdItemId,
-            lineItemCount: doc.items.length 
-          });
-          
-          await createSubitemsForLineItems(createdItemId, doc.items, columns, requestId);
-          
-        } catch (subitemError) {
-          log('error', 'SUBITEM_CREATION_FAILED', {
-            requestId,
-            itemId: createdItemId,
-            error: subitemError.message,
-            stack: subitemError.stack
-          });
-        }
-      } else {
-        if (!subitemsColumn) {
-          log('warn', 'NO_SUBITEMS_COLUMN', { requestId, itemId: createdItemId });
-        }
-        if (!doc.items || doc.items.length === 0) {
-          log('warn', 'NO_LINE_ITEMS', { 
-            requestId, 
-            itemId: createdItemId,
-            hasItems: !!doc.items,
-            itemsLength: doc.items?.length || 0
-          });
-        }
-      }
-    }
-    
-    log('info', 'ALL_ITEMS_PROCESSED', { requestId, documentCount: documents.length });
-    
-  } catch (error) {
-    log('error', 'CREATE_MONDAY_ITEMS_FAILED', {
-      requestId,
-      error: error.message,
-      stack: error.stack
-    });
-    throw error;
-  }
-}
-
-// 🔧 UPDATED: Subitem creation function with Line Number support (uses extracted line numbers)
-async function createSubitemsForLineItems(parentItemId, items, columns, requestId) {
-  try {
-    log('info', 'SUBITEM_CREATION_START', { requestId, parentItemId, lineItemCount: items.length });
-
-    // 1️⃣ Get the linked board ID from your Subtasks column
-    const subitemsColumn = columns.find(c => c.type === 'subtasks');
-    if (!subitemsColumn) {
-      log('error', 'NO_SUBTASKS_COLUMN_FOUND', { requestId });
-      return;
-    }
-
-    let settings = {};
-    try {
-      settings = JSON.parse(subitemsColumn.settings_str || '{}');
-    } catch (e) {
-      log('error', 'SETTINGS_PARSE_ERROR', { requestId, error: e.message });
-      return;
-    }
-
-    const subitemBoardId = Array.isArray(settings.boardIds)
-      ? settings.boardIds[0]
-      : settings.linked_board_id;
-    
-    if (!subitemBoardId) {
-      log('error', 'MISSING_SUBITEM_BOARD_ID', { requestId, settings });
-      return;
-    }
-
-    log('info', 'SUBITEM_BOARD_IDENTIFIED', { requestId, subitemBoardId });
-
-    // 2️⃣ Fetch that board's columns
-    const colsQuery = `
-      query {
-        boards(ids: [${subitemBoardId}]) {
-          columns { id title type }
-        }
-      }
-    `;
-    
-    const colsResponse = await axios.post('https://api.monday.com/v2', { query: colsQuery }, {
-      headers: { Authorization: `Bearer ${MONDAY_CONFIG.apiKey}` }
-    });
-    
-    const subitemColumns = colsResponse.data.data.boards[0].columns;
-    
-    log('info', 'SUBITEM_COLUMNS_FETCHED', {
-      requestId,
-      subitemBoardId,
-      columnCount: subitemColumns.length,
-      columns: subitemColumns.map(c => ({ 
-        id: c.id, 
-        title: c.title, 
-        type: c.type,
-        titleLowercase: c.title.trim().toLowerCase()
-      }))
-    });
-
-    // 3️⃣ Loop each line item and map into those columns
-    for (let i = 0; i < items.length; i++) {
-      const { line_number, item_number, quantity, unit_cost, description, source_page, po_number } = items[i];
-      const columnValues = {};
-      
-      // 🔧 NEW: Use extracted line_number for subitem indexing
-      const actualLineNumber = line_number || `${i + 1}`;
-      
-      subitemColumns.forEach(col => {
-        const title = col.title.trim().toLowerCase();
-        
-        // 🔧 NEW: Map to Line Number column using extracted value
-        if (title.includes('line number') || title.includes('line #') || title.includes('subitem') || title === 'index') {
-          if (col.type === 'numbers') {
-            // Try to parse as number, fallback to string index if not numeric
-            const numericLineNumber = parseFloat(actualLineNumber);
-            columnValues[col.id] = isNaN(numericLineNumber) ? (i + 1) : numericLineNumber;
-          } else {
-            columnValues[col.id] = actualLineNumber;
-          }
-        } else if (title === 'item number' || title.includes('item num')) {
-          columnValues[col.id] = item_number || '';
-        } else if (title === 'quantity' || title === 'qty') {
-          if (col.type === 'numbers') {
-            columnValues[col.id] = quantity || 0;
-          } else {
-            columnValues[col.id] = String(quantity || 0);
-          }
-        } else if (title === 'unit cost' || title.includes('unit cost')) {
-          if (col.type === 'numbers') {
-            columnValues[col.id] = unit_cost || 0;
-          } else {
-            columnValues[col.id] = String(unit_cost || 0);
-          }
-        } else if (title === 'description' || title.includes('desc')) {
-          columnValues[col.id] = description || '';
-        } else if (title.includes('source page') || title.includes('page')) {
-          columnValues[col.id] = source_page || '';
-        } else if (title.includes('po number') || title === 'po' || title.includes('purchase order')) {
-          columnValues[col.id] = po_number || '';
-        }
-      });
-
-      log('info', 'SUBITEM_COLUMN_MAPPING', {
-        requestId,
-        extractedLineNumber: actualLineNumber,
-        itemNumber: item_number,
-        sourcePage: source_page,
-        poNumber: po_number,
-        columnValues
-      });
-
-      // 🔧 NEW: Use extracted line number in subitem name
-      const subitemName = `Line ${actualLineNumber}`;
-      const escapedName = subitemName.replace(/"/g, '\\"');
-      const columnValuesJson = JSON.stringify(columnValues);
-      
-      const mutation = `
-        mutation {
-          create_subitem(
-            parent_item_id: ${parentItemId}
-            item_name: "${escapedName}"
-            column_values: ${JSON.stringify(columnValuesJson)}
-          ) { 
-            id 
-            name
-          }
-        }
-      `;
-      
-      log('info', 'CREATING_SUBITEM', {
-        requestId,
-        extractedLineNumber: actualLineNumber,
-        subitemName: escapedName,
-        poNumber: po_number
-      });
-      
-      const response = await axios.post('https://api.monday.com/v2', { query: mutation }, {
-        headers: {
-          Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
-          'Content-Type': 'application/json',
-          'API-Version': '2024-04'
-        }
-      });
-      
-      if (response.data.errors) {
-        log('error', 'SUBITEM_MUTATION_ERRORS', { 
-          requestId, 
-          extractedLineNumber: actualLineNumber, 
-          errors: response.data.errors 
-        });
-        
-        // Try creating without column values if there are errors
-        const simpleQuery = `
-          mutation {
-            create_subitem(
-              parent_item_id: ${parentItemId}
-              item_name: "${escapedName}"
-            ) { 
-              id 
-              name
-            }
-          }
-        `;
-        
-        const retryResponse = await axios.post('https://api.monday.com/v2', { query: simpleQuery }, {
-          headers: {
-            Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
-            'Content-Type': 'application/json',
-            'API-Version': '2024-04'
-          }
-        });
-        
-        if (retryResponse.data.errors) {
-          log('error', 'SIMPLE_SUBITEM_ALSO_FAILED', {
-            requestId,
-            extractedLineNumber: actualLineNumber,
-            errors: retryResponse.data.errors
-          });
-        } else {
-          log('info', 'SIMPLE_SUBITEM_SUCCESS', {
-            requestId,
-            extractedLineNumber: actualLineNumber,
-            subitemId: retryResponse.data.data.create_subitem.id,
-            subitemName: escapedName
-          });
-        }
-      } else {
-        log('info', 'SUBITEM_CREATED', { 
-          requestId, 
-          extractedLineNumber: actualLineNumber, 
-          subitemId: response.data.data.create_subitem.id,
-          subitemName: escapedName,
-          poNumber: po_number
-        });
-      }
-      
-      // Small pause to avoid rate limits
-      await new Promise(resolve => setTimeout(resolve, 250));
-    }
-
-    log('info', 'ALL_SUBITEMS_CREATED', { requestId, parentItemId, lineItemCount: items.length });
-    
-  } catch (error) {
-    log('error', 'SUBITEM_CREATION_ERROR', {
-      requestId,
-      parentItemId,
-      error: error.message,
-      stack: error.stack
-    });
-    // Don't throw - continue with other processing
-  }
-}
-
-// 🔧 UPDATED: buildColumnValues function to include Source Request ID mapping
-function buildColumnValues(columns, doc, formatDate, instabaseRunId = null) {
-  const columnValues = {};
-  
-  // Map extracted data to Monday.com columns
-  columns.forEach(col => {
-    const title = col.title.toLowerCase();
-    const id = col.id;
-    const type = col.type;
-    
-    if (title.includes('supplier')) {
-      columnValues[id] = doc.supplier_name || '';
-    } else if (title === 'id') {
-      // 🔧 FIXED: Map Instabase Run ID to ID column (BEFORE generic number rule)
-      columnValues[id] = instabaseRunId || '';
-      console.log(`[DEBUG] Mapped Instabase Run ID: ${instabaseRunId} to ID column ${col.id}`);
-    } else if (title.includes('reference number') || title === 'reference number' || title.includes('reference')) {
-      columnValues[id] = doc.reference_number || '';
-      console.log(`[DEBUG] Mapped reference number: ${doc.reference_number} to column ${col.id}`);
-    } else if (title.includes('document number') || (title.includes('number') && !title.includes('total') && !title.includes('reference') && !title.includes('source') && !title.includes('id'))) {
-      // 🔧 FIXED: Exclude 'id' from generic number rule
-      columnValues[id] = doc.invoice_number || '';
-    } else if (title.includes('document type') || (title.includes('type') && !title.includes('document'))) {
-      if (type === 'dropdown') {
-        let settings = {};
-        try {
-          settings = JSON.parse(col.settings_str || '{}');
-        } catch (e) {
-          // Use default if parsing fails
-        }
-        
-        if (settings.labels && settings.labels.length > 0) {
-          const matchingLabel = settings.labels.find(label => 
-            label.name?.toLowerCase() === (doc.document_type || '').toLowerCase()
-          );
-          
-          if (matchingLabel) {
-            columnValues[id] = matchingLabel.name;
-          } else {
-            columnValues[id] = settings.labels[0].name;
-          }
-        }
-      } else {
-        columnValues[id] = doc.document_type || '';
-      }
-    } else if (title.includes('document date') || (title.includes('date') && !title.includes('due'))) {
-      columnValues[id] = formatDate(doc.document_date);
-    } else if (title === 'due date' || (title.includes('due date') && !title.includes('2') && !title.includes('3'))) {
-      const formattedDate = formatDate(doc.due_date);
-      if (formattedDate) {
-        columnValues[id] = formattedDate;
-      }
-    } else if (title.includes('due date 2')) {
-      const formattedDate = formatDate(doc.due_date_2);
-      if (formattedDate) {
-        columnValues[id] = formattedDate;
-      }
-    } else if (title.includes('due date 3')) {
-      const formattedDate = formatDate(doc.due_date_3);
-      if (formattedDate) {
-        columnValues[id] = formattedDate;
-      }
-    } else if (title.includes('total amount')) {
-      columnValues[id] = doc.total_amount || 0;
-    } else if (title.includes('tax amount')) {
-      columnValues[id] = doc.tax_amount || 0;
-    } else if (title.includes('extraction status') || title.includes('status')) {
-      if (type === 'status') {
-        columnValues[id] = { "index": 1 };
-      } else {
-        columnValues[id] = "Extracted";
-      }
-    }
-  });
-  
-  return columnValues;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 8️⃣  HEALTH + TEST ROUTES
-// ----------------------------------------------------------------------------
-app.get('/health', (req, res) => {
-  res.json({ 
-    ok: true, 
-    timestamp: new Date().toISOString(),
-    service: 'digital-mailroom-webhook',
-    version: '4.1.2-updated-field-mapping'
-  });
-});
-
-app.post('/test/process-item/:id', async (req, res) => {
-  const requestId = `test_${Date.now()}`;
-  try {
-    log('info', 'TEST_PROCESSING_START', { requestId, itemId: req.params.id });
-    
-app.post('/test/process-item/:id', async (req, res) => {
-  const requestId = `test_${Date.now()}`;
-  try {
-    log('info', 'TEST_PROCESSING_START', { requestId, itemId: req.params.id });
-    
-    const files = await getMondayItemFilesWithPublicUrl(req.params.id, MONDAY_CONFIG.fileUploadsBoardId, requestId);
-    
-    if (files.length === 0) {
-      return res.json({ success: false, message: 'No PDF files found' });
-    }
-    
-    const { files: extracted, originalFiles, runId } = await processFilesWithInstabase(files, requestId);
-    const groups = groupPagesByInvoiceNumber(extracted, requestId);
-    await createMondayExtractedItems(groups, req.params.id, originalFiles, requestId, runId);
-    
-    res.json({ 
-      success: true, 
-      message: 'Processing completed with updated field mapping, PO number support, and line number indexing',
-      requestId,
-      instabaseRunId: runId,
-      filesProcessed: files.length,
-      groupsCreated: groups.length,
-      itemsWithLineItems: groups.filter(g => g.items.length > 0).length,
-      multiPageReconstructions: groups.filter(g => g.isMultiPageReconstruction).length,
-      reconstructionDetails: groups.map(g => ({
-        invoiceNumber: g.invoice_number,
-        isMultiPage: g.isMultiPageReconstruction || false,
-        pageCount: g.originalPageCount || 1,
-        lineItemCount: g.items?.length || 0,
-        totalAmount: g.total_amount,
-        itemsWithPO: g.items?.filter(item => item.po_number).length || 0,
-        lineNumbers: g.items?.map(item => item.line_number) || []  // Show extracted line numbers
-      }))
-    });
-  } catch (error) {
-    log('error', 'TEST_PROCESSING_ERROR', { requestId, error: error.message });
-    res.status(500).json({ error: error.message, requestId });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 9️⃣  START SERVER
-// ----------------------------------------------------------------------------
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Digital Mailroom Webhook Server v4.1.2-updated-field-mapping`);
-  console.log(`📡 Listening on port ${PORT}`);
-  console.log(`🔗 Health check: http://localhost:${PORT}/health`);
-  console.log(`🧪 Test endpoint: POST /test/process-item/:id`);
-  console.log(`📅 Started at: ${new Date().toISOString()}`);
-  console.log(`🔧 Features: Multi-page document reconstruction, smart page merging, PO number tracking, line number indexing, updated field mapping`);
-});
-
-// -----------------------------------------------------------------------------
-//  🔧 UPDATED FIELD MAPPING + LINE NUMBER + PO NUMBER FEATURES:
-//  1. ✅ Smart filename-based page grouping
-//  2. ✅ Intelligent document reconstruction from split pages
-//  3. ✅ Line item aggregation across all pages
-//  4. ✅ Total/tax extraction from updated field positions
-//  5. ✅ Due date merging from field 4 (was field 6)
-//  6. ✅ Invoice number detection with fallback strategies
-//  7. ✅ Enhanced logging for debugging multi-page processing
-//  8. ✅ Source page tracking for line items
-//  9. ✅ Robust error handling and recovery
-//  10. ✅ Run ID linking for Instabase traceability
-//  11. ✅ PO Number extraction from field 8 (Reference Number)
-//  12. ✅ Line Number extraction and indexing for subitems
-//  13. ✅ UPDATED: Field mapping after page type removal:
-//       - Field 0: Document Number ✅
-//       - Field 1: Document Type ✅ (was field 2)
-//       - Field 2: Supplier ✅ (was field 3)
-//       - Field 3: Document Date ✅ (was field 5)
-//       - Field 4: Due Date ✅ (was field 6)
-//       - Field 5: Items ✅ (was field 7)
-//       - Field 6: Total ✅ (was field 8)
-//       - Field 7: Tax ✅ (was field 9)
-//       - Field 8: Reference Number ✅ (was field 10)
-//  14. ✅ Terms field removed completely
-//  15. ✅ Page type references removed
-//  16. ✅ Use extracted Line Numbers as subitem names (Line 40, Line 60, etc.)
-//  17. ✅ Support for both array and object formats from Instabase
-// -----------------------------------------------------------------------------// Digital Mailroom Webhook — FINAL VERSION with Updated Field Mapping + Line Number Support
+// Digital Mailroom Webhook — FINAL VERSION with Updated Field Mapping + Line Number Support
 // -----------------------------------------------------------------------------
 // This version works with the updated Instabase field mapping (page type field removed)
 // and includes Line Number extraction for subitems
@@ -1453,101 +620,594 @@ function extractDueDatesFromField(raw4, requestId, pageIndex) {
   
   const v = raw4?.value;
   
-  log('info', 'DUE_DATE_RAW_DATA', {
-    requestId,
-    pageIndex,
-    rawValue: v,
-    valueType: typeof v,
-    isArray: Array.isArray(v),
-    stringified: JSON.stringify(v)
-  });
-  
   if (typeof v === 'string') {
-    try {
-      const parsed = JSON.parse(v.trim());
-      if (Array.isArray(parsed)) {
-        // Handle nested arrays like [["Due Date"], ["2025-06-16"]]
-        if (parsed.length > 0 && Array.isArray(parsed[0])) {
-          // Find the actual date values, skip header rows
-          const dateValues = parsed.filter(row => 
-            Array.isArray(row) && row.length > 0 && 
-            !String(row[0]).toLowerCase().includes('due date') &&
-            String(row[0]).match(/\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4}|\d{2}-\d{2}-\d{4}/)
-          );
-          
-          if (dateValues.length > 0) {
-            dueDates.due_date = dateValues[0][0] || '';
-            dueDates.due_date_2 = dateValues[1] ? dateValues[1][0] : '';
-            dueDates.due_date_3 = dateValues[2] ? dateValues[2][0] : '';
-          }
-        } else {
-          // Regular array format
-          dueDates.due_date = parsed[1] || '';
-          dueDates.due_date_2 = parsed[2] || '';
-          dueDates.due_date_3 = parsed[3] || '';
-        }
-      } else {
-        dueDates.due_date = String(parsed);
-      }
-    } catch (e) {
-      dueDates.due_date = String(v);
-    }
+    dueDates.due_date = v.trim();
   } else if (Array.isArray(v)) {
-    // Handle nested arrays like [["Due Date"], ["2025-06-16"]]
-    if (v.length > 0 && Array.isArray(v[0])) {
-      const dateValues = v.filter(row => 
-        Array.isArray(row) && row.length > 0 && 
-        !String(row[0]).toLowerCase().includes('due date') &&
-        String(row[0]).match(/\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4}|\d{2}-\d{2}-\d{4}/)
-      );
-      
-      if (dateValues.length > 0) {
-        dueDates.due_date = dateValues[0][0] || '';
-        dueDates.due_date_2 = dateValues[1] ? dateValues[1][0] : '';
-        dueDates.due_date_3 = dateValues[2] ? dateValues[2][0] : '';
-      }
-    } else {
-      // Regular array format - look for actual dates, not headers
-      const actualDates = v.filter(item => {
-        const str = String(item || '').toLowerCase();
-        return !str.includes('due date') && 
-               !str.includes('date') && 
-               str.match(/\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4}|\d{2}-\d{2}-\d{4}/);
-      });
-      
-      if (actualDates.length > 0) {
-        dueDates.due_date = actualDates[0] || '';
-        dueDates.due_date_2 = actualDates[1] || '';
-        dueDates.due_date_3 = actualDates[2] || '';
-      } else {
-        // Fallback to index-based if no dates found
-        dueDates.due_date = v[1] || '';
-        dueDates.due_date_2 = v[2] || '';
-        dueDates.due_date_3 = v[3] || '';
-      }
-    }
-  } else if (v?.tables && Array.isArray(v.tables[0]?.rows)) {
-    const rows = v.tables[0].rows;
-    dueDates.due_date = rows[1] || '';
-    dueDates.due_date_2 = rows[2] || '';
-    dueDates.due_date_3 = rows[3] || '';
-  } else if (v?.rows) {
-    dueDates.due_date = v.rows[1] || '';
-    dueDates.due_date_2 = v.rows[2] || '';
-    dueDates.due_date_3 = v.rows[3] || '';
+    dueDates.due_date = v[0] || '';
+    dueDates.due_date_2 = v[1] || '';
+    dueDates.due_date_3 = v[2] || '';
   } else {
     dueDates.due_date = String(v);
   }
-  
-  log('info', 'DUE_DATES_EXTRACTED', {
-    requestId,
-    pageIndex,
-    extractedDueDates: dueDates
-  });
   
   return dueDates;
 }
 
 // 🔧 UPDATED: Helper function to extract line items - UPDATED FIELD MAPPING
 function extractLineItemsFromPage(page, requestId, pageIndex) {
-  const fields = page
+  const fields = page.fields || {};
+  const raw5 = fields['5'];  // 🔧 UPDATED: Line items moved from field 7 to field 5
+  const raw8 = fields['8'];  // 🔧 UPDATED: PO Number moved from field 11 to field 8 (Reference Number)
+  let itemsData = [];
+  let poNumber = '';
+  
+  // Extract PO number from reference field (field 8)
+  if (raw8) {
+    const v = raw8?.value;
+    if (typeof v === 'string' && v.startsWith('SP')) {
+      poNumber = v.trim();
+    }
+  }
+  
+  // 🔧 UPDATED: Extract line items from field 5 (was field 7)
+  if (raw5) {
+    const v = raw5?.value;
+    
+    if (typeof v === 'string') {
+      try {
+        itemsData = JSON.parse(v.trim());
+      } catch (e) {
+        log('error', 'JSON_PARSE_FAILED', { requestId, pageIndex, error: e.message });
+      }
+    } else if (Array.isArray(v)) {
+      itemsData = v;
+    }
+  }
+  
+  // Try to find line items in ANY field that contains arrays (fallback)
+  if (!Array.isArray(itemsData) || itemsData.length === 0) {
+    Object.keys(fields).forEach(fieldKey => {
+      const fieldValue = fields[fieldKey]?.value;
+      if (Array.isArray(fieldValue) && fieldValue.length > 0 && itemsData.length === 0) {
+        const firstItem = fieldValue[0];
+        if (typeof firstItem === 'object' || Array.isArray(firstItem)) {
+          itemsData = fieldValue;
+          log('info', 'LINE_ITEMS_FOUND_IN_ALTERNATE_FIELD', {
+            requestId,
+            pageIndex,
+            fieldKey,
+            itemCount: fieldValue.length
+          });
+        }
+      }
+    });
+  }
+  
+  if (!Array.isArray(itemsData) || itemsData.length === 0) {
+    return [];
+  }
+  
+  const processedItems = [];
+  
+  itemsData.forEach((row, rowIndex) => {
+    let lineNumber = '';
+    let itemNumber = '';
+    let unitCost = 0;
+    let quantity = 0;
+    let description = '';
+    let itemPoNumber = '';
+    
+    if (Array.isArray(row)) {
+      lineNumber = String(row[0] || '').trim();
+      itemNumber = String(row[1] || '').trim();
+      unitCost = parseFloat(row[2]) || 0;
+      quantity = parseFloat(row[3]) || 0;
+      description = String(row[4] || '').trim();
+      itemPoNumber = String(row[5] || '').trim();
+    } else if (typeof row === 'object' && row !== null) {
+      lineNumber = String(row['Line Number'] || row.line_number || row.lineNumber || row.line || '').trim();
+      itemNumber = String(row['Item Number'] || row.item_number || row.itemNumber || row.number || row.item || row.Item || '').trim();
+      unitCost = parseFloat(row['Unit Cost'] || row.unit_cost || row.unitCost || row.cost || row.price || 0);
+      quantity = parseFloat(row.Quantity || row.quantity || row.qty || row.amount || 0);
+      description = String(row.Description || row.description || row.desc || row.item_description || '').trim();
+      itemPoNumber = String(row['PO Number'] || row.po_number || row.poNumber || row.po || '').trim();
+      
+      // Handle null PO Numbers
+      if (itemPoNumber === 'null' || !itemPoNumber) {
+        itemPoNumber = '';
+      }
+    } else {
+      lineNumber = String(row || '').trim();
+    }
+    
+    // Use item-specific PO if available, otherwise use page-level PO
+    const finalPoNumber = itemPoNumber || poNumber;
+    
+    if (lineNumber || itemNumber || (unitCost > 0) || (quantity > 0)) {
+      processedItems.push({
+        line_number: lineNumber || `Item ${rowIndex + 1}`,
+        item_number: itemNumber || `Item ${rowIndex + 1}`,
+        description: description,
+        quantity: quantity,
+        unit_cost: unitCost,
+        amount: quantity * unitCost,
+        source_page: pageIndex + 1,
+        po_number: finalPoNumber
+      });
+    }
+  });
+  
+  return processedItems;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7️⃣  ENHANCED MONDAY ITEMS CREATION WITH FIXED SOURCE ID & SUBITEM INDEXING
+// ----------------------------------------------------------------------------
+async function createMondayExtractedItems(documents, sourceItemId, originalFiles, requestId, instabaseRunId) {
+  try {
+    log('info', 'STAGE: Getting board structure', { requestId });
+    
+    const boardQuery = `
+      query {
+        boards(ids: [${MONDAY_CONFIG.extractedDocsBoardId}]) {
+          id
+          name
+          columns {
+            id
+            title
+            type
+            settings_str
+          }
+        }
+      }
+    `;
+    
+    const boardResponse = await axios.post('https://api.monday.com/v2', {
+      query: boardQuery
+    }, {
+      headers: {
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
+    
+    // Find the actual "Source Request ID" column
+    const sourceRequestIdColumn = columns.find(col => 
+      col.title.toLowerCase() === 'id'
+    );
+    
+    // Validate subitems column exists
+    const subitemsColumn = columns.find(col => col.type === 'subtasks');
+    
+    for (const doc of documents) {
+      log('info', 'CREATING_MONDAY_ITEM', {
+        requestId,
+        documentType: doc.document_type,
+        invoiceNumber: doc.invoice_number,
+        itemCount: doc.items?.length || 0
+      });
+      
+      const formatDate = (dateStr) => {
+        if (!dateStr || dateStr === 'Due Date' || dateStr === 'undefined' || dateStr === 'null') {
+          return '';
+        }
+        try {
+          let date;
+          if (typeof dateStr === 'string') {
+            const cleanDate = dateStr.trim();
+            if (cleanDate.match(/^\d{4}-\d{2}-\d{2}$/)) {
+              return cleanDate;
+            }
+            date = new Date(cleanDate);
+          } else {
+            date = new Date(dateStr);
+          }
+          
+          if (isNaN(date.getTime())) {
+            return '';
+          }
+          
+          return date.toISOString().split('T')[0];
+        } catch (e) {
+          return '';
+        }
+      };
+      
+      const columnValues = buildColumnValues(columns, doc, formatDate, instabaseRunId);
+      
+      // Create the item
+      const mutation = `
+        mutation {
+          create_item(
+            board_id: ${MONDAY_CONFIG.extractedDocsBoardId}
+            item_name: "${instabaseRunId || 'RUN_PENDING'}"
+            column_values: ${JSON.stringify(JSON.stringify(columnValues))}
+          ) {
+            id
+            name
+          }
+        }
+      `;
+      
+      const response = await axios.post('https://api.monday.com/v2', {
+        query: mutation
+      }, {
+        headers: {
+          'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      if (response.data.errors) {
+        log('error', 'ITEM_CREATION_FAILED', {
+          requestId,
+          errors: response.data.errors
+        });
+        continue;
+      }
+      
+      const createdItemId = response.data.data.create_item.id;
+      log('info', 'ITEM_CREATED_SUCCESS', {
+        requestId,
+        itemId: createdItemId,
+        documentType: doc.document_type,
+        invoiceNumber: doc.invoice_number
+      });
+      
+      // Upload PDF file
+      if (originalFiles && originalFiles.length > 0) {
+        const fileColumn = columns.find(col => col.type === 'file');
+        if (fileColumn) {
+          try {
+            await uploadPdfToMondayItem(createdItemId, originalFiles[0].buffer, originalFiles[0].name, fileColumn.id, requestId);
+          } catch (uploadError) {
+            log('error', 'PDF_UPLOAD_FAILED', {
+              requestId,
+              itemId: createdItemId,
+              error: uploadError.message
+            });
+          }
+        }
+      }
+      
+      // Create subitems if we have line items and subitems column exists
+      if (subitemsColumn && doc.items && doc.items.length > 0) {
+        try {
+          await createSubitemsForLineItems(createdItemId, doc.items, columns, requestId);
+        } catch (subitemError) {
+          log('error', 'SUBITEM_CREATION_FAILED', {
+            requestId,
+            itemId: createdItemId,
+            error: subitemError.message
+          });
+        }
+      }
+    }
+    
+    log('info', 'ALL_ITEMS_PROCESSED', { requestId, documentCount: documents.length });
+    
+  } catch (error) {
+    log('error', 'CREATE_MONDAY_ITEMS_FAILED', {
+      requestId,
+      error: error.message,
+      stack: error.stack
+    });
+    throw error;
+  }
+}
+
+// 🔧 UPDATED: Subitem creation function with Line Number support
+async function createSubitemsForLineItems(parentItemId, items, columns, requestId) {
+  try {
+    log('info', 'SUBITEM_CREATION_START', { requestId, parentItemId, lineItemCount: items.length });
+
+    // Get the linked board ID from your Subtasks column
+    const subitemsColumn = columns.find(c => c.type === 'subtasks');
+    if (!subitemsColumn) {
+      log('error', 'NO_SUBTASKS_COLUMN_FOUND', { requestId });
+      return;
+    }
+
+    let settings = {};
+    try {
+      settings = JSON.parse(subitemsColumn.settings_str || '{}');
+    } catch (e) {
+      log('error', 'SETTINGS_PARSE_ERROR', { requestId, error: e.message });
+      return;
+    }
+
+    const subitemBoardId = Array.isArray(settings.boardIds)
+      ? settings.boardIds[0]
+      : settings.linked_board_id;
+    
+    if (!subitemBoardId) {
+      log('error', 'MISSING_SUBITEM_BOARD_ID', { requestId, settings });
+      return;
+    }
+
+    // Fetch that board's columns
+    const colsQuery = `
+      query {
+        boards(ids: [${subitemBoardId}]) {
+          columns { id title type }
+        }
+      }
+    `;
+    
+    const colsResponse = await axios.post('https://api.monday.com/v2', { query: colsQuery }, {
+      headers: { Authorization: `Bearer ${MONDAY_CONFIG.apiKey}` }
+    });
+    
+    const subitemColumns = colsResponse.data.data.boards[0].columns;
+
+    // Loop each line item and map into those columns
+    for (let i = 0; i < items.length; i++) {
+      const { line_number, item_number, quantity, unit_cost, description, source_page, po_number } = items[i];
+      const columnValues = {};
+      
+      // Use extracted line_number for subitem indexing
+      const actualLineNumber = line_number || `${i + 1}`;
+      
+      subitemColumns.forEach(col => {
+        const title = col.title.trim().toLowerCase();
+        
+        // Map to Line Number column using extracted value
+        if (title.includes('line number') || title.includes('line #') || title.includes('subitem') || title === 'index') {
+          if (col.type === 'numbers') {
+            const numericLineNumber = parseFloat(actualLineNumber);
+            columnValues[col.id] = isNaN(numericLineNumber) ? (i + 1) : numericLineNumber;
+          } else {
+            columnValues[col.id] = actualLineNumber;
+          }
+        } else if (title === 'item number' || title.includes('item num')) {
+          columnValues[col.id] = item_number || '';
+        } else if (title === 'quantity' || title === 'qty') {
+          if (col.type === 'numbers') {
+            columnValues[col.id] = quantity || 0;
+          } else {
+            columnValues[col.id] = String(quantity || 0);
+          }
+        } else if (title === 'unit cost' || title.includes('unit cost')) {
+          if (col.type === 'numbers') {
+            columnValues[col.id] = unit_cost || 0;
+          } else {
+            columnValues[col.id] = String(unit_cost || 0);
+          }
+        } else if (title === 'description' || title.includes('desc')) {
+          columnValues[col.id] = description || '';
+        } else if (title.includes('source page') || title.includes('page')) {
+          columnValues[col.id] = source_page || '';
+        } else if (title.includes('po number') || title === 'po' || title.includes('purchase order')) {
+          columnValues[col.id] = po_number || '';
+        }
+      });
+
+      // Use extracted line number in subitem name
+      const subitemName = `Line ${actualLineNumber}`;
+      const escapedName = subitemName.replace(/"/g, '\\"');
+      const columnValuesJson = JSON.stringify(columnValues);
+      
+      const mutation = `
+        mutation {
+          create_subitem(
+            parent_item_id: ${parentItemId}
+            item_name: "${escapedName}"
+            column_values: ${JSON.stringify(columnValuesJson)}
+          ) { 
+            id 
+            name
+          }
+        }
+      `;
+      
+      const response = await axios.post('https://api.monday.com/v2', { query: mutation }, {
+        headers: {
+          Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
+          'Content-Type': 'application/json',
+          'API-Version': '2024-04'
+        }
+      });
+      
+      if (response.data.errors) {
+        log('error', 'SUBITEM_MUTATION_ERRORS', { 
+          requestId, 
+          extractedLineNumber: actualLineNumber, 
+          errors: response.data.errors 
+        });
+        
+        // Try creating without column values if there are errors
+        const simpleQuery = `
+          mutation {
+            create_subitem(
+              parent_item_id: ${parentItemId}
+              item_name: "${escapedName}"
+            ) { 
+              id 
+              name
+            }
+          }
+        `;
+        
+        const retryResponse = await axios.post('https://api.monday.com/v2', { query: simpleQuery }, {
+          headers: {
+            Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
+            'Content-Type': 'application/json',
+            'API-Version': '2024-04'
+          }
+        });
+        
+        if (retryResponse.data.errors) {
+          log('error', 'SIMPLE_SUBITEM_ALSO_FAILED', {
+            requestId,
+            extractedLineNumber: actualLineNumber,
+            errors: retryResponse.data.errors
+          });
+        } else {
+          log('info', 'SIMPLE_SUBITEM_SUCCESS', {
+            requestId,
+            extractedLineNumber: actualLineNumber,
+            subitemId: retryResponse.data.data.create_subitem.id,
+            subitemName: escapedName
+          });
+        }
+      } else {
+        log('info', 'SUBITEM_CREATED', { 
+          requestId, 
+          extractedLineNumber: actualLineNumber, 
+          subitemId: response.data.data.create_subitem.id,
+          subitemName: escapedName,
+          poNumber: po_number
+        });
+      }
+      
+      // Small pause to avoid rate limits
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+
+    log('info', 'ALL_SUBITEMS_CREATED', { requestId, parentItemId, lineItemCount: items.length });
+    
+  } catch (error) {
+    log('error', 'SUBITEM_CREATION_ERROR', {
+      requestId,
+      parentItemId,
+      error: error.message,
+      stack: error.stack
+    });
+  }
+}
+
+// buildColumnValues function
+function buildColumnValues(columns, doc, formatDate, instabaseRunId = null) {
+  const columnValues = {};
+  
+  columns.forEach(col => {
+    const title = col.title.toLowerCase();
+    const id = col.id;
+    const type = col.type;
+    
+    if (title.includes('supplier')) {
+      columnValues[id] = doc.supplier_name || '';
+    } else if (title === 'id') {
+      columnValues[id] = instabaseRunId || '';
+    } else if (title.includes('reference number') || title === 'reference number' || title.includes('reference')) {
+      columnValues[id] = doc.reference_number || '';
+    } else if (title.includes('document number') || (title.includes('number') && !title.includes('total') && !title.includes('reference') && !title.includes('source') && !title.includes('id'))) {
+      columnValues[id] = doc.invoice_number || '';
+    } else if (title.includes('document type') || (title.includes('type') && !title.includes('document'))) {
+      if (type === 'dropdown') {
+        let settings = {};
+        try {
+          settings = JSON.parse(col.settings_str || '{}');
+        } catch (e) {
+          // Use default if parsing fails
+        }
+        
+        if (settings.labels && settings.labels.length > 0) {
+          const matchingLabel = settings.labels.find(label => 
+            label.name?.toLowerCase() === (doc.document_type || '').toLowerCase()
+          );
+          
+          if (matchingLabel) {
+            columnValues[id] = matchingLabel.name;
+          } else {
+            columnValues[id] = settings.labels[0].name;
+          }
+        }
+      } else {
+        columnValues[id] = doc.document_type || '';
+      }
+    } else if (title.includes('document date') || (title.includes('date') && !title.includes('due'))) {
+      columnValues[id] = formatDate(doc.document_date);
+    } else if (title === 'due date' || (title.includes('due date') && !title.includes('2') && !title.includes('3'))) {
+      const formattedDate = formatDate(doc.due_date);
+      if (formattedDate) {
+        columnValues[id] = formattedDate;
+      }
+    } else if (title.includes('due date 2')) {
+      const formattedDate = formatDate(doc.due_date_2);
+      if (formattedDate) {
+        columnValues[id] = formattedDate;
+      }
+    } else if (title.includes('due date 3')) {
+      const formattedDate = formatDate(doc.due_date_3);
+      if (formattedDate) {
+        columnValues[id] = formattedDate;
+      }
+    } else if (title.includes('total amount')) {
+      columnValues[id] = doc.total_amount || 0;
+    } else if (title.includes('tax amount')) {
+      columnValues[id] = doc.tax_amount || 0;
+    } else if (title.includes('extraction status') || title.includes('status')) {
+      if (type === 'status') {
+        columnValues[id] = { "index": 1 };
+      } else {
+        columnValues[id] = "Extracted";
+      }
+    }
+  });
+  
+  return columnValues;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8️⃣  HEALTH + TEST ROUTES
+// ----------------------------------------------------------------------------
+app.get('/health', (req, res) => {
+  res.json({ 
+    ok: true, 
+    timestamp: new Date().toISOString(),
+    service: 'digital-mailroom-webhook',
+    version: '4.1.2-updated-field-mapping'
+  });
+});
+
+app.post('/test/process-item/:id', async (req, res) => {
+  const requestId = `test_${Date.now()}`;
+  try {
+    log('info', 'TEST_PROCESSING_START', { requestId, itemId: req.params.id });
+    
+    const files = await getMondayItemFilesWithPublicUrl(req.params.id, MONDAY_CONFIG.fileUploadsBoardId, requestId);
+    
+    if (files.length === 0) {
+      return res.json({ success: false, message: 'No PDF files found' });
+    }
+    
+    const { files: extracted, originalFiles, runId } = await processFilesWithInstabase(files, requestId);
+    const groups = groupPagesByInvoiceNumber(extracted, requestId);
+    await createMondayExtractedItems(groups, req.params.id, originalFiles, requestId, runId);
+    
+    res.json({ 
+      success: true, 
+      message: 'Processing completed with updated field mapping and line number indexing',
+      requestId,
+      instabaseRunId: runId,
+      filesProcessed: files.length,
+      groupsCreated: groups.length,
+      itemsWithLineItems: groups.filter(g => g.items.length > 0).length,
+      reconstructionDetails: groups.map(g => ({
+        invoiceNumber: g.invoice_number,
+        lineItemCount: g.items?.length || 0,
+        totalAmount: g.total_amount,
+        lineNumbers: g.items?.map(item => item.line_number) || []
+      }))
+    });
+  } catch (error) {
+    log('error', 'TEST_PROCESSING_ERROR', { requestId, error: error.message });
+    res.status(500).json({ error: error.message, requestId });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9️⃣  START SERVER
+// ----------------------------------------------------------------------------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Digital Mailroom Webhook Server v4.1.2-updated-field-mapping`);
+  console.log(`📡 Listening on port ${PORT}`);
+  console.log(`🔗 Health check: http://localhost:${PORT}/health`);
+  console.log(`🧪 Test endpoint: POST /test/process-item/:id`);
+  console.log(`📅 Started at: ${new Date().toISOString()}`);
+  console.log(`🔧 Features: Updated field mapping, line number indexing, PO number tracking`);
+});
