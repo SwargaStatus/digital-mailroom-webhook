@@ -249,11 +249,11 @@ async function processFilesWithInstabase(files, requestId) {
     // Poll for completion
     let status = 'RUNNING';
     let attempts = 0;
-    const maxAttempts = 60; // 5 minutes
+    const maxAttempts = 180; // 15 minutes (180 * 5 seconds = 900 seconds = 15 minutes)
 
     while (status === 'RUNNING' || status === 'PENDING') {
       if (attempts >= maxAttempts) {
-        throw new Error('Processing timeout after 5 minutes');
+        throw new Error('Processing timeout after 15 minutes');
       }
 
       await new Promise(resolve => setTimeout(resolve, 5000));
