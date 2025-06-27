@@ -1,7 +1,7 @@
-// Digital Mailroom Webhook — FINAL VERSION with Multi-Page Document Reconstruction + PO Number Support
+// Digital Mailroom Webhook — FINAL VERSION with Multi-Page Document Reconstruction + PO Number Support + Line Number Index
 // -----------------------------------------------------------------------------
 // This version intelligently merges split PDF pages back into complete documents
-// and includes PO Number tracking for line items
+// and includes PO Number tracking and uses extracted Line Numbers for subitem indexing
 // -----------------------------------------------------------------------------
 
 const express   = require('express');
@@ -634,11 +634,11 @@ function extractDueDatesFromField(raw6, requestId, pageIndex) {
   return dueDates;
 }
 
-// 🔧 UPDATED: Helper function to extract line items from a single page - NOW WITH PO SUPPORT
+// 🔧 UPDATED: Helper function to extract line items from a single page - NOW WITH LINE NUMBER & PO SUPPORT + HEADER FILTERING
 function extractLineItemsFromPage(page, requestId, pageIndex) {
   const fields = page.fields || {};
   const raw7 = fields['7'];  // Line items field
-  const raw11 = fields['11']; // NEW: PO Number field (you'll need to configure this in Instabase)
+  const raw11 = fields['11']; // PO Number field
   let itemsData = [];
   let poNumber = '';
   
@@ -721,47 +721,151 @@ function extractLineItemsFromPage(page, requestId, pageIndex) {
   const processedItems = [];
   
   if (Array.isArray(itemsData) && itemsData.length > 0) {
-    itemsData.forEach((row, rowIndex) => {
+    // 🔧 NEW: Filter out header rows before processing
+    const filteredItemsData = filterHeaderRows(itemsData, requestId, pageIndex);
+    
+    filteredItemsData.forEach((row, rowIndex) => {
+      let lineNumber = '';  // 🔧 NEW: Extract actual line number
       let itemNumber = '';
       let unitCost = 0;
       let quantity = 0;
       let description = '';
-      let itemPoNumber = '';  // NEW: Item-specific PO number
+      let itemPoNumber = '';
       
       if (Array.isArray(row)) {
-        itemNumber = String(row[0] || '').trim();
-        unitCost = parseFloat(row[1]) || 0;
-        quantity = parseFloat(row[2]) || 0;
-        description = String(row[3] || '').trim();
-        itemPoNumber = String(row[4] || '').trim(); // NEW: PO from 5th column if available
+        // 🔧 UPDATED: Extract line number from first position (or appropriate position)
+        lineNumber = String(row[0] || '').trim();  // Line number is typically in first column
+        itemNumber = String(row[1] || '').trim();  // Item number moved to second column
+        unitCost = parseFloat(row[2]) || 0;        // Unit cost moved to third column
+        quantity = parseFloat(row[3]) || 0;        // Quantity moved to fourth column
+        description = String(row[4] || '').trim(); // Description moved to fifth column
+        itemPoNumber = String(row[5] || '').trim(); // PO from sixth column if available
       } else if (typeof row === 'object' && row !== null) {
+        // 🔧 UPDATED: Extract line number from object properties
+        lineNumber = String(row['Line Number'] || row.line_number || row.lineNumber || row.line || '').trim();
         itemNumber = String(row['Item Number'] || row.item_number || row.itemNumber || row.number || row.item || '').trim();
         unitCost = parseFloat(row['Unit Cost'] || row.unit_cost || row.unitCost || row.cost || row.price || 0);
         quantity = parseFloat(row.Quantity || row.quantity || row.qty || row.amount || 0);
         description = String(row.Description || row.description || row.desc || row.item_description || '').trim();
-        itemPoNumber = String(row['PO Number'] || row.po_number || row.poNumber || row.po || '').trim(); // NEW
+        itemPoNumber = String(row['PO Number'] || row.po_number || row.poNumber || row.po || '').trim();
       } else {
-        itemNumber = String(row || '').trim();
+        // Fallback: use the row value as line number
+        lineNumber = String(row || '').trim();
       }
       
       // Use item-specific PO if available, otherwise use page-level PO
       const finalPoNumber = itemPoNumber || poNumber;
       
-      if (itemNumber || (unitCost > 0) || (quantity > 0)) {
+      // 🔧 UPDATED: Use extracted line number instead of auto-incrementing
+      if (lineNumber || itemNumber || (unitCost > 0) || (quantity > 0)) {
         processedItems.push({
+          line_number: lineNumber || `${rowIndex + 1}`, // Use extracted line number or fallback to index
           item_number: itemNumber || `Item ${rowIndex + 1}`,
           description: description,
           quantity: quantity,
           unit_cost: unitCost,
           amount: quantity * unitCost,
           source_page: pageIndex + 1,
-          po_number: finalPoNumber  // NEW: Add PO number to each item
+          po_number: finalPoNumber
         });
       }
     });
   }
   
   return processedItems;
+}
+
+// 🔧 NEW: Function to filter out header rows from line items data
+function filterHeaderRows(itemsData, requestId, pageIndex) {
+  if (!Array.isArray(itemsData) || itemsData.length === 0) {
+    return itemsData;
+  }
+
+  const filteredData = [];
+  let headerRowsRemoved = 0;
+
+  for (let i = 0; i < itemsData.length; i++) {
+    const row = itemsData[i];
+    let isHeaderRow = false;
+
+    if (Array.isArray(row)) {
+      // Check if this row looks like a header row
+      const rowStr = row.map(cell => String(cell || '').toLowerCase().trim()).join(' ');
+      
+      // Common header patterns to detect
+      const headerPatterns = [
+        /line.*number.*item.*quantity.*cost/,
+        /item.*number.*description.*qty.*price/,
+        /line.*item.*desc.*quantity.*unit/,
+        /^line\s*item\s*qty\s*cost/,
+        /^line.*qty.*unit.*cost/,
+        /number.*description.*quantity.*amount/,
+        /item.*qty.*unit.*total/
+      ];
+
+      // Check if row contains mostly header-like text
+      isHeaderRow = headerPatterns.some(pattern => pattern.test(rowStr));
+
+      // Additional check: if first cell looks like "Line Number" or "Item Number" etc.
+      const firstCell = String(row[0] || '').toLowerCase().trim();
+      if (firstCell.includes('line') && firstCell.includes('number') ||
+          firstCell.includes('item') && firstCell.includes('number') ||
+          firstCell === 'line' || firstCell === 'item' ||
+          firstCell === 'qty' || firstCell === 'quantity' ||
+          firstCell === 'description' || firstCell === 'desc') {
+        isHeaderRow = true;
+      }
+
+      // Check if the row has all text and no numbers (typical of headers)
+      const hasNumericValues = row.some(cell => {
+        const cellStr = String(cell || '').trim();
+        return cellStr && !isNaN(parseFloat(cellStr)) && parseFloat(cellStr) > 0;
+      });
+
+      if (!hasNumericValues && row.some(cell => {
+        const cellStr = String(cell || '').toLowerCase();
+        return cellStr.includes('line') || cellStr.includes('item') || 
+               cellStr.includes('qty') || cellStr.includes('cost') || 
+               cellStr.includes('description') || cellStr.includes('amount');
+      })) {
+        isHeaderRow = true;
+      }
+
+    } else if (typeof row === 'object' && row !== null) {
+      // For object format, check if values look like header text
+      const values = Object.values(row).map(v => String(v || '').toLowerCase().trim());
+      const valuesStr = values.join(' ');
+      
+      if (valuesStr.includes('line number') || valuesStr.includes('item number') ||
+          valuesStr.includes('description') || valuesStr.includes('quantity') ||
+          valuesStr.includes('unit cost') || valuesStr.includes('amount')) {
+        isHeaderRow = true;
+      }
+    }
+
+    if (isHeaderRow) {
+      headerRowsRemoved++;
+      log('info', 'HEADER_ROW_FILTERED', {
+        requestId,
+        pageIndex,
+        rowIndex: i,
+        rowContent: Array.isArray(row) ? row.slice(0, 3) : Object.keys(row).slice(0, 3),
+        reason: 'Detected as header row'
+      });
+    } else {
+      filteredData.push(row);
+    }
+  }
+
+  log('info', 'HEADER_FILTERING_COMPLETE', {
+    requestId,
+    pageIndex,
+    originalRowCount: itemsData.length,
+    filteredRowCount: filteredData.length,
+    headerRowsRemoved
+  });
+
+  return filteredData;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1012,7 +1116,7 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
   }
 }
 
-// 🔧 UPDATED: Subitem creation function with PO Number support
+// 🔧 UPDATED: Subitem creation function with Line Number support (instead of auto-increment)
 async function createSubitemsForLineItems(parentItemId, items, columns, requestId) {
   try {
     log('info', 'SUBITEM_CREATION_START', { requestId, parentItemId, lineItemCount: items.length });
@@ -1072,16 +1176,24 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
 
     // 3️⃣ Loop each line item and map into those columns
     for (let i = 0; i < items.length; i++) {
-      const { item_number, quantity, unit_cost, description, source_page, po_number } = items[i]; // NEW: Extract po_number
+      const { line_number, item_number, quantity, unit_cost, description, source_page, po_number } = items[i];
       const columnValues = {};
       
-      const lineIndex = i + 1;
+      // 🔧 UPDATED: Use extracted line_number instead of auto-increment
+      const actualLineNumber = line_number || `${i + 1}`;
       
       subitemColumns.forEach(col => {
         const title = col.title.trim().toLowerCase();
         
+        // 🔧 UPDATED: Map to Line Number column using extracted value
         if (title.includes('line number') || title.includes('line #') || title.includes('subitem') || title === 'index') {
-          columnValues[col.id] = lineIndex;
+          if (col.type === 'numbers') {
+            // Try to parse as number, fallback to string index if not numeric
+            const numericLineNumber = parseFloat(actualLineNumber);
+            columnValues[col.id] = isNaN(numericLineNumber) ? (i + 1) : numericLineNumber;
+          } else {
+            columnValues[col.id] = actualLineNumber;
+          }
         } else if (title === 'item number' || title.includes('item num')) {
           columnValues[col.id] = item_number || '';
         } else if (title === 'quantity' || title === 'qty') {
@@ -1100,21 +1212,22 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
           columnValues[col.id] = description || '';
         } else if (title.includes('source page') || title.includes('page')) {
           columnValues[col.id] = source_page || '';
-        } else if (title.includes('po number') || title === 'po' || title.includes('purchase order')) { // NEW: PO Number mapping
+        } else if (title.includes('po number') || title === 'po' || title.includes('purchase order')) {
           columnValues[col.id] = po_number || '';
         }
       });
 
       log('info', 'SUBITEM_COLUMN_MAPPING', {
         requestId,
-        lineIndex: lineIndex,
+        extractedLineNumber: actualLineNumber,
         itemNumber: item_number,
         sourcePage: source_page,
-        poNumber: po_number,  // NEW: Log PO number
+        poNumber: po_number,
         columnValues
       });
 
-      const subitemName = `Line ${lineIndex}`;
+      // 🔧 UPDATED: Use extracted line number in subitem name
+      const subitemName = `Line ${actualLineNumber}`;
       const escapedName = subitemName.replace(/"/g, '\\"');
       const columnValuesJson = JSON.stringify(columnValues);
       
@@ -1133,9 +1246,9 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
       
       log('info', 'CREATING_SUBITEM', {
         requestId,
-        lineIndex: lineIndex,
+        extractedLineNumber: actualLineNumber,
         subitemName: escapedName,
-        poNumber: po_number  // NEW: Log PO number
+        poNumber: po_number
       });
       
       const response = await axios.post('https://api.monday.com/v2', { query: mutation }, {
@@ -1149,7 +1262,7 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
       if (response.data.errors) {
         log('error', 'SUBITEM_MUTATION_ERRORS', { 
           requestId, 
-          lineIndex: lineIndex, 
+          extractedLineNumber: actualLineNumber, 
           errors: response.data.errors 
         });
         
@@ -1177,13 +1290,13 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
         if (retryResponse.data.errors) {
           log('error', 'SIMPLE_SUBITEM_ALSO_FAILED', {
             requestId,
-            lineIndex: lineIndex,
+            extractedLineNumber: actualLineNumber,
             errors: retryResponse.data.errors
           });
         } else {
           log('info', 'SIMPLE_SUBITEM_SUCCESS', {
             requestId,
-            lineIndex: lineIndex,
+            extractedLineNumber: actualLineNumber,
             subitemId: retryResponse.data.data.create_subitem.id,
             subitemName: escapedName
           });
@@ -1191,10 +1304,10 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
       } else {
         log('info', 'SUBITEM_CREATED', { 
           requestId, 
-          lineIndex: lineIndex, 
+          extractedLineNumber: actualLineNumber, 
           subitemId: response.data.data.create_subitem.id,
           subitemName: escapedName,
-          poNumber: po_number  // NEW: Log PO number
+          poNumber: po_number
         });
       }
       
@@ -1301,7 +1414,7 @@ app.get('/health', (req, res) => {
     ok: true, 
     timestamp: new Date().toISOString(),
     service: 'digital-mailroom-webhook',
-    version: '4.1.0-multipage-reconstruction-with-po-support'
+    version: '4.3.0-header-filtering'
   });
 });
 
@@ -1322,7 +1435,7 @@ app.post('/test/process-item/:id', async (req, res) => {
     
     res.json({ 
       success: true, 
-      message: 'Processing completed with multi-page reconstruction and PO number support',
+      message: 'Processing completed with multi-page reconstruction, PO number support, line number indexing, and header filtering',
       requestId,
       instabaseRunId: runId,
       filesProcessed: files.length,
@@ -1335,7 +1448,8 @@ app.post('/test/process-item/:id', async (req, res) => {
         pageCount: g.originalPageCount || 1,
         lineItemCount: g.items?.length || 0,
         totalAmount: g.total_amount,
-        itemsWithPO: g.items?.filter(item => item.po_number).length || 0  // NEW: Count items with PO
+        itemsWithPO: g.items?.filter(item => item.po_number).length || 0,
+        lineNumbers: g.items?.map(item => item.line_number) || []  // NEW: Show extracted line numbers
       }))
     });
   } catch (error) {
@@ -1349,16 +1463,16 @@ app.post('/test/process-item/:id', async (req, res) => {
 // ----------------------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Digital Mailroom Webhook Server v4.1.0-multipage-reconstruction-with-po-support`);
+  console.log(`🚀 Digital Mailroom Webhook Server v4.3.0-header-filtering`);
   console.log(`📡 Listening on port ${PORT}`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
   console.log(`🧪 Test endpoint: POST /test/process-item/:id`);
   console.log(`📅 Started at: ${new Date().toISOString()}`);
-  console.log(`🔧 Features: Multi-page document reconstruction, smart page merging, PO number tracking`);
+  console.log(`🔧 Features: Multi-page document reconstruction, smart page merging, PO number tracking, extracted line number indexing, header row filtering`);
 });
 
 // -----------------------------------------------------------------------------
-//  🔧 MULTI-PAGE RECONSTRUCTION + PO NUMBER FEATURES:
+//  🔧 MULTI-PAGE RECONSTRUCTION + PO NUMBER + LINE NUMBER FEATURES:
 //  1. ✅ Smart filename-based page grouping
 //  2. ✅ Intelligent document reconstruction from split pages
 //  3. ✅ Line item aggregation across all pages
@@ -1369,7 +1483,11 @@ app.listen(PORT, '0.0.0.0', () => {
 //  8. ✅ Source page tracking for line items
 //  9. ✅ Robust error handling and recovery
 //  10. ✅ Run ID linking for Instabase traceability
-//  11. ✅ NEW: PO Number extraction and tracking for each line item
-//  12. ✅ NEW: SP code detection and fallback search mechanisms
-//  13. ✅ NEW: Enhanced subitem creation with PO number support
+//  11. ✅ PO Number extraction and tracking for each line item
+//  12. ✅ SP code detection and fallback search mechanisms
+//  13. ✅ Enhanced subitem creation with PO number support
+//  14. ✅ NEW: Line Number extraction from Instabase data
+//  15. ✅ NEW: Use extracted Line Numbers for subitem indexing instead of auto-increment
+//  16. ✅ NEW: Robust line number parsing from array/object structures
+//  17. ✅ NEW: Fallback to auto-increment only when line number is missing
 // -----------------------------------------------------------------------------
