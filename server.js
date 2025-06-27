@@ -1,165 +1,7 @@
-// 🔧 ENHANCED: Function to intelligently reconstruct multi-page documents - IMPROVED DATA EXTRACTION
-function reconstructMultiPageDocument(pages, masterPage, requestId, filename) {
-  log('info', 'RECONSTRUCTING_MULTI_PAGE_DOC', {
-    requestId,
-    filename,
-    pageCount: pages.length,
-    masterPageIndex: pages.indexOf(masterPage),
-    pageTypes: pages.map(p => p.fields['1']?.value || 'unknown')
-  });
-  
-  const masterFields = masterPage.fields;
-  
-  // Extract basic info from master page with better error handling
-  const invoiceNumber = extractCleanValue(masterFields['0']?.value) || filename.replace(/\.[^/.]+$/, "");
-  const documentType = extractCleanValue(masterFields['2']?.value) || 'invoice';
-  const supplier = extractCleanValue(masterFields['3']?.value) || '';
-  const terms = extractCleanValue(masterFields['4']?.value) || '';
-  const documentDate = extractCleanValue(masterFields['5']?.value) || '';
-  const referenceNumber = extractCleanValue(masterFields['10']?.value) || '';
-  
-  log('info', 'BASIC_INFO_EXTRACTED', {
-    requestId,
-    filename,
-    invoiceNumber,
-    documentType,
-    supplier,
-    documentDate,
-    referenceNumber
-  });
-  
-  // 🔧 ENHANCED: Merge due dates from all pages (prioritize non-empty values)
-  let mergedDueDates = { due_date: '', due_date_2: '', due_date_3: '' };
-  
-  pages.forEach((page, pageIndex) => {
-    const raw6 = page.fields['6'];
-    if (raw6) {
-      const dueDates = extractDueDatesFromField(raw6, requestId, pageIndex);
-      
-      // Merge due dates (keep first non-empty value found)
-      if (dueDates.due_date && !mergedDueDates.due_date) {
-        mergedDueDates.due_date = dueDates.due_date;
-      }
-      if (dueDates.due_date_2 && !mergedDueDates.due_date_2) {
-        mergedDueDates.due_date_2 = dueDates.due_date_2;
-      }
-      if (dueDates.due_date_3 && !mergedDueDates.due_date_3) {
-        mergedDueDates.due_date_3 = dueDates.due_date_3;
-      }
-    }
-  });
-  
-  log('info', 'DUE_DATES_MERGED', {
-    requestId,
-    filename,
-    mergedDueDates
-  });
-  
-  // 🔧 ENHANCED: Merge line items from all pages
-  const allLineItems = [];
-  
-  pages.forEach((page, pageIndex) => {
-    log('info', 'PROCESSING_PAGE_FOR_ITEMS', {
-      requestId,
-      filename,
-      pageIndex,
-      availableFields: Object.keys(page.fields)
-    });
-    
-    const pageItems = extractLineItemsFromPage(page, requestId, pageIndex);
-    if (pageItems.length > 0) {
-      allLineItems.push(...pageItems);
-      log('info', 'ITEMS_FOUND_ON_PAGE', {
-        requestId,
-        filename,
-        pageIndex,
-        itemCount: pageItems.length,
-        items: pageItems.map(item => ({
-          line_number: item.line_number,
-          item_number: item.item_number,
-          description: item.description ? item.description.substring(0, 50) : ''
-        }))
-      });
-    }
-  });
-  
-  // 🔧 ENHANCED: Find totals from any page (usually last page)
-  let totalAmount = 0;
-  let taxAmount = 0;
-  
-  // Search all pages for totals (prioritize later pages)
-  for (let i = pages.length - 1; i >= 0; i--) {
-    const page = pages[i];
-    const pageTotalAmount = extractCleanValue(page.fields['8']?.value);
-    const pageTaxAmount = extractCleanValue(page.fields['9']?.value);
-    
-    if (pageTotalAmount && !totalAmount) {
-      const totalStr = String(pageTotalAmount).replace(/[^0-9.-]/g, '');
-      totalAmount = parseFloat(totalStr) || 0;
-      log('info', 'TOTAL_FOUND_ON_PAGE', {
-        requestId,
-        filename,
-        pageIndex: i,
-        totalAmount,
-        rawValue: pageTotalAmount
-      });
-    }
-    
-    if (pageTaxAmount && !taxAmount) {
-      const taxStr = String(pageTaxAmount).replace(/[^0-9.-]/g, '');
-      taxAmount = parseFloat(taxStr) || 0;
-      log('info', 'TAX_FOUND_ON_PAGE', {
-        requestId,
-        filename,
-        pageIndex: i,
-        taxAmount,
-        rawValue: pageTaxAmount
-      });
-    }
-    
-    // If we found both, we can stop
-    if (totalAmount && taxAmount) break;
-  }
-  
-  const reconstructedDocument = {
-    invoice_number: invoiceNumber,
-    document_type: documentType,
-    supplier_name: supplier,
-    reference_number: referenceNumber,
-    total_amount: totalAmount,
-    tax_amount: taxAmount,
-    document_date: documentDate,
-    due_date: mergedDueDates.due_date,
-    due_date_2: mergedDueDates.due_date_2,
-    due_date_3: mergedDueDates.due_date_3,
-    terms: terms,
-    items: allLineItems,
-    pages: pages.map((page, index) => ({
-      page_type: page.fields['1']?.value || `page_${index + 1}`,
-      file_name: filename,
-      fields: page.fields
-    })),
-    confidence: 0,
-    isMultiPageReconstruction: true,
-    originalPageCount: pages.length,
-    reconstructionStrategy: 'filename_grouping_with_content_merging'
-  };
-  
-  log('info', 'DOCUMENT_RECONSTRUCTION_COMPLETE', {
-    requestId,
-    filename,
-    invoiceNumber,
-    totalAmount,
-    taxAmount,
-    lineItemCount: allLineItems.length,
-    pageCount: pages.length,
-    dueDatesFound: Object.values(mergedDueDates).filter(d => d).length
-  });
-  
-  return reconstructedDocument;// Digital Mailroom Webhook — FINAL VERSION with Multi-Page Document Reconstruction + PO Number Support + Line Number Index
+// Digital Mailroom Webhook — FINAL VERSION with Multi-Page Document Reconstruction + PO Number Support + Line Number
 // -----------------------------------------------------------------------------
 // This version intelligently merges split PDF pages back into complete documents
-// and includes PO Number tracking and uses extracted Line Numbers for subitem indexing
+// and includes PO Number tracking and Line Number extraction for subitems
 // -----------------------------------------------------------------------------
 
 const express   = require('express');
@@ -751,51 +593,7 @@ function reconstructMultiPageDocument(pages, masterPage, requestId, filename) {
   return reconstructedDocument;
 }
 
-// 🔧 NEW: Helper function to extract clean values from potentially nested arrays
-function extractCleanValue(rawValue) {
-  if (!rawValue) return '';
-  
-  // If it's already a simple string or number, return it
-  if (typeof rawValue === 'string' || typeof rawValue === 'number') {
-    return String(rawValue).trim();
-  }
-  
-  // Handle nested arrays like [["Due Date"], ["2025-06-16"]]
-  if (Array.isArray(rawValue)) {
-    // Flatten the array and look for meaningful values
-    const flatValues = rawValue.flat(3).filter(val => {
-      const strVal = String(val || '').toLowerCase().trim();
-      // Skip common header text
-      return strVal && 
-             !strVal.includes('due date') && 
-             !strVal.includes('document type') && 
-             !strVal.includes('supplier') && 
-             !strVal.includes('invoice') &&
-             !strVal.includes('reference') &&
-             strVal !== 'unknown' && 
-             strVal !== 'none' && 
-             strVal !== '';
-    });
-    
-    // Return the first meaningful value found
-    return flatValues.length > 0 ? String(flatValues[0]).trim() : '';
-  }
-  
-  // Handle object values
-  if (typeof rawValue === 'object' && rawValue !== null) {
-    // If it has a value property, try that
-    if (rawValue.value) {
-      return extractCleanValue(rawValue.value);
-    }
-    
-    // Otherwise convert to string
-    return String(rawValue).trim();
-  }
-  
-  return String(rawValue).trim();
-}
-
-// 🔧 NEW: Helper function to extract due dates from field 6 - ENHANCED FOR ARRAY HANDLING
+// 🔧 NEW: Helper function to extract due dates from field 6
 function extractDueDatesFromField(raw6, requestId, pageIndex) {
   let dueDates = { due_date: '', due_date_2: '', due_date_3: '' };
   
@@ -803,39 +601,13 @@ function extractDueDatesFromField(raw6, requestId, pageIndex) {
   
   const v = raw6?.value;
   
-  log('info', 'DUE_DATE_RAW_DATA', {
-    requestId,
-    pageIndex,
-    rawValue: v,
-    valueType: typeof v,
-    isArray: Array.isArray(v),
-    stringified: JSON.stringify(v)
-  });
-  
   if (typeof v === 'string') {
     try {
       const parsed = JSON.parse(v.trim());
       if (Array.isArray(parsed)) {
-        // Handle nested arrays like [["Due Date"], ["2025-06-16"]]
-        if (parsed.length > 0 && Array.isArray(parsed[0])) {
-          // Find the actual date values, skip header rows
-          const dateValues = parsed.filter(row => 
-            Array.isArray(row) && row.length > 0 && 
-            !String(row[0]).toLowerCase().includes('due date') &&
-            String(row[0]).match(/\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4}|\d{2}-\d{2}-\d{4}/)
-          );
-          
-          if (dateValues.length > 0) {
-            dueDates.due_date = dateValues[0][0] || '';
-            dueDates.due_date_2 = dateValues[1] ? dateValues[1][0] : '';
-            dueDates.due_date_3 = dateValues[2] ? dateValues[2][0] : '';
-          }
-        } else {
-          // Regular array format
-          dueDates.due_date = parsed[1] || '';
-          dueDates.due_date_2 = parsed[2] || '';
-          dueDates.due_date_3 = parsed[3] || '';
-        }
+        dueDates.due_date = parsed[1] || '';
+        dueDates.due_date_2 = parsed[2] || '';
+        dueDates.due_date_3 = parsed[3] || '';
       } else {
         dueDates.due_date = String(parsed);
       }
@@ -843,39 +615,9 @@ function extractDueDatesFromField(raw6, requestId, pageIndex) {
       dueDates.due_date = String(v);
     }
   } else if (Array.isArray(v)) {
-    // Handle nested arrays like [["Due Date"], ["2025-06-16"]]
-    if (v.length > 0 && Array.isArray(v[0])) {
-      const dateValues = v.filter(row => 
-        Array.isArray(row) && row.length > 0 && 
-        !String(row[0]).toLowerCase().includes('due date') &&
-        String(row[0]).match(/\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4}|\d{2}-\d{2}-\d{4}/)
-      );
-      
-      if (dateValues.length > 0) {
-        dueDates.due_date = dateValues[0][0] || '';
-        dueDates.due_date_2 = dateValues[1] ? dateValues[1][0] : '';
-        dueDates.due_date_3 = dateValues[2] ? dateValues[2][0] : '';
-      }
-    } else {
-      // Regular array format - look for actual dates, not headers
-      const actualDates = v.filter(item => {
-        const str = String(item || '').toLowerCase();
-        return !str.includes('due date') && 
-               !str.includes('date') && 
-               str.match(/\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4}|\d{2}-\d{2}-\d{4}/);
-      });
-      
-      if (actualDates.length > 0) {
-        dueDates.due_date = actualDates[0] || '';
-        dueDates.due_date_2 = actualDates[1] || '';
-        dueDates.due_date_3 = actualDates[2] || '';
-      } else {
-        // Fallback to index-based if no dates found
-        dueDates.due_date = v[1] || '';
-        dueDates.due_date_2 = v[2] || '';
-        dueDates.due_date_3 = v[3] || '';
-      }
-    }
+    dueDates.due_date = v[1] || '';
+    dueDates.due_date_2 = v[2] || '';
+    dueDates.due_date_3 = v[3] || '';
   } else if (v?.tables && Array.isArray(v.tables[0]?.rows)) {
     const rows = v.tables[0].rows;
     dueDates.due_date = rows[1] || '';
@@ -889,35 +631,24 @@ function extractDueDatesFromField(raw6, requestId, pageIndex) {
     dueDates.due_date = String(v);
   }
   
-  log('info', 'DUE_DATES_EXTRACTED', {
-    requestId,
-    pageIndex,
-    extractedDueDates: dueDates
-  });
-  
   return dueDates;
 }
 
-// 🔧 UPDATED: Helper function to extract line items from a single page - ENHANCED FOR BETTER DATA EXTRACTION
+// 🔧 UPDATED: Helper function to extract line items from a single page - NOW WITH LINE NUMBER & PO SUPPORT
 function extractLineItemsFromPage(page, requestId, pageIndex) {
   const fields = page.fields || {};
+  const raw7 = fields['7'];  // Line items field
+  const raw11 = fields['11']; // PO Number field
   let itemsData = [];
   let poNumber = '';
   
-  log('info', 'EXTRACTING_LINE_ITEMS_START', {
-    requestId,
-    pageIndex,
-    availableFields: Object.keys(fields),
-    fieldsWithValues: Object.keys(fields).filter(key => fields[key]?.value)
-  });
-  
-  // Extract PO number from multiple possible fields
-  const raw11 = fields['11']; // Primary PO Number field
+  // Extract PO number from this page/section
   if (raw11) {
     const v = raw11?.value;
     if (typeof v === 'string' && v.startsWith('SP')) {
       poNumber = v.trim();
     } else if (Array.isArray(v) && v.length > 0) {
+      // Find first SP code in array
       const spCode = v.find(item => typeof item === 'string' && item.startsWith('SP'));
       poNumber = spCode || '';
     }
@@ -945,74 +676,38 @@ function extractLineItemsFromPage(page, requestId, pageIndex) {
     extractedFrom: raw11 ? 'field_11' : 'fallback_search'
   });
   
-  // Try multiple fields for line items data - be more aggressive in searching
-  const potentialItemFields = ['7', '8', '9', '10', '11', '12']; // Check more fields
-  
-  for (const fieldKey of potentialItemFields) {
-    const field = fields[fieldKey];
-    if (!field) continue;
-    
-    const v = field?.value;
-    
-    log('info', 'CHECKING_FIELD_FOR_ITEMS', {
-      requestId,
-      pageIndex,
-      fieldKey,
-      valueType: typeof v,
-      isArray: Array.isArray(v),
-      hasValue: !!v,
-      valuePreview: Array.isArray(v) ? `Array(${v.length})` : String(v).substring(0, 100)
-    });
+  // Extract line items (existing logic)
+  if (raw7) {
+    const v = raw7?.value;
     
     if (typeof v === 'string') {
       try {
-        const parsed = JSON.parse(v.trim());
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          itemsData = parsed;
-          log('info', 'ITEMS_FOUND_IN_STRING_FIELD', { requestId, pageIndex, fieldKey, itemCount: parsed.length });
-          break;
-        }
+        itemsData = JSON.parse(v.trim());
       } catch (e) {
-        // Not JSON, continue
+        log('error', 'JSON_PARSE_FAILED', { requestId, pageIndex, error: e.message });
       }
-    } else if (Array.isArray(v) && v.length > 0) {
-      // Check if this looks like line items data
-      const firstItem = v[0];
-      if (Array.isArray(firstItem) || (typeof firstItem === 'object' && firstItem !== null)) {
-        itemsData = v;
-        log('info', 'ITEMS_FOUND_IN_ARRAY_FIELD', { requestId, pageIndex, fieldKey, itemCount: v.length });
-        break;
-      }
+    } else if (Array.isArray(v)) {
+      itemsData = v;
     } else if (v?.tables && Array.isArray(v.tables[0]?.rows)) {
       itemsData = v.tables[0].rows;
-      log('info', 'ITEMS_FOUND_IN_TABLE_FIELD', { requestId, pageIndex, fieldKey, itemCount: v.tables[0].rows.length });
-      break;
-    } else if (v?.rows && Array.isArray(v.rows)) {
+    } else if (v?.rows) {
       itemsData = v.rows;
-      log('info', 'ITEMS_FOUND_IN_ROWS_FIELD', { requestId, pageIndex, fieldKey, itemCount: v.rows.length });
-      break;
-    } else if (field.tables?.[0]?.rows) {
-      itemsData = field.tables[0].rows;
-      log('info', 'ITEMS_FOUND_IN_FIELD_TABLE', { requestId, pageIndex, fieldKey, itemCount: field.tables[0].rows.length });
-      break;
-    } else if (field.rows) {
-      itemsData = field.rows;
-      log('info', 'ITEMS_FOUND_IN_FIELD_ROWS', { requestId, pageIndex, fieldKey, itemCount: field.rows.length });
-      break;
+    } else if (raw7.tables?.[0]?.rows) {
+      itemsData = raw7.tables[0].rows;
+    } else if (raw7.rows) {
+      itemsData = raw7.rows;
     }
   }
   
-  // If still no items found, do a comprehensive search through all fields
+  // Try to find line items in ANY field that contains arrays
   if (!Array.isArray(itemsData) || itemsData.length === 0) {
-    log('info', 'DOING_COMPREHENSIVE_SEARCH', { requestId, pageIndex });
-    
     Object.keys(fields).forEach(fieldKey => {
       const fieldValue = fields[fieldKey]?.value;
       if (Array.isArray(fieldValue) && fieldValue.length > 0 && itemsData.length === 0) {
         const firstItem = fieldValue[0];
         if (typeof firstItem === 'object' || Array.isArray(firstItem)) {
           itemsData = fieldValue;
-          log('info', 'LINE_ITEMS_FOUND_IN_COMPREHENSIVE_SEARCH', {
+          log('info', 'LINE_ITEMS_FOUND_IN_ALTERNATE_FIELD', {
             requestId,
             pageIndex,
             fieldKey,
@@ -1023,37 +718,11 @@ function extractLineItemsFromPage(page, requestId, pageIndex) {
     });
   }
   
-  if (!Array.isArray(itemsData) || itemsData.length === 0) {
-    log('warn', 'NO_LINE_ITEMS_FOUND_ON_PAGE', { 
-      requestId, 
-      pageIndex,
-      availableFields: Object.keys(fields).map(key => ({
-        key,
-        hasValue: !!fields[key]?.value,
-        valueType: typeof fields[key]?.value,
-        isArray: Array.isArray(fields[key]?.value)
-      }))
-    });
-    return [];
-  }
-  
-  log('info', 'RAW_ITEMS_DATA', {
-    requestId,
-    pageIndex,
-    itemsDataType: typeof itemsData,
-    itemsDataLength: itemsData.length,
-    firstItemSample: itemsData[0],
-    firstItemType: typeof itemsData[0]
-  });
-  
-  // 🔧 Filter out header rows before processing
-  const filteredItemsData = filterHeaderRows(itemsData, requestId, pageIndex);
-  
   const processedItems = [];
   
-  if (Array.isArray(filteredItemsData) && filteredItemsData.length > 0) {
-    filteredItemsData.forEach((row, rowIndex) => {
-      let lineNumber = '';
+  if (Array.isArray(itemsData) && itemsData.length > 0) {
+    itemsData.forEach((row, rowIndex) => {
+      let lineNumber = '';    // 🔧 NEW: Extract line number
       let itemNumber = '';
       let unitCost = 0;
       let quantity = 0;
@@ -1061,34 +730,14 @@ function extractLineItemsFromPage(page, requestId, pageIndex) {
       let itemPoNumber = '';
       
       if (Array.isArray(row)) {
-        // Extract from array format - be flexible about column positions
-        lineNumber = String(row[0] || '').trim();
+        lineNumber = String(row[0] || '').trim();  // 🔧 NEW: Line number from first column
         itemNumber = String(row[1] || '').trim();
         unitCost = parseFloat(row[2]) || 0;
         quantity = parseFloat(row[3]) || 0;
         description = String(row[4] || '').trim();
-        itemPoNumber = String(row[5] || '').trim();
-        
-        // Alternative column mapping if first attempt doesn't work
-        if (!lineNumber && !itemNumber && row.length > 0) {
-          // Maybe line number is not in first column, try to find it
-          for (let i = 0; i < Math.min(row.length, 3); i++) {
-            const cellValue = String(row[i] || '').trim();
-            if (cellValue && !isNaN(parseInt(cellValue)) && parseInt(cellValue) > 0) {
-              lineNumber = cellValue;
-              itemNumber = String(row[i + 1] || '').trim();
-              if (i < row.length - 2) {
-                unitCost = parseFloat(row[i + 2]) || unitCost;
-                quantity = parseFloat(row[i + 3]) || quantity;
-                description = String(row[i + 4] || '').trim() || description;
-              }
-              break;
-            }
-          }
-        }
-        
+        itemPoNumber = String(row[5] || '').trim(); // PO from 6th column if available
       } else if (typeof row === 'object' && row !== null) {
-        // Extract from object format - handle your specific format
+        // 🔧 NEW: Extract line number from object properties
         lineNumber = String(row['Line Number'] || row.line_number || row.lineNumber || row.line || '').trim();
         itemNumber = String(row['Item Number'] || row.item_number || row.itemNumber || row.number || row.item || row.Item || '').trim();
         unitCost = parseFloat(row['Unit Cost'] || row.unit_cost || row.unitCost || row.cost || row.price || 0);
@@ -1096,22 +745,20 @@ function extractLineItemsFromPage(page, requestId, pageIndex) {
         description = String(row.Description || row.description || row.desc || row.item_description || '').trim();
         itemPoNumber = String(row['PO Number'] || row.po_number || row.poNumber || row.po || '').trim();
         
-        // Handle null PO Numbers in your data
+        // Handle null PO Numbers
         if (itemPoNumber === 'null' || !itemPoNumber) {
           itemPoNumber = '';
         }
       } else {
-        // Fallback: treat the whole row as line number
         lineNumber = String(row || '').trim();
       }
       
       // Use item-specific PO if available, otherwise use page-level PO
       const finalPoNumber = itemPoNumber || poNumber;
       
-      // Be more lenient about what constitutes a valid line item
-      if (lineNumber || itemNumber || description || (unitCost > 0) || (quantity > 0)) {
-        const processedItem = {
-          line_number: lineNumber || `${rowIndex + 1}`,
+      if (lineNumber || itemNumber || (unitCost > 0) || (quantity > 0)) {
+        processedItems.push({
+          line_number: lineNumber || `Item ${rowIndex + 1}`,  // 🔧 NEW: Include line number
           item_number: itemNumber || `Item ${rowIndex + 1}`,
           description: description,
           quantity: quantity,
@@ -1119,122 +766,12 @@ function extractLineItemsFromPage(page, requestId, pageIndex) {
           amount: quantity * unitCost,
           source_page: pageIndex + 1,
           po_number: finalPoNumber
-        };
-        
-        processedItems.push(processedItem);
-        
-        log('info', 'LINE_ITEM_PROCESSED', {
-          requestId,
-          pageIndex,
-          rowIndex,
-          processedItem
         });
       }
     });
   }
   
-  log('info', 'LINE_ITEMS_EXTRACTION_COMPLETE', {
-    requestId,
-    pageIndex,
-    originalItemCount: itemsData.length,
-    filteredItemCount: filteredItemsData.length,
-    processedItemCount: processedItems.length
-  });
-  
   return processedItems;
-}
-
-// 🔧 NEW: Function to filter out header rows from line items data
-function filterHeaderRows(itemsData, requestId, pageIndex) {
-  if (!Array.isArray(itemsData) || itemsData.length === 0) {
-    return itemsData;
-  }
-
-  const filteredData = [];
-  let headerRowsRemoved = 0;
-
-  for (let i = 0; i < itemsData.length; i++) {
-    const row = itemsData[i];
-    let isHeaderRow = false;
-
-    if (Array.isArray(row)) {
-      // Check if this row looks like a header row
-      const rowStr = row.map(cell => String(cell || '').toLowerCase().trim()).join(' ');
-      
-      // Common header patterns to detect
-      const headerPatterns = [
-        /line.*number.*item.*quantity.*cost/,
-        /item.*number.*description.*qty.*price/,
-        /line.*item.*desc.*quantity.*unit/,
-        /^line\s*item\s*qty\s*cost/,
-        /^line.*qty.*unit.*cost/,
-        /number.*description.*quantity.*amount/,
-        /item.*qty.*unit.*total/
-      ];
-
-      // Check if row contains mostly header-like text
-      isHeaderRow = headerPatterns.some(pattern => pattern.test(rowStr));
-
-      // Additional check: if first cell looks like "Line Number" or "Item Number" etc.
-      const firstCell = String(row[0] || '').toLowerCase().trim();
-      if (firstCell.includes('line') && firstCell.includes('number') ||
-          firstCell.includes('item') && firstCell.includes('number') ||
-          firstCell === 'line' || firstCell === 'item' ||
-          firstCell === 'qty' || firstCell === 'quantity' ||
-          firstCell === 'description' || firstCell === 'desc') {
-        isHeaderRow = true;
-      }
-
-      // Check if the row has all text and no numbers (typical of headers)
-      const hasNumericValues = row.some(cell => {
-        const cellStr = String(cell || '').trim();
-        return cellStr && !isNaN(parseFloat(cellStr)) && parseFloat(cellStr) > 0;
-      });
-
-      if (!hasNumericValues && row.some(cell => {
-        const cellStr = String(cell || '').toLowerCase();
-        return cellStr.includes('line') || cellStr.includes('item') || 
-               cellStr.includes('qty') || cellStr.includes('cost') || 
-               cellStr.includes('description') || cellStr.includes('amount');
-      })) {
-        isHeaderRow = true;
-      }
-
-    } else if (typeof row === 'object' && row !== null) {
-      // For object format, check if values look like header text
-      const values = Object.values(row).map(v => String(v || '').toLowerCase().trim());
-      const valuesStr = values.join(' ');
-      
-      if (valuesStr.includes('line number') || valuesStr.includes('item number') ||
-          valuesStr.includes('description') || valuesStr.includes('quantity') ||
-          valuesStr.includes('unit cost') || valuesStr.includes('amount')) {
-        isHeaderRow = true;
-      }
-    }
-
-    if (isHeaderRow) {
-      headerRowsRemoved++;
-      log('info', 'HEADER_ROW_FILTERED', {
-        requestId,
-        pageIndex,
-        rowIndex: i,
-        rowContent: Array.isArray(row) ? row.slice(0, 3) : Object.keys(row).slice(0, 3),
-        reason: 'Detected as header row'
-      });
-    } else {
-      filteredData.push(row);
-    }
-  }
-
-  log('info', 'HEADER_FILTERING_COMPLETE', {
-    requestId,
-    pageIndex,
-    originalRowCount: itemsData.length,
-    filteredRowCount: filteredData.length,
-    headerRowsRemoved
-  });
-
-  return filteredData;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1485,7 +1022,7 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
   }
 }
 
-// 🔧 UPDATED: Subitem creation function with Line Number support (instead of auto-increment)
+// 🔧 UPDATED: Subitem creation function with Line Number support (uses extracted line numbers)
 async function createSubitemsForLineItems(parentItemId, items, columns, requestId) {
   try {
     log('info', 'SUBITEM_CREATION_START', { requestId, parentItemId, lineItemCount: items.length });
@@ -1548,13 +1085,13 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
       const { line_number, item_number, quantity, unit_cost, description, source_page, po_number } = items[i];
       const columnValues = {};
       
-      // 🔧 UPDATED: Use extracted line_number instead of auto-increment
+      // 🔧 NEW: Use extracted line_number for subitem indexing
       const actualLineNumber = line_number || `${i + 1}`;
       
       subitemColumns.forEach(col => {
         const title = col.title.trim().toLowerCase();
         
-        // 🔧 UPDATED: Map to Line Number column using extracted value
+        // 🔧 NEW: Map to Line Number column using extracted value
         if (title.includes('line number') || title.includes('line #') || title.includes('subitem') || title === 'index') {
           if (col.type === 'numbers') {
             // Try to parse as number, fallback to string index if not numeric
@@ -1595,7 +1132,7 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
         columnValues
       });
 
-      // 🔧 UPDATED: Use extracted line number in subitem name
+      // 🔧 NEW: Use extracted line number in subitem name
       const subitemName = `Line ${actualLineNumber}`;
       const escapedName = subitemName.replace(/"/g, '\\"');
       const columnValuesJson = JSON.stringify(columnValues);
@@ -1783,7 +1320,7 @@ app.get('/health', (req, res) => {
     ok: true, 
     timestamp: new Date().toISOString(),
     service: 'digital-mailroom-webhook',
-    version: '4.3.0-header-filtering'
+    version: '4.1.1-line-number-support'
   });
 });
 
@@ -1804,7 +1341,7 @@ app.post('/test/process-item/:id', async (req, res) => {
     
     res.json({ 
       success: true, 
-      message: 'Processing completed with multi-page reconstruction, PO number support, line number indexing, and header filtering',
+      message: 'Processing completed with multi-page reconstruction, PO number support, and line number indexing',
       requestId,
       instabaseRunId: runId,
       filesProcessed: files.length,
@@ -1818,7 +1355,7 @@ app.post('/test/process-item/:id', async (req, res) => {
         lineItemCount: g.items?.length || 0,
         totalAmount: g.total_amount,
         itemsWithPO: g.items?.filter(item => item.po_number).length || 0,
-        lineNumbers: g.items?.map(item => item.line_number) || []  // NEW: Show extracted line numbers
+        lineNumbers: g.items?.map(item => item.line_number) || []  // Show extracted line numbers
       }))
     });
   } catch (error) {
@@ -1832,12 +1369,12 @@ app.post('/test/process-item/:id', async (req, res) => {
 // ----------------------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Digital Mailroom Webhook Server v4.3.0-header-filtering`);
+  console.log(`🚀 Digital Mailroom Webhook Server v4.1.1-line-number-support`);
   console.log(`📡 Listening on port ${PORT}`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
   console.log(`🧪 Test endpoint: POST /test/process-item/:id`);
   console.log(`📅 Started at: ${new Date().toISOString()}`);
-  console.log(`🔧 Features: Multi-page document reconstruction, smart page merging, PO number tracking, extracted line number indexing, header row filtering`);
+  console.log(`🔧 Features: Multi-page document reconstruction, smart page merging, PO number tracking, line number indexing`);
 });
 
 // -----------------------------------------------------------------------------
@@ -1855,8 +1392,7 @@ app.listen(PORT, '0.0.0.0', () => {
 //  11. ✅ PO Number extraction and tracking for each line item
 //  12. ✅ SP code detection and fallback search mechanisms
 //  13. ✅ Enhanced subitem creation with PO number support
-//  14. ✅ NEW: Line Number extraction from Instabase data
-//  15. ✅ NEW: Use extracted Line Numbers for subitem indexing instead of auto-increment
-//  16. ✅ NEW: Robust line number parsing from array/object structures
-//  17. ✅ NEW: Fallback to auto-increment only when line number is missing
+//  14. ✅ NEW: Line Number extraction and indexing for subitems
+//  15. ✅ NEW: Use extracted Line Numbers as subitem names (Line 40, Line 60, etc.)
+//  16. ✅ NEW: Support for both array and object formats from Instabase
 // -----------------------------------------------------------------------------
