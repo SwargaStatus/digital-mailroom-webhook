@@ -16,11 +16,11 @@ app.use(express.json());
 // ----------------------------------------------------------------------------
 const INSTABASE_CONFIG = {
   baseUrl:       'https://aihub.instabase.com',
-  apiKey:        'jEmrseIwOb9YtmJ6GzPAywtz53KnpS',
-  deploymentId:  '0197a3fe-599d-7bac-a34b-81704cc83beb',
+  apiKey:        'b1qiTmzarVHmCoX3UQY9KANvz6a8xp',
+  deploymentId:  '2d4ebb2a-8461-495e-9466-ca92ce4f7b81',
   headers: {
-    'IB-Context':   'sturgeontire',
-    'Authorization': 'Bearer jEmrseIwOb9YtmJ6GzPAywtz53KnpS',
+    'IB-Context':   'STU',
+    'Authorization': 'Bearer b1qiTmzarVHmCoX3UQY9KANvz6a8xp',
     'Content-Type':  'application/json'
   }
 };
@@ -214,7 +214,7 @@ async function processFilesWithInstabase(files, requestId) {
     
     // Create batch
     const batchRes = await axios.post(`${INSTABASE_CONFIG.baseUrl}/api/v2/batches`,
-                                     { workspace:'nileshn_sturgeontire.com' },
+                                     { workspace:'My workspace' },
                                      { headers: INSTABASE_CONFIG.headers });
     const batchId = batchRes.data.id;
     log('info', 'BATCH_CREATED', { requestId, batchId });
