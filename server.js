@@ -504,7 +504,7 @@ async function processFilesWithInstabase(files, requestId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6️⃣  FIXED GROUPING - Recognizes Multiple Invoices in Same PDF
+// 6️⃣  STRICT GROUPING - Ensures Invoice # on Line Matches Attached Document
 // ----------------------------------------------------------------------------
 function groupPagesByInvoiceNumber(extractedFiles, requestId) {
   log('info', 'GROUPING_START', { 
@@ -519,7 +519,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
     return [];
   }
   
-  // 🔧 FIXED: Track actual PDF page numbers, not document indices
+  // Strictly group by invoice number
   extractedFiles.forEach((file, fileIndex) => {
     log('info', 'PROCESSING_FILE', { 
       requestId, 
@@ -534,53 +534,38 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
     
     file.documents.forEach((doc, docIndex) => {
       const fields = doc.fields || {};
-      
-      // 🔧 CRITICAL: Get the actual page number from Instabase
-      const actualPageNumber = doc.page_num || docIndex; // Use page_num if available, fallback to docIndex
-      
-      // Extract invoice number from each page
+      const actualPageNumber = doc.page_num || docIndex;
       let invoiceNumber = fields['0']?.value;
-      
-      // Clean up invoice number
-      if (invoiceNumber && 
-          invoiceNumber !== 'unknown' && 
-          invoiceNumber !== 'none' && 
-          invoiceNumber !== '') {
-        
+      if (invoiceNumber && invoiceNumber !== 'unknown' && invoiceNumber !== 'none' && invoiceNumber !== '') {
         const cleanInvoiceNumber = String(invoiceNumber).trim();
-        
         if (!documentGroups[cleanInvoiceNumber]) {
           documentGroups[cleanInvoiceNumber] = {
             invoice_number: cleanInvoiceNumber,
             pages: [],
-            pageIndices: [], // Track actual PDF page numbers
+            pageIndices: [],
             fileName: file.original_file_name,
             masterPage: null
           };
         }
-        
+        // Only add this page to this invoice group
         const pageData = {
           fileIndex,
           docIndex,
-          actualPageNumber, // 🔧 NEW: Store the actual page number
+          actualPageNumber,
           fields,
           fileName: file.original_file_name,
           invoiceNumber: cleanInvoiceNumber
         };
-        
         documentGroups[cleanInvoiceNumber].pages.push(pageData);
-        documentGroups[cleanInvoiceNumber].pageIndices.push(actualPageNumber); // 🔧 FIXED: Use actual page number
-        
-        // Set first page with this invoice number as master
+        documentGroups[cleanInvoiceNumber].pageIndices.push(actualPageNumber);
         if (!documentGroups[cleanInvoiceNumber].masterPage) {
           documentGroups[cleanInvoiceNumber].masterPage = pageData;
         }
-        
         log('info', 'PAGE_GROUPED_BY_INVOICE', {
           requestId,
           invoiceNumber: cleanInvoiceNumber,
           docIndex: docIndex,
-          actualPageNumber: actualPageNumber, // 🔧 NEW: Log both for debugging
+          actualPageNumber: actualPageNumber,
           fileName: file.original_file_name
         });
       } else {
@@ -594,23 +579,19 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
       }
     });
   });
-  
   log('info', 'INVOICES_GROUPED', {
     requestId,
     invoiceNumbers: Object.keys(documentGroups),
     groupsByInvoice: Object.keys(documentGroups).map(invoiceNum => ({
       invoiceNumber: invoiceNum,
       pageCount: documentGroups[invoiceNum].pages.length,
-      pageIndices: documentGroups[invoiceNum].pageIndices // 🔧 NEW: Show actual page numbers
+      pageIndices: documentGroups[invoiceNum].pageIndices
     }))
   });
-  
-  // Create reconstructed documents with correct page indices
+  // Create reconstructed documents with correct page indices and strict line item filtering
   const resultGroups = [];
-  
   Object.keys(documentGroups).forEach(invoiceNumber => {
     const group = documentGroups[invoiceNumber];
-    
     if (group.masterPage && group.pages.length > 0) {
       log('info', 'RECONSTRUCTING_INVOICE', {
         requestId,
@@ -618,21 +599,20 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
         pageCount: group.pages.length,
         pageIndices: group.pageIndices
       });
-      
+      // Strictly filter pages and line items for this invoice only
+      const filteredPages = group.pages.filter(p => p.invoiceNumber === invoiceNumber);
       const reconstructedDocument = reconstructSingleInvoiceDocument(
-        group.pages, 
+        filteredPages, 
         group.masterPage, 
         requestId, 
         group.fileName,
         invoiceNumber
       );
-      
       if (reconstructedDocument) {
-        // 🔧 FIXED: Add correct page indices to the document
-        reconstructedDocument.pageIndices = group.pageIndices;
+        reconstructedDocument.pageIndices = filteredPages.map(p => p.actualPageNumber);
         reconstructedDocument.debugInfo = {
           originalFileName: group.fileName,
-          pageMapping: group.pages.map(p => ({
+          pageMapping: filteredPages.map(p => ({
             invoiceNumber: p.invoiceNumber,
             docIndex: p.docIndex,
             actualPageNumber: p.actualPageNumber
@@ -642,11 +622,10 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
       }
     }
   });
-  
   return resultGroups;
 }
 
-// 🔧 UPDATED: Reconstruct single invoice (not multi-page merger)
+// Update reconstructSingleInvoiceDocument to only use the filtered pages for line items
 function reconstructSingleInvoiceDocument(pages, masterPage, requestId, filename, invoiceNumber) {
   log('info', 'RECONSTRUCTING_SINGLE_INVOICE', {
     requestId,
@@ -654,23 +633,16 @@ function reconstructSingleInvoiceDocument(pages, masterPage, requestId, filename
     pageCount: pages.length,
     filename
   });
-  
   const masterFields = masterPage.fields;
-  
-  // Extract basic info from master page
   const documentType = masterFields['1']?.value || 'invoice';
   const supplier = masterFields['2']?.value || '';
   const documentDate = masterFields['3']?.value || '';
   const referenceNumber = masterFields['8']?.value || '';
-  
-  // Extract due dates from field 4
   let mergedDueDates = { due_date: '', due_date_2: '', due_date_3: '' };
-  
   pages.forEach((page, pageIndex) => {
     const raw4 = page.fields['4'];
     if (raw4) {
       const dueDates = extractDueDatesFromField(raw4, requestId, pageIndex);
-      
       if (dueDates.due_date && !mergedDueDates.due_date) {
         mergedDueDates.due_date = dueDates.due_date;
       }
@@ -682,47 +654,34 @@ function reconstructSingleInvoiceDocument(pages, masterPage, requestId, filename
       }
     }
   });
-  
-  // Extract line items from field 5 - ONLY from pages with THIS invoice number
+  // Only extract line items from these pages
   const allLineItems = [];
-  
   pages.forEach((page, pageIndex) => {
-    // Only process pages that belong to this specific invoice
-    if (page.invoiceNumber === invoiceNumber) {
-      const pageItems = extractLineItemsFromPage(page, requestId, pageIndex);
-      if (pageItems.length > 0) {
-        allLineItems.push(...pageItems);
-        log('info', 'ITEMS_FOUND_FOR_INVOICE', {
-          requestId,
-          invoiceNumber,
-          pageIndex,
-          itemCount: pageItems.length
-        });
-      }
+    const pageItems = extractLineItemsFromPage(page, requestId, pageIndex);
+    if (pageItems.length > 0) {
+      allLineItems.push(...pageItems);
+      log('info', 'ITEMS_FOUND_FOR_INVOICE', {
+        requestId,
+        invoiceNumber,
+        pageIndex,
+        itemCount: pageItems.length
+      });
     }
   });
-  
-  // Find totals from field 6 and tax from field 7 - ONLY from this invoice's pages
   let totalAmount = 0;
   let taxAmount = 0;
-  
   for (const page of pages) {
-    if (page.invoiceNumber === invoiceNumber) {
-      const pageTotalAmount = page.fields['6']?.value;
-      const pageTaxAmount = page.fields['7']?.value;
-      
-      if (pageTotalAmount && !totalAmount) {
-        const totalStr = String(pageTotalAmount).replace(/[^0-9.-]/g, '');
-        totalAmount = parseFloat(totalStr) || 0;
-      }
-      
-      if (pageTaxAmount && !taxAmount) {
-        const taxStr = String(pageTaxAmount).replace(/[^0-9.-]/g, '');
-        taxAmount = parseFloat(taxStr) || 0;
-      }
+    const pageTotalAmount = page.fields['6']?.value;
+    const pageTaxAmount = page.fields['7']?.value;
+    if (pageTotalAmount && !totalAmount) {
+      const totalStr = String(pageTotalAmount).replace(/[^0-9.-]/g, '');
+      totalAmount = parseFloat(totalStr) || 0;
+    }
+    if (pageTaxAmount && !taxAmount) {
+      const taxStr = String(pageTaxAmount).replace(/[^0-9.-]/g, '');
+      taxAmount = parseFloat(taxStr) || 0;
     }
   }
-  
   const reconstructedDocument = {
     invoice_number: invoiceNumber,
     document_type: documentType,
@@ -735,14 +694,13 @@ function reconstructSingleInvoiceDocument(pages, masterPage, requestId, filename
     due_date_2: mergedDueDates.due_date_2,
     due_date_3: mergedDueDates.due_date_3,
     terms: '',
-    items: allLineItems,
-    pages: pages.filter(p => p.invoiceNumber === invoiceNumber),
+    items: allLineItems, // Only line items for this invoice
+    pages: pages,
     confidence: 0,
     isMultiPageReconstruction: false,
-    originalPageCount: pages.filter(p => p.invoiceNumber === invoiceNumber).length,
-    reconstructionStrategy: 'invoice_number_based_grouping'
+    originalPageCount: pages.length,
+    reconstructionStrategy: 'invoice_number_based_grouping_strict'
   };
-  
   log('info', 'SINGLE_INVOICE_RECONSTRUCTION_COMPLETE', {
     requestId,
     invoiceNumber,
@@ -751,7 +709,6 @@ function reconstructSingleInvoiceDocument(pages, masterPage, requestId, filename
     lineItemCount: allLineItems.length,
     pageCount: reconstructedDocument.originalPageCount
   });
-  
   return reconstructedDocument;
 }
 
