@@ -17,11 +17,11 @@ app.use(express.json());
 // ----------------------------------------------------------------------------
 const INSTABASE_CONFIG = {
   baseUrl:       'https://aihub.instabase.com',
-  apiKey:        'b1qiTmzarVHmCoX3UQY9KANvz6a8xp',
+  apiKey:        'GTovDkdhQjNTbSUQ1Nh201xvZvmM00',
   deploymentId:  '01980ed0-7584-7e30-aad8-2b286de010f4',
   headers: {
     'IB-Context':   'STU',
-    'Authorization': 'Bearer b1qiTmzarVHmCoX3UQY9KANvz6a8xp',
+    'Authorization': 'Bearer GTovDkdhQjNTbSUQ1Nh201xvZvmM00',
     'Content-Type':  'application/json'
   }
 };
@@ -236,13 +236,39 @@ async function processFilesWithInstabase(files, requestId) {
       log('info', 'FILE_UPLOADED', { requestId, fileName: f.name });
     }
 
-    // Start processing run
+    // Start processing run with enhanced error logging
     log('info', 'STARTING_PROCESSING', { requestId, batchId });
-    const runResponse = await axios.post(
-      `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/deployments/${INSTABASE_CONFIG.deploymentId}/runs`,
-      { batch_id: batchId },
-      { headers: INSTABASE_CONFIG.headers }
-    );
+    
+    // 🔧 NEW: Log the exact URL and payload we're sending
+    const runUrl = `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/deployments/${INSTABASE_CONFIG.deploymentId}/runs`;
+    const runPayload = { batch_id: batchId };
+    
+    log('info', 'PROCESSING_REQUEST_DETAILS', {
+      requestId,
+      url: runUrl,
+      payload: runPayload,
+      headers: INSTABASE_CONFIG.headers,
+      deploymentId: INSTABASE_CONFIG.deploymentId
+    });
+    
+    let runResponse;
+    try {
+      runResponse = await axios.post(runUrl, runPayload, { headers: INSTABASE_CONFIG.headers });
+    } catch (runError) {
+      // 🔧 NEW: Enhanced error logging to see exactly what Instabase returns
+      log('error', 'PROCESSING_RUN_ERROR_DETAILS', {
+        requestId,
+        status: runError.response?.status,
+        statusText: runError.response?.statusText,
+        responseData: runError.response?.data,
+        responseHeaders: runError.response?.headers,
+        requestUrl: runUrl,
+        requestPayload: runPayload,
+        requestHeaders: INSTABASE_CONFIG.headers
+      });
+      
+      throw new Error(`Instabase processing run failed: ${runError.response?.status} - ${JSON.stringify(runError.response?.data)}`);
+    }
     
     const runId = runResponse.data.id;
     log('info', 'RUN_STARTED', { requestId, runId });
