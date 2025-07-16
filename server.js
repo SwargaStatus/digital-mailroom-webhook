@@ -1,3 +1,4 @@
+
 // Digital Mailroom Webhook — FINAL VERSION with Updated Field Mapping + Line Number Support
 // -----------------------------------------------------------------------------
 // This version works with the updated Instabase field mapping (page type field removed)
@@ -214,7 +215,7 @@ async function processFilesWithInstabase(files, requestId) {
     
     // Create batch
     const batchRes = await axios.post(`${INSTABASE_CONFIG.baseUrl}/api/v2/batches`,
-                                     { workspace:'My workspace' },
+                                     { workspace:'nilesh.narendran_yahoo.com' },
                                      { headers: INSTABASE_CONFIG.headers });
     const batchId = batchRes.data.id;
     log('info', 'BATCH_CREATED', { requestId, batchId });
