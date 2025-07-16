@@ -326,7 +326,7 @@ async function processFilesWithInstabase(files, requestId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6️⃣  ENHANCED GROUPING WITH INTELLIGENT MULTI-PAGE DOCUMENT MERGING
+// 6️⃣  FIXED GROUPING - Recognizes Multiple Invoices in Same PDF
 // ----------------------------------------------------------------------------
 function groupPagesByInvoiceNumber(extractedFiles, requestId) {
   log('info', 'GROUPING_START', { 
@@ -341,9 +341,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
     return [];
   }
   
-  // 🔧 NEW: First pass - collect all pages by filename
-  const pagesByFilename = {};
-  
+  // 🔧 FIXED: Group by INVOICE NUMBER, not filename
   extractedFiles.forEach((file, fileIndex) => {
     log('info', 'PROCESSING_FILE', { 
       requestId, 
@@ -356,167 +354,143 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
       return;
     }
     
-    // Group pages by filename
-    if (!pagesByFilename[file.original_file_name]) {
-      pagesByFilename[file.original_file_name] = [];
-    }
-    
     file.documents.forEach((doc, docIndex) => {
       const fields = doc.fields || {};
       
-      pagesByFilename[file.original_file_name].push({
-        fileIndex,
-        docIndex,
-        fields,
-        fileName: file.original_file_name
-      });
+      // 🔧 FIXED: Extract invoice number from each page
+      let invoiceNumber = fields['0']?.value;
+      
+      // Clean up invoice number
+      if (invoiceNumber && 
+          invoiceNumber !== 'unknown' && 
+          invoiceNumber !== 'none' && 
+          invoiceNumber !== '') {
+        
+        // Use the actual invoice number as the key
+        const cleanInvoiceNumber = String(invoiceNumber).trim();
+        
+        if (!documentGroups[cleanInvoiceNumber]) {
+          documentGroups[cleanInvoiceNumber] = {
+            invoice_number: cleanInvoiceNumber,
+            pages: [],
+            fileName: file.original_file_name,
+            masterPage: null
+          };
+        }
+        
+        const pageData = {
+          fileIndex,
+          docIndex,
+          fields,
+          fileName: file.original_file_name,
+          invoiceNumber: cleanInvoiceNumber
+        };
+        
+        documentGroups[cleanInvoiceNumber].pages.push(pageData);
+        
+        // Set first page with this invoice number as master
+        if (!documentGroups[cleanInvoiceNumber].masterPage) {
+          documentGroups[cleanInvoiceNumber].masterPage = pageData;
+        }
+        
+        log('info', 'PAGE_GROUPED_BY_INVOICE', {
+          requestId,
+          invoiceNumber: cleanInvoiceNumber,
+          pageIndex: docIndex,
+          fileName: file.original_file_name
+        });
+      } else {
+        log('warn', 'NO_INVOICE_NUMBER_ON_PAGE', {
+          requestId,
+          fileIndex,
+          docIndex,
+          availableFields: Object.keys(fields)
+        });
+      }
     });
   });
   
-  log('info', 'PAGES_GROUPED_BY_FILENAME', {
+  log('info', 'INVOICES_GROUPED', {
     requestId,
-    filenames: Object.keys(pagesByFilename),
-    pagesByFile: Object.keys(pagesByFilename).map(filename => ({
-      filename,
-      pageCount: pagesByFilename[filename].length
+    invoiceNumbers: Object.keys(documentGroups),
+    groupsByInvoice: Object.keys(documentGroups).map(invoiceNum => ({
+      invoiceNumber: invoiceNum,
+      pageCount: documentGroups[invoiceNum].pages.length
     }))
   });
   
-  // 🔧 NEW: Second pass - intelligent document reconstruction
-  Object.keys(pagesByFilename).forEach(filename => {
-    const pages = pagesByFilename[filename];
+  // 🔧 FIXED: Reconstruct each invoice separately
+  const resultGroups = [];
+  
+  Object.keys(documentGroups).forEach(invoiceNumber => {
+    const group = documentGroups[invoiceNumber];
     
-    log('info', 'RECONSTRUCTING_DOCUMENT', {
-      requestId,
-      filename,
-      totalPages: pages.length
-    });
-    
-    // Find the page with the invoice number (usually page 1, but not always)
-    let masterPage = null;
-    let invoiceNumber = null;
-    
-    // Strategy 1: Look for explicit invoice number
-    for (const page of pages) {
-      const candidateInvoiceNumber = page.fields['0']?.value;
-      if (candidateInvoiceNumber && 
-          candidateInvoiceNumber !== 'unknown' && 
-          candidateInvoiceNumber !== 'none' && 
-          candidateInvoiceNumber !== '') {
-        masterPage = page;
-        invoiceNumber = candidateInvoiceNumber;
-        log('info', 'FOUND_INVOICE_NUMBER', {
-          requestId,
-          filename,
-          invoiceNumber,
-          pageIndex: pages.indexOf(page)
-        });
-        break;
-      }
-    }
-    
-    // Strategy 2: If no invoice number found, use filename as identifier
-    if (!invoiceNumber) {
-      // Extract potential invoice number from filename
-      const filenameMatch = filename.match(/(\d{8,})/); // Look for 8+ digit numbers
-      if (filenameMatch) {
-        invoiceNumber = filenameMatch[1];
-        masterPage = pages[0]; // Use first page as master
-        log('info', 'EXTRACTED_INVOICE_FROM_FILENAME', {
-          requestId,
-          filename,
-          extractedInvoiceNumber: invoiceNumber
-        });
-      } else {
-        // Fallback: use filename without extension
-        invoiceNumber = filename.replace(/\.[^/.]+$/, "");
-        masterPage = pages[0];
-        log('info', 'USING_FILENAME_AS_INVOICE', {
-          requestId,
-          filename,
-          invoiceNumber
-        });
-      }
-    }
-    
-    if (!masterPage) {
-      log('warn', 'NO_MASTER_PAGE_FOUND', { requestId, filename });
-      return;
-    }
-    
-    // 🔧 NEW: Merge all pages for this document
-    const mergedDocument = reconstructMultiPageDocument(pages, masterPage, requestId, filename);
-    
-    if (mergedDocument) {
-      documentGroups[invoiceNumber] = mergedDocument;
-      log('info', 'DOCUMENT_RECONSTRUCTED', {
+    if (group.masterPage && group.pages.length > 0) {
+      log('info', 'RECONSTRUCTING_INVOICE', {
         requestId,
         invoiceNumber,
-        filename,
-        totalPages: pages.length,
-        lineItemCount: mergedDocument.items?.length || 0,
-        totalAmount: mergedDocument.total_amount
+        pageCount: group.pages.length
       });
+      
+      const reconstructedDocument = reconstructSingleInvoiceDocument(
+        group.pages, 
+        group.masterPage, 
+        requestId, 
+        group.fileName,
+        invoiceNumber
+      );
+      
+      if (reconstructedDocument) {
+        resultGroups.push(reconstructedDocument);
+        log('info', 'INVOICE_RECONSTRUCTED', {
+          requestId,
+          invoiceNumber,
+          totalAmount: reconstructedDocument.total_amount,
+          lineItemCount: reconstructedDocument.items?.length || 0
+        });
+      }
     }
   });
   
-  const resultGroups = Object.values(documentGroups);
   log('info', 'GROUPING_COMPLETE', {
     requestId,
-    groupCount: resultGroups.length,
-    groupsWithItems: resultGroups.filter(g => g.items.length > 0).length
-  });
-  
-  resultGroups.forEach(group => {
-    log('info', 'GROUP_SUMMARY', {
-      requestId,
-      invoiceNumber: group.invoice_number,
-      pageCount: group.pages.length,
-      itemCount: group.items.length,
-      totalAmount: group.total_amount
-    });
+    totalInvoices: resultGroups.length,
+    invoicesWithItems: resultGroups.filter(g => g.items.length > 0).length,
+    summary: resultGroups.map(g => ({
+      invoiceNumber: g.invoice_number,
+      totalAmount: g.total_amount,
+      itemCount: g.items.length
+    }))
   });
   
   return resultGroups;
 }
 
-// 🔧 UPDATED: Function to intelligently reconstruct multi-page documents - UPDATED FIELD MAPPING
-function reconstructMultiPageDocument(pages, masterPage, requestId, filename) {
-  log('info', 'RECONSTRUCTING_MULTI_PAGE_DOC', {
+// 🔧 UPDATED: Reconstruct single invoice (not multi-page merger)
+function reconstructSingleInvoiceDocument(pages, masterPage, requestId, filename, invoiceNumber) {
+  log('info', 'RECONSTRUCTING_SINGLE_INVOICE', {
     requestId,
-    filename,
+    invoiceNumber,
     pageCount: pages.length,
-    masterPageIndex: pages.indexOf(masterPage)
+    filename
   });
   
   const masterFields = masterPage.fields;
   
-  // 🔧 UPDATED: Extract basic info from master page with NEW field mapping (page type removed)
-  const invoiceNumber = masterFields['0']?.value || filename.replace(/\.[^/.]+$/, "");
-  const documentType = masterFields['1']?.value || 'invoice';  // Moved from field 2 to 1
-  const supplier = masterFields['2']?.value || '';             // Moved from field 3 to 2
-  const documentDate = masterFields['3']?.value || '';         // Moved from field 5 to 3
-  const referenceNumber = masterFields['8']?.value || '';      // Reference number now in field 8
+  // Extract basic info from master page
+  const documentType = masterFields['1']?.value || 'invoice';
+  const supplier = masterFields['2']?.value || '';
+  const documentDate = masterFields['3']?.value || '';
+  const referenceNumber = masterFields['8']?.value || '';
   
-  log('info', 'BASIC_INFO_EXTRACTED', {
-    requestId,
-    filename,
-    invoiceNumber,
-    documentType,
-    supplier,
-    documentDate,
-    referenceNumber
-  });
-  
-  // 🔧 UPDATED: Merge due dates from field 4 (was field 6)
+  // Extract due dates from field 4
   let mergedDueDates = { due_date: '', due_date_2: '', due_date_3: '' };
   
   pages.forEach((page, pageIndex) => {
-    const raw4 = page.fields['4'];  // Due date moved from field 6 to field 4
+    const raw4 = page.fields['4'];
     if (raw4) {
       const dueDates = extractDueDatesFromField(raw4, requestId, pageIndex);
       
-      // Merge due dates (keep first non-empty value found)
       if (dueDates.due_date && !mergedDueDates.due_date) {
         mergedDueDates.due_date = dueDates.due_date;
       }
@@ -529,76 +503,44 @@ function reconstructMultiPageDocument(pages, masterPage, requestId, filename) {
     }
   });
   
-  log('info', 'DUE_DATES_MERGED', {
-    requestId,
-    filename,
-    mergedDueDates
-  });
-  
-  // 🔧 UPDATED: Merge line items from field 5 (was field 7)
+  // Extract line items from field 5 - ONLY from pages with THIS invoice number
   const allLineItems = [];
   
   pages.forEach((page, pageIndex) => {
-    log('info', 'PROCESSING_PAGE_FOR_ITEMS', {
-      requestId,
-      filename,
-      pageIndex,
-      availableFields: Object.keys(page.fields)
-    });
-    
-    const pageItems = extractLineItemsFromPage(page, requestId, pageIndex);
-    if (pageItems.length > 0) {
-      allLineItems.push(...pageItems);
-      log('info', 'ITEMS_FOUND_ON_PAGE', {
-        requestId,
-        filename,
-        pageIndex,
-        itemCount: pageItems.length,
-        items: pageItems.map(item => ({
-          line_number: item.line_number,
-          item_number: item.item_number,
-          description: item.description ? item.description.substring(0, 50) : ''
-        }))
-      });
+    // Only process pages that belong to this specific invoice
+    if (page.invoiceNumber === invoiceNumber) {
+      const pageItems = extractLineItemsFromPage(page, requestId, pageIndex);
+      if (pageItems.length > 0) {
+        allLineItems.push(...pageItems);
+        log('info', 'ITEMS_FOUND_FOR_INVOICE', {
+          requestId,
+          invoiceNumber,
+          pageIndex,
+          itemCount: pageItems.length
+        });
+      }
     }
   });
   
-  // 🔧 UPDATED: Find totals from field 6 and tax from field 7 (was fields 8 and 9)
+  // Find totals from field 6 and tax from field 7 - ONLY from this invoice's pages
   let totalAmount = 0;
   let taxAmount = 0;
   
-  // Search all pages for totals (prioritize later pages)
-  for (let i = pages.length - 1; i >= 0; i--) {
-    const page = pages[i];
-    const pageTotalAmount = page.fields['6']?.value;  // Total moved from field 8 to field 6
-    const pageTaxAmount = page.fields['7']?.value;    // Tax moved from field 9 to field 7
-    
-    if (pageTotalAmount && !totalAmount) {
-      const totalStr = String(pageTotalAmount).replace(/[^0-9.-]/g, '');
-      totalAmount = parseFloat(totalStr) || 0;
-      log('info', 'TOTAL_FOUND_ON_PAGE', {
-        requestId,
-        filename,
-        pageIndex: i,
-        totalAmount,
-        rawValue: pageTotalAmount
-      });
+  for (const page of pages) {
+    if (page.invoiceNumber === invoiceNumber) {
+      const pageTotalAmount = page.fields['6']?.value;
+      const pageTaxAmount = page.fields['7']?.value;
+      
+      if (pageTotalAmount && !totalAmount) {
+        const totalStr = String(pageTotalAmount).replace(/[^0-9.-]/g, '');
+        totalAmount = parseFloat(totalStr) || 0;
+      }
+      
+      if (pageTaxAmount && !taxAmount) {
+        const taxStr = String(pageTaxAmount).replace(/[^0-9.-]/g, '');
+        taxAmount = parseFloat(taxStr) || 0;
+      }
     }
-    
-    if (pageTaxAmount && !taxAmount) {
-      const taxStr = String(pageTaxAmount).replace(/[^0-9.-]/g, '');
-      taxAmount = parseFloat(taxStr) || 0;
-      log('info', 'TAX_FOUND_ON_PAGE', {
-        requestId,
-        filename,
-        pageIndex: i,
-        taxAmount,
-        rawValue: pageTaxAmount
-      });
-    }
-    
-    // If we found both, we can stop
-    if (totalAmount && taxAmount) break;
   }
   
   const reconstructedDocument = {
@@ -612,28 +554,22 @@ function reconstructMultiPageDocument(pages, masterPage, requestId, filename) {
     due_date: mergedDueDates.due_date,
     due_date_2: mergedDueDates.due_date_2,
     due_date_3: mergedDueDates.due_date_3,
-    terms: '',  // Terms removed
+    terms: '',
     items: allLineItems,
-    pages: pages.map((page, index) => ({
-      page_type: `page_${index + 1}`,  // No longer extracting from field since removed
-      file_name: filename,
-      fields: page.fields
-    })),
+    pages: pages.filter(p => p.invoiceNumber === invoiceNumber),
     confidence: 0,
-    isMultiPageReconstruction: true,
-    originalPageCount: pages.length,
-    reconstructionStrategy: 'filename_grouping_with_content_merging'
+    isMultiPageReconstruction: false,
+    originalPageCount: pages.filter(p => p.invoiceNumber === invoiceNumber).length,
+    reconstructionStrategy: 'invoice_number_based_grouping'
   };
   
-  log('info', 'DOCUMENT_RECONSTRUCTION_COMPLETE', {
+  log('info', 'SINGLE_INVOICE_RECONSTRUCTION_COMPLETE', {
     requestId,
-    filename,
     invoiceNumber,
     totalAmount,
     taxAmount,
     lineItemCount: allLineItems.length,
-    pageCount: pages.length,
-    dueDatesFound: Object.values(mergedDueDates).filter(d => d).length
+    pageCount: reconstructedDocument.originalPageCount
   });
   
   return reconstructedDocument;
