@@ -8,6 +8,7 @@
 const express   = require('express');
 const axios     = require('axios');
 const FormData  = require('form-data');
+const PDFDocument = require('pdf-lib').PDFDocument;
 
 const app = express();
 app.use(express.json());
@@ -341,7 +342,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
     return [];
   }
   
-  // 🔧 FIXED: Group by INVOICE NUMBER, not filename
+  // Track page indices for each invoice
   extractedFiles.forEach((file, fileIndex) => {
     log('info', 'PROCESSING_FILE', { 
       requestId, 
@@ -357,7 +358,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
     file.documents.forEach((doc, docIndex) => {
       const fields = doc.fields || {};
       
-      // 🔧 FIXED: Extract invoice number from each page
+      // Extract invoice number from each page
       let invoiceNumber = fields['0']?.value;
       
       // Clean up invoice number
@@ -366,13 +367,13 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
           invoiceNumber !== 'none' && 
           invoiceNumber !== '') {
         
-        // Use the actual invoice number as the key
         const cleanInvoiceNumber = String(invoiceNumber).trim();
         
         if (!documentGroups[cleanInvoiceNumber]) {
           documentGroups[cleanInvoiceNumber] = {
             invoice_number: cleanInvoiceNumber,
             pages: [],
+            pageIndices: [], // 🔧 NEW: Track which pages belong to this invoice
             fileName: file.original_file_name,
             masterPage: null
           };
@@ -387,6 +388,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
         };
         
         documentGroups[cleanInvoiceNumber].pages.push(pageData);
+        documentGroups[cleanInvoiceNumber].pageIndices.push(docIndex); // 🔧 NEW: Track page index
         
         // Set first page with this invoice number as master
         if (!documentGroups[cleanInvoiceNumber].masterPage) {
@@ -410,16 +412,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
     });
   });
   
-  log('info', 'INVOICES_GROUPED', {
-    requestId,
-    invoiceNumbers: Object.keys(documentGroups),
-    groupsByInvoice: Object.keys(documentGroups).map(invoiceNum => ({
-      invoiceNumber: invoiceNum,
-      pageCount: documentGroups[invoiceNum].pages.length
-    }))
-  });
-  
-  // 🔧 FIXED: Reconstruct each invoice separately
+  // Create reconstructed documents with page indices
   const resultGroups = [];
   
   Object.keys(documentGroups).forEach(invoiceNumber => {
@@ -429,7 +422,8 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
       log('info', 'RECONSTRUCTING_INVOICE', {
         requestId,
         invoiceNumber,
-        pageCount: group.pages.length
+        pageCount: group.pages.length,
+        pageIndices: group.pageIndices
       });
       
       const reconstructedDocument = reconstructSingleInvoiceDocument(
@@ -441,26 +435,11 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
       );
       
       if (reconstructedDocument) {
+        // 🔧 NEW: Add page indices to the document
+        reconstructedDocument.pageIndices = group.pageIndices;
         resultGroups.push(reconstructedDocument);
-        log('info', 'INVOICE_RECONSTRUCTED', {
-          requestId,
-          invoiceNumber,
-          totalAmount: reconstructedDocument.total_amount,
-          lineItemCount: reconstructedDocument.items?.length || 0
-        });
       }
     }
-  });
-  
-  log('info', 'GROUPING_COMPLETE', {
-    requestId,
-    totalInvoices: resultGroups.length,
-    invoicesWithItems: resultGroups.filter(g => g.items.length > 0).length,
-    summary: resultGroups.map(g => ({
-      invoiceNumber: g.invoice_number,
-      totalAmount: g.total_amount,
-      itemCount: g.items.length
-    }))
   });
   
   return resultGroups;
@@ -833,13 +812,6 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
     });
     
     const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
-    
-    // Find the actual "Source Request ID" column
-    const sourceRequestIdColumn = columns.find(col => 
-      col.title.toLowerCase() === 'id'
-    );
-    
-    // Validate subitems column exists
     const subitemsColumn = columns.find(col => col.type === 'subtasks');
     
     for (const doc of documents) {
@@ -847,7 +819,8 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         requestId,
         documentType: doc.document_type,
         invoiceNumber: doc.invoice_number,
-        itemCount: doc.items?.length || 0
+        itemCount: doc.items?.length || 0,
+        pageIndices: doc.pageIndices
       });
       
       const formatDate = (dateStr) => {
@@ -917,12 +890,38 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         invoiceNumber: doc.invoice_number
       });
       
-      // Upload PDF file
-      if (originalFiles && originalFiles.length > 0) {
+      // 🔧 FIXED: Upload invoice-specific PDF file
+      if (originalFiles && originalFiles.length > 0 && doc.pageIndices && doc.pageIndices.length > 0) {
         const fileColumn = columns.find(col => col.type === 'file');
         if (fileColumn) {
           try {
-            await uploadPdfToMondayItem(createdItemId, originalFiles[0].buffer, originalFiles[0].name, fileColumn.id, requestId);
+            // Create a PDF with only the pages for this specific invoice
+            const invoiceSpecificPdf = await createInvoiceSpecificPDF(
+              originalFiles[0].buffer, 
+              doc.invoice_number, 
+              doc.pageIndices, 
+              requestId
+            );
+            
+            // Generate a specific filename for this invoice
+            const invoiceFileName = `Invoice_${doc.invoice_number}.pdf`;
+            
+            await uploadPdfToMondayItem(
+              createdItemId, 
+              invoiceSpecificPdf, 
+              invoiceFileName, 
+              fileColumn.id, 
+              requestId
+            );
+            
+            log('info', 'INVOICE_SPECIFIC_PDF_UPLOADED', {
+              requestId,
+              itemId: createdItemId,
+              invoiceNumber: doc.invoice_number,
+              fileName: invoiceFileName,
+              pageIndices: doc.pageIndices
+            });
+            
           } catch (uploadError) {
             log('error', 'PDF_UPLOAD_FAILED', {
               requestId,
