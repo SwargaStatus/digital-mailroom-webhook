@@ -176,12 +176,44 @@ async function processWebhookData(body, requestId) {
     await createMondayExtractedItems(groups, itemId, originalFiles, requestId, runId);
     
     log('info', 'PROCESSING_COMPLETE', { requestId, itemId });
+    await updateMondayItemStatusToDone(ev.pulseId, ev.boardId, requestId);
   } catch (err) {
     log('error', 'BACKGROUND_PROCESSING_FAILED', { 
       requestId, 
       error: err.message, 
       stack: err.stack 
     });
+  }
+}
+
+// Function to update the status column to 'Done' for the original item
+async function updateMondayItemStatusToDone(itemId, boardId, requestId) {
+  const statusColumnId = "status"; // Change if your column ID is different
+  const doneLabel = "Done"; // The label as it appears in Monday.com
+
+  const mutation = `
+    mutation {
+      change_column_value(
+        board_id: ${boardId},
+        item_id: ${itemId},
+        column_id: "${statusColumnId}",
+        value: "{\\"label\\": \\\"${doneLabel}\\\"}"
+      ) {
+        id
+      }
+    }
+  `;
+
+  try {
+    const response = await axios.post('https://api.monday.com/v2', { query: mutation }, {
+      headers: {
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    log('info', 'STATUS_UPDATED_TO_DONE', { requestId, itemId, boardId, response: response.data });
+  } catch (error) {
+    log('error', 'STATUS_UPDATE_FAILED', { requestId, itemId, boardId, error: error.message });
   }
 }
 
