@@ -64,46 +64,56 @@ async function createInvoiceSpecificPDF(originalPdfBuffer, invoiceNumber, pageIn
     // Create a new PDF document
     const newPdf = await PDFDocument.create();
     
-    // Validate and copy only the pages for this specific invoice
-    const validPageIndices = pageIndices.filter(pageIndex => {
+    // 🔧 ENHANCED: Better validation and logging
+    const validPageIndices = [];
+    const invalidPageIndices = [];
+    pageIndices.forEach(pageIndex => {
       if (pageIndex >= 0 && pageIndex < totalPages) {
-        return true;
+        validPageIndices.push(pageIndex);
       } else {
-        log('warn', 'INVALID_PAGE_INDEX', {
-          requestId,
-          invoiceNumber,
-          pageIndex,
-          totalPages
-        });
-        return false;
+        invalidPageIndices.push(pageIndex);
       }
     });
-    
-    if (validPageIndices.length === 0) {
-      throw new Error(`No valid page indices found for invoice ${invoiceNumber}`);
-    }
-    
-    for (const pageIndex of validPageIndices) {
-      const [copiedPage] = await newPdf.copyPages(originalPdf, [pageIndex]);
-      newPdf.addPage(copiedPage);
-      
-      log('info', 'PAGE_COPIED_TO_INVOICE_PDF', {
+    if (invalidPageIndices.length > 0) {
+      log('warn', 'INVALID_PAGE_INDICES_FOUND', {
         requestId,
         invoiceNumber,
-        pageIndex,
+        invalidIndices: invalidPageIndices,
         totalPages
       });
+    }
+    if (validPageIndices.length === 0) {
+      throw new Error(`No valid page indices found for invoice ${invoiceNumber}. Requested: ${pageIndices}, Total pages: ${totalPages}`);
+    }
+    
+    // 🔧 ENHANCED: Copy pages with detailed logging
+    for (let i = 0; i < validPageIndices.length; i++) {
+      const pageIndex = validPageIndices[i];
+      log('info', 'COPYING_PAGE_TO_INVOICE_PDF', {
+        requestId,
+        invoiceNumber,
+        sourcePageIndex: pageIndex,
+        destinationPageIndex: i,
+        totalValidPages: validPageIndices.length
+      });
+      const [copiedPage] = await newPdf.copyPages(originalPdf, [pageIndex]);
+      newPdf.addPage(copiedPage);
     }
     
     // Generate the PDF buffer
     const pdfBytes = await newPdf.save();
     
-    log('info', 'INVOICE_PDF_CREATED', {
+    log('info', 'INVOICE_PDF_CREATED_SUCCESS', {
       requestId,
       invoiceNumber,
       requestedPageCount: pageIndices.length,
       validPageCount: validPageIndices.length,
-      outputSize: pdfBytes.length
+      invalidPageCount: invalidPageIndices.length,
+      outputSize: pdfBytes.length,
+      pageMapping: validPageIndices.map((sourceIndex, destIndex) => ({
+        sourcePageIndex: sourceIndex,
+        destinationPageIndex: destIndex
+      }))
     });
     
     return Buffer.from(pdfBytes);
@@ -204,13 +214,20 @@ async function processWebhookData(body, requestId) {
   }
 }
 
-// Function to update the status column to 'Done' for the original item
+// 🔧 FIXED: Status update with flexible column detection
 async function updateMondayItemStatusToDone(itemId, boardId, requestId, runId = null) {
-  const statusColumnId = "status"; // Change if your column ID is different
-  const doneLabel = "Completed"; // The label as it appears in Monday.com
-  const processingNotesColumnTitle = "Processing Notes"; // Adjust if your column is named differently
-
-  // 1. Fetch the board columns to get the status column settings
+  const statusColumnId = "status";
+  const doneLabel = "Completed";
+  // 🔧 ENHANCED: Try multiple possible column names for processing notes
+  const possibleNotesColumnNames = [
+    "processing notes",
+    "notes", 
+    "processing note",
+    "run id",
+    "instabase run id",
+    "extraction notes",
+    "batch id"
+  ];
   const boardQuery = `
     query {
       boards(ids: [${boardId}]) {
@@ -223,7 +240,6 @@ async function updateMondayItemStatusToDone(itemId, boardId, requestId, runId = 
       }
     }
   `;
-
   try {
     const boardResponse = await axios.post('https://api.monday.com/v2', { query: boardQuery }, {
       headers: {
@@ -231,15 +247,43 @@ async function updateMondayItemStatusToDone(itemId, boardId, requestId, runId = 
         'Content-Type': 'application/json'
       }
     });
-
     const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
+    // 🔧 ENHANCED: Log all available columns for debugging
+    log('info', 'AVAILABLE_BOARD_COLUMNS', {
+      requestId,
+      boardId,
+      columns: columns.map(col => ({ id: col.id, title: col.title, type: col.type }))
+    });
     const statusColumn = columns.find(col => col.id === statusColumnId && col.type === 'status');
     if (!statusColumn) {
       log('error', 'STATUS_COLUMN_NOT_FOUND', { requestId, itemId, boardId });
       return;
     }
-
-    // 2. Parse settings_str to get the labels and their indexes
+    // Find processing notes column with flexible matching
+    let processingNotesColumn = null;
+    if (runId) {
+      processingNotesColumn = columns.find(col => {
+        const title = col.title.toLowerCase().trim();
+        return possibleNotesColumnNames.some(name => title.includes(name)) && 
+               (col.type === 'text' || col.type === 'long_text');
+      });
+      if (processingNotesColumn) {
+        log('info', 'PROCESSING_NOTES_COLUMN_FOUND', {
+          requestId,
+          columnId: processingNotesColumn.id,
+          columnTitle: processingNotesColumn.title,
+          columnType: processingNotesColumn.type
+        });
+      } else {
+        log('warn', 'PROCESSING_NOTES_COLUMN_NOT_FOUND', {
+          requestId,
+          searchedNames: possibleNotesColumnNames,
+          availableTextColumns: columns.filter(col => col.type === 'text' || col.type === 'long_text')
+            .map(col => col.title)
+        });
+      }
+    }
+    // Parse status column settings
     let doneIndex = null;
     try {
       const settings = JSON.parse(statusColumn.settings_str);
@@ -255,26 +299,31 @@ async function updateMondayItemStatusToDone(itemId, boardId, requestId, runId = 
       log('error', 'STATUS_COLUMN_SETTINGS_PARSE_ERROR', { requestId, error: e.message });
       return;
     }
-
     if (doneIndex === null) {
-      log('error', 'DONE_LABEL_NOT_FOUND', { requestId, itemId, boardId, labels: statusColumn.settings_str });
+      log('error', 'DONE_LABEL_NOT_FOUND', { 
+        requestId, 
+        itemId, 
+        boardId, 
+        searchedFor: doneLabel,
+        availableLabels: JSON.parse(statusColumn.settings_str).labels 
+      });
       return;
     }
-
-    // Find the Processing Notes text column
-    let processingNotesColumn = null;
-    if (runId) {
-      processingNotesColumn = columns.find(col => col.title.trim().toLowerCase() === processingNotesColumnTitle.toLowerCase() && col.type === 'text');
-    }
-
-    // Build the value object for the mutation
-    let valueObj = { index: doneIndex };
-    let columnValues = { [statusColumnId]: valueObj };
+    // Build column values
+    let columnValues = { 
+      [statusColumnId]: { "index": doneIndex }
+    };
     if (runId && processingNotesColumn) {
       columnValues[processingNotesColumn.id] = runId;
     }
-
-    // 3. Use the index and runId in your mutation
+    log('info', 'UPDATING_MONDAY_COLUMNS', {
+      requestId,
+      itemId,
+      boardId,
+      columnValues,
+      runId
+    });
+    // Update columns
     const mutation = `
       mutation {
         change_multiple_column_values(
@@ -286,16 +335,36 @@ async function updateMondayItemStatusToDone(itemId, boardId, requestId, runId = 
         }
       }
     `;
-
     const response = await axios.post('https://api.monday.com/v2', { query: mutation }, {
       headers: {
         'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
         'Content-Type': 'application/json'
       }
     });
-    log('info', 'STATUS_AND_NOTES_UPDATED', { requestId, itemId, boardId, runId, response: response.data });
+    if (response.data.errors) {
+      log('error', 'STATUS_UPDATE_MUTATION_ERROR', { 
+        requestId, 
+        itemId, 
+        boardId, 
+        errors: response.data.errors 
+      });
+    } else {
+      log('info', 'STATUS_AND_NOTES_UPDATED_SUCCESS', { 
+        requestId, 
+        itemId, 
+        boardId, 
+        runId,
+        updatedColumns: Object.keys(columnValues)
+      });
+    }
   } catch (error) {
-    log('error', 'STATUS_UPDATE_FAILED', { requestId, itemId, boardId, runId, error: error.message });
+    log('error', 'STATUS_UPDATE_FAILED', { 
+      requestId, 
+      itemId, 
+      boardId, 
+      runId, 
+      error: error.message 
+    });
   }
 }
 
@@ -503,38 +572,28 @@ async function processFilesWithInstabase(files, requestId) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 6️⃣  STRICT GROUPING - Ensures Invoice # on Line Matches Attached Document
-// ----------------------------------------------------------------------------
+// 🔧 FIXED: Grouping function with consistent page tracking
 function groupPagesByInvoiceNumber(extractedFiles, requestId) {
   log('info', 'GROUPING_START', { 
     requestId, 
     inputFiles: extractedFiles?.length || 0 
   });
-  
   const documentGroups = {};
-  
   if (!extractedFiles || extractedFiles.length === 0) {
     log('warn', 'NO_FILES_TO_GROUP', { requestId });
     return [];
   }
-  
-  // Strictly group by invoice number
+  // 🔧 CRITICAL FIX: Track pages consistently without double-filtering
   extractedFiles.forEach((file, fileIndex) => {
-    log('info', 'PROCESSING_FILE', { 
-      requestId, 
-      fileIndex, 
-      fileName: file.original_file_name 
-    });
-    
+    log('info', 'PROCESSING_FILE', { requestId, fileIndex, fileName: file.original_file_name });
     if (!file.documents || file.documents.length === 0) {
       log('warn', 'NO_DOCUMENTS_IN_FILE', { requestId, fileIndex });
       return;
     }
-    
     file.documents.forEach((doc, docIndex) => {
       const fields = doc.fields || {};
-      const actualPageNumber = doc.page_num || docIndex;
+      // 🔧 CRITICAL: Use docIndex as the PDF page number (0-based indexing)
+      const pdfPageIndex = docIndex;
       let invoiceNumber = fields['0']?.value;
       if (invoiceNumber && invoiceNumber !== 'unknown' && invoiceNumber !== 'none' && invoiceNumber !== '') {
         const cleanInvoiceNumber = String(invoiceNumber).trim();
@@ -542,22 +601,21 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
           documentGroups[cleanInvoiceNumber] = {
             invoice_number: cleanInvoiceNumber,
             pages: [],
-            pageIndices: [],
+            pageIndices: [], // Track PDF page indices for extraction
             fileName: file.original_file_name,
             masterPage: null
           };
         }
-        // Only add this page to this invoice group
         const pageData = {
           fileIndex,
           docIndex,
-          actualPageNumber,
+          pdfPageIndex, // 🔧 NEW: Explicit PDF page index
           fields,
           fileName: file.original_file_name,
           invoiceNumber: cleanInvoiceNumber
         };
         documentGroups[cleanInvoiceNumber].pages.push(pageData);
-        documentGroups[cleanInvoiceNumber].pageIndices.push(actualPageNumber);
+        documentGroups[cleanInvoiceNumber].pageIndices.push(pdfPageIndex); // 🔧 FIXED: Use consistent index
         if (!documentGroups[cleanInvoiceNumber].masterPage) {
           documentGroups[cleanInvoiceNumber].masterPage = pageData;
         }
@@ -565,7 +623,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
           requestId,
           invoiceNumber: cleanInvoiceNumber,
           docIndex: docIndex,
-          actualPageNumber: actualPageNumber,
+          pdfPageIndex: pdfPageIndex, // 🔧 NEW: Log the actual PDF page index
           fileName: file.original_file_name
         });
       } else {
@@ -573,7 +631,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
           requestId,
           fileIndex,
           docIndex,
-          actualPageNumber: doc.page_num || docIndex,
+          pdfPageIndex: docIndex,
           availableFields: Object.keys(fields)
         });
       }
@@ -588,7 +646,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
       pageIndices: documentGroups[invoiceNum].pageIndices
     }))
   });
-  // Create reconstructed documents with correct page indices and strict line item filtering
+  // 🔧 FIXED: No double-filtering, use original pageIndices
   const resultGroups = [];
   Object.keys(documentGroups).forEach(invoiceNumber => {
     const group = documentGroups[invoiceNumber];
@@ -597,25 +655,24 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
         requestId,
         invoiceNumber,
         pageCount: group.pages.length,
-        pageIndices: group.pageIndices
+        pageIndices: group.pageIndices // 🔧 FIXED: Use original pageIndices
       });
-      // Strictly filter pages and line items for this invoice only
-      const filteredPages = group.pages.filter(p => p.invoiceNumber === invoiceNumber);
       const reconstructedDocument = reconstructSingleInvoiceDocument(
-        filteredPages, 
+        group.pages, 
         group.masterPage, 
         requestId, 
         group.fileName,
         invoiceNumber
       );
       if (reconstructedDocument) {
-        reconstructedDocument.pageIndices = filteredPages.map(p => p.actualPageNumber);
+        // 🔧 FIXED: Use the original pageIndices without modification
+        reconstructedDocument.pageIndices = group.pageIndices;
         reconstructedDocument.debugInfo = {
           originalFileName: group.fileName,
-          pageMapping: filteredPages.map(p => ({
+          pageMapping: group.pages.map(p => ({
             invoiceNumber: p.invoiceNumber,
             docIndex: p.docIndex,
-            actualPageNumber: p.actualPageNumber
+            pdfPageIndex: p.pdfPageIndex
           }))
         };
         resultGroups.push(reconstructedDocument);
@@ -1116,18 +1173,15 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
   }
 }
 
-// 🔧 UPDATED: Subitem creation function with Line Number support
+// 🔧 ENHANCED: Subitem creation with better error handling and timeouts
 async function createSubitemsForLineItems(parentItemId, items, columns, requestId) {
   try {
     log('info', 'SUBITEM_CREATION_START', { requestId, parentItemId, lineItemCount: items.length });
-
-    // Get the linked board ID from your Subtasks column
     const subitemsColumn = columns.find(c => c.type === 'subtasks');
     if (!subitemsColumn) {
       log('error', 'NO_SUBTASKS_COLUMN_FOUND', { requestId });
       return;
     }
-
     let settings = {};
     try {
       settings = JSON.parse(subitemsColumn.settings_str || '{}');
@@ -1135,17 +1189,14 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
       log('error', 'SETTINGS_PARSE_ERROR', { requestId, error: e.message });
       return;
     }
-
     const subitemBoardId = Array.isArray(settings.boardIds)
       ? settings.boardIds[0]
       : settings.linked_board_id;
-    
     if (!subitemBoardId) {
       log('error', 'MISSING_SUBITEM_BOARD_ID', { requestId, settings });
       return;
     }
-
-    // Fetch that board's columns
+    // Fetch subitem board columns
     const colsQuery = `
       query {
         boards(ids: [${subitemBoardId}]) {
@@ -1153,141 +1204,167 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
         }
       }
     `;
-    
     const colsResponse = await axios.post('https://api.monday.com/v2', { query: colsQuery }, {
       headers: { Authorization: `Bearer ${MONDAY_CONFIG.apiKey}` }
     });
-    
     const subitemColumns = colsResponse.data.data.boards[0].columns;
-
-    // Loop each line item and map into those columns
-    for (let i = 0; i < items.length; i++) {
-      const { line_number, item_number, quantity, unit_cost, description, source_page, po_number } = items[i];
-      const columnValues = {};
-      
-      // Use extracted line_number for subitem indexing
-      const actualLineNumber = line_number || `${i + 1}`;
-      
-      subitemColumns.forEach(col => {
-        const title = col.title.trim().toLowerCase();
-        
-        // Map to Line Number column using extracted value
-        if (title.includes('line number') || title.includes('line #') || title.includes('subitem') || title === 'index') {
-          if (col.type === 'numbers') {
-            const numericLineNumber = parseFloat(actualLineNumber);
-            columnValues[col.id] = isNaN(numericLineNumber) ? (i + 1) : numericLineNumber;
-          } else {
-            columnValues[col.id] = actualLineNumber;
-          }
-        } else if (title === 'item number' || title.includes('item num')) {
-          columnValues[col.id] = item_number || '';
-        } else if (title === 'quantity' || title === 'qty') {
-          if (col.type === 'numbers') {
-            columnValues[col.id] = quantity || 0;
-          } else {
-            columnValues[col.id] = String(quantity || 0);
-          }
-        } else if (title === 'unit cost' || title.includes('unit cost')) {
-          if (col.type === 'numbers') {
-            columnValues[col.id] = unit_cost || 0;
-          } else {
-            columnValues[col.id] = String(unit_cost || 0);
-          }
-        } else if (title === 'description' || title.includes('desc')) {
-          columnValues[col.id] = description || '';
-        } else if (title.includes('source page') || title.includes('page')) {
-          columnValues[col.id] = source_page || '';
-        } else if (title.includes('po number') || title === 'po' || title.includes('purchase order')) {
-          columnValues[col.id] = po_number || '';
-        }
+    // 🔧 ENHANCED: Batch creation with error recovery
+    let successCount = 0;
+    let failureCount = 0;
+    const batchSize = 5; // Process in smaller batches
+    for (let i = 0; i < items.length; i += batchSize) {
+      const batch = items.slice(i, i + batchSize);
+      log('info', 'PROCESSING_SUBITEM_BATCH', {
+        requestId,
+        batchStart: i,
+        batchSize: batch.length,
+        totalItems: items.length
       });
-
-      // Use extracted line number in subitem name
-      const subitemName = `Line ${actualLineNumber}`;
-      const escapedName = subitemName.replace(/"/g, '\\"');
-      const columnValuesJson = JSON.stringify(columnValues);
-      
-      const mutation = `
-        mutation {
-          create_subitem(
-            parent_item_id: ${parentItemId}
-            item_name: "${escapedName}"
-            column_values: ${JSON.stringify(columnValuesJson)}
-          ) { 
-            id 
-            name
-          }
-        }
-      `;
-      
-      const response = await axios.post('https://api.monday.com/v2', { query: mutation }, {
-        headers: {
-          Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
-          'Content-Type': 'application/json',
-          'API-Version': '2024-04'
-        }
-      });
-      
-      if (response.data.errors) {
-        log('error', 'SUBITEM_MUTATION_ERRORS', { 
-          requestId, 
-          extractedLineNumber: actualLineNumber, 
-          errors: response.data.errors 
-        });
-        
-        // Try creating without column values if there are errors
-        const simpleQuery = `
-          mutation {
-            create_subitem(
-              parent_item_id: ${parentItemId}
-              item_name: "${escapedName}"
-            ) { 
-              id 
-              name
+      for (const item of batch) {
+        try {
+          const { line_number, item_number, quantity, unit_cost, description, source_page, po_number } = item;
+          const columnValues = {};
+          const actualLineNumber = line_number || `${items.indexOf(item) + 1}`;
+          subitemColumns.forEach(col => {
+            const title = col.title.trim().toLowerCase();
+            if (title.includes('line number') || title.includes('line #') || title.includes('subitem') || title === 'index') {
+              if (col.type === 'numbers') {
+                const numericLineNumber = parseFloat(actualLineNumber);
+                columnValues[col.id] = isNaN(numericLineNumber) ? (items.indexOf(item) + 1) : numericLineNumber;
+              } else {
+                columnValues[col.id] = actualLineNumber;
+              }
+            } else if (title === 'item number' || title.includes('item num')) {
+              columnValues[col.id] = item_number || '';
+            } else if (title === 'quantity' || title === 'qty') {
+              if (col.type === 'numbers') {
+                columnValues[col.id] = quantity || 0;
+              } else {
+                columnValues[col.id] = String(quantity || 0);
+              }
+            } else if (title === 'unit cost' || title.includes('unit cost')) {
+              if (col.type === 'numbers') {
+                columnValues[col.id] = unit_cost || 0;
+              } else {
+                columnValues[col.id] = String(unit_cost || 0);
+              }
+            } else if (title === 'description' || title.includes('desc')) {
+              columnValues[col.id] = description || '';
+            } else if (title.includes('source page') || title.includes('page')) {
+              columnValues[col.id] = source_page || '';
+            } else if (title.includes('po number') || title === 'po' || title.includes('purchase order')) {
+              columnValues[col.id] = po_number || '';
             }
-          }
-        `;
-        
-        const retryResponse = await axios.post('https://api.monday.com/v2', { query: simpleQuery }, {
-          headers: {
-            Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
-            'Content-Type': 'application/json',
-            'API-Version': '2024-04'
-          }
-        });
-        
-        if (retryResponse.data.errors) {
-          log('error', 'SIMPLE_SUBITEM_ALSO_FAILED', {
-            requestId,
-            extractedLineNumber: actualLineNumber,
-            errors: retryResponse.data.errors
           });
-        } else {
-          log('info', 'SIMPLE_SUBITEM_SUCCESS', {
+          const subitemName = `Line ${actualLineNumber}`;
+          const escapedName = subitemName.replace(/"/g, '\"');
+          const columnValuesJson = JSON.stringify(columnValues);
+          const mutation = `
+            mutation {
+              create_subitem(
+                parent_item_id: ${parentItemId}
+                item_name: "${escapedName}"
+                column_values: ${JSON.stringify(columnValuesJson)}
+              ) { 
+                id 
+                name
+              }
+            }
+          `;
+          // 🔧 ENHANCED: Extended timeout for subitem creation
+          const response = await axios.post('https://api.monday.com/v2', { query: mutation }, {
+            headers: {
+              Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
+              'Content-Type': 'application/json',
+              'API-Version': '2024-04'
+            },
+            timeout: 30000 // 🔧 INCREASED: 30 second timeout
+          });
+          if (response.data.errors) {
+            log('error', 'SUBITEM_CREATION_ERROR', { 
+              requestId, 
+              lineNumber: actualLineNumber, 
+              errors: response.data.errors 
+            });
+            // 🔧 ENHANCED: Retry with simple creation on error
+            const simpleQuery = `
+              mutation {
+                create_subitem(
+                  parent_item_id: ${parentItemId}
+                  item_name: "${escapedName}"
+                ) { 
+                  id 
+                  name
+                }
+              }
+            `;
+            try {
+              const retryResponse = await axios.post('https://api.monday.com/v2', { query: simpleQuery }, {
+                headers: {
+                  Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
+                  'Content-Type': 'application/json',
+                  'API-Version': '2024-04'
+                },
+                timeout: 30000
+              });
+              if (retryResponse.data.errors) {
+                failureCount++;
+                log('error', 'SUBITEM_RETRY_FAILED', {
+                  requestId,
+                  lineNumber: actualLineNumber,
+                  errors: retryResponse.data.errors
+                });
+              } else {
+                successCount++;
+                log('info', 'SUBITEM_RETRY_SUCCESS', {
+                  requestId,
+                  lineNumber: actualLineNumber,
+                  subitemId: retryResponse.data.data.create_subitem.id
+                });
+              }
+            } catch (retryError) {
+              failureCount++;
+              log('error', 'SUBITEM_RETRY_EXCEPTION', {
+                requestId,
+                lineNumber: actualLineNumber,
+                error: retryError.message
+              });
+            }
+          } else {
+            successCount++;
+            log('info', 'SUBITEM_CREATED_SUCCESS', { 
+              requestId, 
+              lineNumber: actualLineNumber, 
+              subitemId: response.data.data.create_subitem.id,
+              poNumber: po_number
+            });
+          }
+        } catch (itemError) {
+          failureCount++;
+          log('error', 'SUBITEM_CREATION_EXCEPTION', {
             requestId,
-            extractedLineNumber: actualLineNumber,
-            subitemId: retryResponse.data.data.create_subitem.id,
-            subitemName: escapedName
+            itemIndex: items.indexOf(item),
+            error: itemError.message
           });
         }
-      } else {
-        log('info', 'SUBITEM_CREATED', { 
-          requestId, 
-          extractedLineNumber: actualLineNumber, 
-          subitemId: response.data.data.create_subitem.id,
-          subitemName: escapedName,
-          poNumber: po_number
-        });
+        // 🔧 ENHANCED: Longer delay between requests to avoid rate limits
+        await new Promise(resolve => setTimeout(resolve, 500));
       }
-      
-      // Small pause to avoid rate limits
-      await new Promise(resolve => setTimeout(resolve, 250));
+      // 🔧 ENHANCED: Longer delay between batches
+      if (i + batchSize < items.length) {
+        log('info', 'BATCH_COMPLETE_WAITING', { requestId, completedItems: i + batchSize, totalItems: items.length });
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
     }
-
-    log('info', 'ALL_SUBITEMS_CREATED', { requestId, parentItemId, lineItemCount: items.length });
-    
+    log('info', 'ALL_SUBITEMS_PROCESSED', { 
+      requestId, 
+      parentItemId, 
+      totalLineItems: items.length,
+      successCount,
+      failureCount
+    });
   } catch (error) {
-    log('error', 'SUBITEM_CREATION_ERROR', {
+    log('error', 'SUBITEM_CREATION_FAILED', {
       requestId,
       parentItemId,
       error: error.message,
