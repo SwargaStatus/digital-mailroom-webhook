@@ -39,6 +39,69 @@ function log(level, message, data = {}) {
   console.log(`[${timestamp}] ${level.toUpperCase()}: ${message}`, data);
 }
 
+// 🔧 NEW: PDF PAGE EXTRACTION FUNCTION
+// ----------------------------------------------------------------------------
+async function createInvoiceSpecificPDF(originalPdfBuffer, invoiceNumber, pageIndices, requestId) {
+  try {
+    log('info', 'CREATING_INVOICE_SPECIFIC_PDF', {
+      requestId,
+      invoiceNumber,
+      pageIndices,
+      originalBufferSize: originalPdfBuffer.length
+    });
+
+    // Load the original PDF
+    const originalPdf = await PDFDocument.load(originalPdfBuffer);
+    
+    // Create a new PDF document
+    const newPdf = await PDFDocument.create();
+    
+    // Copy only the pages for this specific invoice
+    for (const pageIndex of pageIndices) {
+      if (pageIndex < originalPdf.getPageCount()) {
+        const [copiedPage] = await newPdf.copyPages(originalPdf, [pageIndex]);
+        newPdf.addPage(copiedPage);
+        
+        log('info', 'PAGE_COPIED_TO_INVOICE_PDF', {
+          requestId,
+          invoiceNumber,
+          pageIndex,
+          totalPages: originalPdf.getPageCount()
+        });
+      } else {
+        log('warn', 'PAGE_INDEX_OUT_OF_RANGE', {
+          requestId,
+          invoiceNumber,
+          pageIndex,
+          totalPages: originalPdf.getPageCount()
+        });
+      }
+    }
+    
+    // Generate the PDF buffer
+    const pdfBytes = await newPdf.save();
+    
+    log('info', 'INVOICE_PDF_CREATED', {
+      requestId,
+      invoiceNumber,
+      pageCount: pageIndices.length,
+      outputSize: pdfBytes.length
+    });
+    
+    return Buffer.from(pdfBytes);
+    
+  } catch (error) {
+    log('error', 'CREATE_INVOICE_PDF_FAILED', {
+      requestId,
+      invoiceNumber,
+      pageIndices,
+      error: error.message,
+      stack: error.stack
+    });
+    throw error;
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 2️⃣  WEBHOOK ENDPOINT
 // ----------------------------------------------------------------------------
