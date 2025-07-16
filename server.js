@@ -1038,7 +1038,6 @@ function extractLineItemsFromPage(page, requestId, pageIndex) {
 async function createMondayExtractedItems(documents, sourceItemId, originalFiles, requestId, instabaseRunId) {
   try {
     log('info', 'STAGE: Getting board structure', { requestId });
-    
     const boardQuery = `
       query {
         boards(ids: [${MONDAY_CONFIG.extractedDocsBoardId}]) {
@@ -1053,7 +1052,6 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         }
       }
     `;
-    
     const boardResponse = await axios.post('https://api.monday.com/v2', {
       query: boardQuery
     }, {
@@ -1062,10 +1060,9 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         'Content-Type': 'application/json'
       }
     });
-    
     const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
     const subitemsColumn = columns.find(col => col.type === 'subtasks');
-    
+    const summaryTable = [];
     for (const doc of documents) {
       log('info', 'CREATING_MONDAY_ITEM', {
         requestId,
@@ -1075,7 +1072,6 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         pageIndices: doc.pageIndices,
         fileName: doc.fileName
       });
-      
       const formatDate = (dateStr) => {
         if (!dateStr || dateStr === 'Due Date' || dateStr === 'undefined' || dateStr === 'null') {
           return '';
@@ -1091,20 +1087,15 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
           } else {
             date = new Date(dateStr);
           }
-          
           if (isNaN(date.getTime())) {
             return '';
           }
-          
           return date.toISOString().split('T')[0];
         } catch (e) {
           return '';
         }
       };
-      
       const columnValues = buildColumnValues(columns, doc, formatDate, instabaseRunId);
-      
-      // Create the item
       const mutation = `
         mutation {
           create_item(
@@ -1117,7 +1108,6 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
           }
         }
       `;
-      
       const response = await axios.post('https://api.monday.com/v2', {
         query: mutation
       }, {
@@ -1126,7 +1116,6 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
           'Content-Type': 'application/json'
         }
       });
-      
       if (response.data.errors) {
         log('error', 'ITEM_CREATION_FAILED', {
           requestId,
@@ -1134,7 +1123,6 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         });
         continue;
       }
-      
       const createdItemId = response.data.data.create_item.id;
       log('info', 'ITEM_CREATED_SUCCESS', {
         requestId,
@@ -1142,13 +1130,27 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         documentType: doc.document_type,
         invoiceNumber: doc.invoice_number
       });
-      
       // Use the correct buffer for this invoice's file
       if (originalFiles && originalFiles.length > 0 && doc.pageIndices && doc.pageIndices.length > 0) {
         const fileColumn = columns.find(col => col.type === 'file');
         if (fileColumn) {
           try {
-            const bufferForThisDoc = originalFiles.find(f => f.name === doc.fileName)?.buffer;
+            // Try direct match first
+            let bufferForThisDoc = originalFiles.find(f => f.name === doc.fileName)?.buffer;
+            // If not found, try matching by base name (strip path and extension)
+            if (!bufferForThisDoc) {
+              const baseName = doc.fileName ? doc.fileName.split(/[\\/]/).pop().replace(/\.[^.]+$/, '') : '';
+              bufferForThisDoc = originalFiles.find(f => {
+                const fBase = f.name.split(/[\\/]/).pop().replace(/\.[^.]+$/, '');
+                return fBase === baseName;
+              })?.buffer;
+            }
+            log('info', 'PDF_EXTRACTION_DEBUG', {
+              requestId,
+              invoiceNumber: doc.invoice_number,
+              docFileName: doc.fileName,
+              availableOriginalFiles: originalFiles.map(f => f.name)
+            });
             if (!bufferForThisDoc) {
               log('error', 'PDF_BUFFER_NOT_FOUND_FOR_DOC', {
                 requestId,
@@ -1157,7 +1159,7 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
               });
               continue;
             }
-            // 🔧 ENHANCED: Better page index handling with validation
+            // Always convert Instabase 1-based page numbers to 0-based indices for pdf-lib
             log('info', 'PREPARING_PDF_EXTRACTION', {
               requestId,
               invoiceNumber: doc.invoice_number,
@@ -1165,30 +1167,22 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
               fileName: doc.fileName,
               debugInfo: doc.debugInfo
             });
-            // Clean and validate page indices (convert from 1-based to 0-based if needed)
             let cleanPageIndices = Array.from(new Set(doc.pageIndices))
-              .filter(i => typeof i === 'number' && i >= 0)
-              .map(i => {
-                // If Instabase returns 1-based indices, convert to 0-based
-                // You might need to adjust this based on your Instabase setup
-                return i; // Keep as-is for now, but add logging to debug
-              })
+              .filter(i => typeof i === 'number' && i > 0)
+              .map(i => i - 1) // convert 1-based to 0-based
               .sort((a, b) => a - b);
-            log('info', 'CLEANED_PAGE_INDICES', {
-              requestId,
+            log('info', 'PDF_PAGE_MAPPING', {
               invoiceNumber: doc.invoice_number,
-              cleanPageIndices,
-              originalCount: doc.pageIndices.length,
-              cleanedCount: cleanPageIndices.length
+              instabasePages: doc.pageIndices,
+              pdfLibIndices: cleanPageIndices
             });
-            // Validate we have valid page indices
             if (cleanPageIndices.length === 0) {
               log('error', 'NO_VALID_PAGE_INDICES', {
                 requestId,
                 invoiceNumber: doc.invoice_number,
                 originalPageIndices: doc.pageIndices
               });
-              continue; // Skip this document
+              continue;
             }
             const invoiceSpecificPdf = await createInvoiceSpecificPDF(
               bufferForThisDoc, 
@@ -1211,6 +1205,13 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
               fileName: invoiceFileName,
               pageIndices: cleanPageIndices
             });
+            summaryTable.push({
+              invoiceNumber: doc.invoice_number,
+              fileName: doc.fileName,
+              usedFile: originalFiles.find(f => f.buffer === bufferForThisDoc)?.name,
+              pageIndices: cleanPageIndices,
+              mondayItemId: createdItemId
+            });
           } catch (uploadError) {
             log('error', 'PDF_UPLOAD_FAILED', {
               requestId,
@@ -1220,8 +1221,6 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
           }
         }
       }
-      
-      // Create subitems if we have line items and subitems column exists
       if (subitemsColumn && doc.items && doc.items.length > 0) {
         try {
           await createSubitemsForLineItems(createdItemId, doc.items, columns, requestId);
@@ -1234,9 +1233,8 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         }
       }
     }
-    
     log('info', 'ALL_ITEMS_PROCESSED', { requestId, documentCount: documents.length });
-    
+    log('info', 'PDF_ATTACHMENT_SUMMARY', { requestId, summaryTable });
   } catch (error) {
     log('error', 'CREATE_MONDAY_ITEMS_FAILED', {
       requestId,
