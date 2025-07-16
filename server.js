@@ -194,7 +194,7 @@ async function processWebhookData(body, requestId) {
     await createMondayExtractedItems(groups, itemId, originalFiles, requestId, runId);
     
     log('info', 'PROCESSING_COMPLETE', { requestId, itemId });
-    await updateMondayItemStatusToDone(ev.pulseId, ev.boardId, requestId);
+    await updateMondayItemStatusToDone(ev.pulseId, ev.boardId, requestId, runId);
   } catch (err) {
     log('error', 'BACKGROUND_PROCESSING_FAILED', { 
       requestId, 
@@ -205,9 +205,10 @@ async function processWebhookData(body, requestId) {
 }
 
 // Function to update the status column to 'Done' for the original item
-async function updateMondayItemStatusToDone(itemId, boardId, requestId) {
+async function updateMondayItemStatusToDone(itemId, boardId, requestId, runId = null) {
   const statusColumnId = "status"; // Change if your column ID is different
   const doneLabel = "Completed"; // The label as it appears in Monday.com
+  const processingNotesColumnTitle = "Processing Notes"; // Adjust if your column is named differently
 
   // 1. Fetch the board columns to get the status column settings
   const boardQuery = `
@@ -260,14 +261,26 @@ async function updateMondayItemStatusToDone(itemId, boardId, requestId) {
       return;
     }
 
-    // 3. Use the index in your mutation
+    // Find the Processing Notes text column
+    let processingNotesColumn = null;
+    if (runId) {
+      processingNotesColumn = columns.find(col => col.title.trim().toLowerCase() === processingNotesColumnTitle.toLowerCase() && col.type === 'text');
+    }
+
+    // Build the value object for the mutation
+    let valueObj = { index: doneIndex };
+    let columnValues = { [statusColumnId]: valueObj };
+    if (runId && processingNotesColumn) {
+      columnValues[processingNotesColumn.id] = runId;
+    }
+
+    // 3. Use the index and runId in your mutation
     const mutation = `
       mutation {
-        change_column_value(
+        change_multiple_column_values(
           board_id: ${boardId},
           item_id: ${itemId},
-          column_id: "${statusColumnId}",
-          value: "{\\"index\\": ${doneIndex}}"
+          column_values: ${JSON.stringify(JSON.stringify(columnValues))}
         ) {
           id
         }
@@ -280,9 +293,9 @@ async function updateMondayItemStatusToDone(itemId, boardId, requestId) {
         'Content-Type': 'application/json'
       }
     });
-    log('info', 'STATUS_UPDATED_TO_DONE', { requestId, itemId, boardId, response: response.data });
+    log('info', 'STATUS_AND_NOTES_UPDATED', { requestId, itemId, boardId, runId, response: response.data });
   } catch (error) {
-    log('error', 'STATUS_UPDATE_FAILED', { requestId, itemId, boardId, error: error.message });
+    log('error', 'STATUS_UPDATE_FAILED', { requestId, itemId, boardId, runId, error: error.message });
   }
 }
 
