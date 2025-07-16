@@ -52,30 +52,47 @@ async function createInvoiceSpecificPDF(originalPdfBuffer, invoiceNumber, pageIn
 
     // Load the original PDF
     const originalPdf = await PDFDocument.load(originalPdfBuffer);
+    const totalPages = originalPdf.getPageCount();
+    
+    log('info', 'ORIGINAL_PDF_INFO', {
+      requestId,
+      invoiceNumber,
+      totalPagesInOriginal: totalPages,
+      requestedPageIndices: pageIndices
+    });
     
     // Create a new PDF document
     const newPdf = await PDFDocument.create();
     
-    // Copy only the pages for this specific invoice
-    for (const pageIndex of pageIndices) {
-      if (pageIndex < originalPdf.getPageCount()) {
-        const [copiedPage] = await newPdf.copyPages(originalPdf, [pageIndex]);
-        newPdf.addPage(copiedPage);
-        
-        log('info', 'PAGE_COPIED_TO_INVOICE_PDF', {
-          requestId,
-          invoiceNumber,
-          pageIndex,
-          totalPages: originalPdf.getPageCount()
-        });
+    // Validate and copy only the pages for this specific invoice
+    const validPageIndices = pageIndices.filter(pageIndex => {
+      if (pageIndex >= 0 && pageIndex < totalPages) {
+        return true;
       } else {
-        log('warn', 'PAGE_INDEX_OUT_OF_RANGE', {
+        log('warn', 'INVALID_PAGE_INDEX', {
           requestId,
           invoiceNumber,
           pageIndex,
-          totalPages: originalPdf.getPageCount()
+          totalPages
         });
+        return false;
       }
+    });
+    
+    if (validPageIndices.length === 0) {
+      throw new Error(`No valid page indices found for invoice ${invoiceNumber}`);
+    }
+    
+    for (const pageIndex of validPageIndices) {
+      const [copiedPage] = await newPdf.copyPages(originalPdf, [pageIndex]);
+      newPdf.addPage(copiedPage);
+      
+      log('info', 'PAGE_COPIED_TO_INVOICE_PDF', {
+        requestId,
+        invoiceNumber,
+        pageIndex,
+        totalPages
+      });
     }
     
     // Generate the PDF buffer
@@ -84,7 +101,8 @@ async function createInvoiceSpecificPDF(originalPdfBuffer, invoiceNumber, pageIn
     log('info', 'INVOICE_PDF_CREATED', {
       requestId,
       invoiceNumber,
-      pageCount: pageIndices.length,
+      requestedPageCount: pageIndices.length,
+      validPageCount: validPageIndices.length,
       outputSize: pdfBytes.length
     });
     
@@ -189,7 +207,7 @@ async function processWebhookData(body, requestId) {
 // Function to update the status column to 'Done' for the original item
 async function updateMondayItemStatusToDone(itemId, boardId, requestId) {
   const statusColumnId = "status"; // Change if your column ID is different
-  const doneLabel = "Done"; // The label as it appears in Monday.com
+  const doneLabel = "Completed"; // The label as it appears in Monday.com
 
   // 1. Fetch the board columns to get the status column settings
   const boardQuery = `
@@ -488,7 +506,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
     return [];
   }
   
-  // Track page indices for each invoice
+  // 🔧 FIXED: Track actual PDF page numbers, not document indices
   extractedFiles.forEach((file, fileIndex) => {
     log('info', 'PROCESSING_FILE', { 
       requestId, 
@@ -503,6 +521,9 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
     
     file.documents.forEach((doc, docIndex) => {
       const fields = doc.fields || {};
+      
+      // 🔧 CRITICAL: Get the actual page number from Instabase
+      const actualPageNumber = doc.page_num || docIndex; // Use page_num if available, fallback to docIndex
       
       // Extract invoice number from each page
       let invoiceNumber = fields['0']?.value;
@@ -519,7 +540,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
           documentGroups[cleanInvoiceNumber] = {
             invoice_number: cleanInvoiceNumber,
             pages: [],
-            pageIndices: [], // 🔧 NEW: Track which pages belong to this invoice
+            pageIndices: [], // Track actual PDF page numbers
             fileName: file.original_file_name,
             masterPage: null
           };
@@ -528,13 +549,14 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
         const pageData = {
           fileIndex,
           docIndex,
+          actualPageNumber, // 🔧 NEW: Store the actual page number
           fields,
           fileName: file.original_file_name,
           invoiceNumber: cleanInvoiceNumber
         };
         
         documentGroups[cleanInvoiceNumber].pages.push(pageData);
-        documentGroups[cleanInvoiceNumber].pageIndices.push(docIndex); // 🔧 NEW: Track page index
+        documentGroups[cleanInvoiceNumber].pageIndices.push(actualPageNumber); // 🔧 FIXED: Use actual page number
         
         // Set first page with this invoice number as master
         if (!documentGroups[cleanInvoiceNumber].masterPage) {
@@ -544,7 +566,8 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
         log('info', 'PAGE_GROUPED_BY_INVOICE', {
           requestId,
           invoiceNumber: cleanInvoiceNumber,
-          pageIndex: docIndex,
+          docIndex: docIndex,
+          actualPageNumber: actualPageNumber, // 🔧 NEW: Log both for debugging
           fileName: file.original_file_name
         });
       } else {
@@ -552,13 +575,24 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
           requestId,
           fileIndex,
           docIndex,
+          actualPageNumber: doc.page_num || docIndex,
           availableFields: Object.keys(fields)
         });
       }
     });
   });
   
-  // Create reconstructed documents with page indices
+  log('info', 'INVOICES_GROUPED', {
+    requestId,
+    invoiceNumbers: Object.keys(documentGroups),
+    groupsByInvoice: Object.keys(documentGroups).map(invoiceNum => ({
+      invoiceNumber: invoiceNum,
+      pageCount: documentGroups[invoiceNum].pages.length,
+      pageIndices: documentGroups[invoiceNum].pageIndices // 🔧 NEW: Show actual page numbers
+    }))
+  });
+  
+  // Create reconstructed documents with correct page indices
   const resultGroups = [];
   
   Object.keys(documentGroups).forEach(invoiceNumber => {
@@ -581,8 +615,16 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
       );
       
       if (reconstructedDocument) {
-        // 🔧 NEW: Add page indices to the document
+        // 🔧 FIXED: Add correct page indices to the document
         reconstructedDocument.pageIndices = group.pageIndices;
+        reconstructedDocument.debugInfo = {
+          originalFileName: group.fileName,
+          pageMapping: group.pages.map(p => ({
+            invoiceNumber: p.invoiceNumber,
+            docIndex: p.docIndex,
+            actualPageNumber: p.actualPageNumber
+          }))
+        };
         resultGroups.push(reconstructedDocument);
       }
     }
