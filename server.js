@@ -18,7 +18,7 @@ app.use(express.json());
 const INSTABASE_CONFIG = {
   baseUrl:       'https://aihub.instabase.com',
   apiKey:        'b1qiTmzarVHmCoX3UQY9KANvz6a8xp',
-  deploymentId:  '2d4ebb2a-8461-495e-9466-ca92ce4f7b81',
+  deploymentId:  '01980ed0-7584-7e30-aad8-2b286de010f4',
   headers: {
     'IB-Context':   'STU',
     'Authorization': 'Bearer b1qiTmzarVHmCoX3UQY9KANvz6a8xp',
