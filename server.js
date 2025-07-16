@@ -1094,6 +1094,52 @@ app.post('/test/process-item/:id', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 8️⃣b  WEBHOOK: MONDAY TO INSTABASE (PRODUCTION ENDPOINT)
+// ----------------------------------------------------------------------------
+app.post('/webhook/monday-to-instabase', async (req, res) => {
+  const requestId = `webhook_${Date.now()}`;
+  try {
+    log('info', 'WEBHOOK_PROCESSING_START', { requestId, body: req.body, query: req.query });
+    // Accept itemId from body, query, or fallback
+    const itemId = req.body?.itemId || req.query?.itemId || req.body?.id;
+    if (!itemId) {
+      log('error', 'NO_ITEM_ID_PROVIDED', { requestId, body: req.body, query: req.query });
+      return res.status(400).json({ success: false, error: 'Missing itemId in request', requestId });
+    }
+    // Download files from Monday.com
+    const files = await getMondayItemFilesWithPublicUrl(itemId, MONDAY_CONFIG.fileUploadsBoardId, requestId);
+    if (!files || files.length === 0) {
+      log('warn', 'NO_FILES_FOUND_FOR_ITEM', { requestId, itemId });
+      return res.status(404).json({ success: false, error: 'No PDF files found for item', itemId, requestId });
+    }
+    // Process with Instabase
+    const { files: extracted, originalFiles, runId } = await processFilesWithInstabase(files, requestId);
+    // Group by invoice number
+    const groups = groupPagesByInvoiceNumber(extracted, requestId);
+    // Create Monday.com extracted items
+    await createMondayExtractedItems(groups, itemId, originalFiles, requestId, runId);
+    res.json({
+      success: true,
+      message: 'Webhook processing completed',
+      requestId,
+      instabaseRunId: runId,
+      filesProcessed: files.length,
+      groupsCreated: groups.length,
+      itemsWithLineItems: groups.filter(g => g.items.length > 0).length,
+      reconstructionDetails: groups.map(g => ({
+        invoiceNumber: g.invoice_number,
+        lineItemCount: g.items?.length || 0,
+        totalAmount: g.total_amount,
+        lineNumbers: g.items?.map(item => item.line_number) || []
+      }))
+    });
+  } catch (error) {
+    log('error', 'WEBHOOK_PROCESSING_ERROR', { requestId, error: error.message });
+    res.status(500).json({ error: error.message, requestId });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 9️⃣  START SERVER
 // ----------------------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
