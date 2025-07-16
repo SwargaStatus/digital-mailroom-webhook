@@ -191,20 +191,71 @@ async function updateMondayItemStatusToDone(itemId, boardId, requestId) {
   const statusColumnId = "status"; // Change if your column ID is different
   const doneLabel = "Done"; // The label as it appears in Monday.com
 
-  const mutation = `
-    mutation {
-      change_column_value(
-        board_id: ${boardId},
-        item_id: ${itemId},
-        column_id: "${statusColumnId}",
-        value: "{\\"label\\": \\\"${doneLabel}\\\"}"
-      ) {
-        id
+  // 1. Fetch the board columns to get the status column settings
+  const boardQuery = `
+    query {
+      boards(ids: [${boardId}]) {
+        columns {
+          id
+          title
+          type
+          settings_str
+        }
       }
     }
   `;
 
   try {
+    const boardResponse = await axios.post('https://api.monday.com/v2', { query: boardQuery }, {
+      headers: {
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
+    const statusColumn = columns.find(col => col.id === statusColumnId && col.type === 'status');
+    if (!statusColumn) {
+      log('error', 'STATUS_COLUMN_NOT_FOUND', { requestId, itemId, boardId });
+      return;
+    }
+
+    // 2. Parse settings_str to get the labels and their indexes
+    let doneIndex = null;
+    try {
+      const settings = JSON.parse(statusColumn.settings_str);
+      if (settings.labels) {
+        for (const [index, label] of Object.entries(settings.labels)) {
+          if (label && label.trim().toLowerCase() === doneLabel.toLowerCase()) {
+            doneIndex = parseInt(index, 10);
+            break;
+          }
+        }
+      }
+    } catch (e) {
+      log('error', 'STATUS_COLUMN_SETTINGS_PARSE_ERROR', { requestId, error: e.message });
+      return;
+    }
+
+    if (doneIndex === null) {
+      log('error', 'DONE_LABEL_NOT_FOUND', { requestId, itemId, boardId, labels: statusColumn.settings_str });
+      return;
+    }
+
+    // 3. Use the index in your mutation
+    const mutation = `
+      mutation {
+        change_column_value(
+          board_id: ${boardId},
+          item_id: ${itemId},
+          column_id: "${statusColumnId}",
+          value: "{\\"index\\": ${doneIndex}}"
+        ) {
+          id
+        }
+      }
+    `;
+
     const response = await axios.post('https://api.monday.com/v2', { query: mutation }, {
       headers: {
         'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
