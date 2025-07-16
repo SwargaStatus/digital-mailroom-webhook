@@ -20,7 +20,7 @@ const INSTABASE_CONFIG = {
   apiKey:        'GTovDkdhQjNTbSUQ1Nh201xvZvmM00',
   deploymentId:  '01980ed0-7584-7e30-aad8-2b286de010f4',
   headers: {
-    'IB-Context':   'STU',
+    'IB-Context':   'stu',
     'Authorization': 'Bearer GTovDkdhQjNTbSUQ1Nh201xvZvmM00',
     'Content-Type':  'application/json'
   }
