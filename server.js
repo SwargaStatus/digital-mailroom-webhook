@@ -572,7 +572,7 @@ async function processFilesWithInstabase(files, requestId) {
   }
 }
 
-// 🔧 FIXED: Grouping function with consistent page tracking
+// 🔧 FIXED: Grouping function with correct PDF buffer and page index handling
 function groupPagesByInvoiceNumber(extractedFiles, requestId) {
   log('info', 'GROUPING_START', { 
     requestId, 
@@ -583,7 +583,6 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
     log('warn', 'NO_FILES_TO_GROUP', { requestId });
     return [];
   }
-  // 🔧 CRITICAL FIX: Track pages consistently without double-filtering
   extractedFiles.forEach((file, fileIndex) => {
     log('info', 'PROCESSING_FILE', { requestId, fileIndex, fileName: file.original_file_name });
     if (!file.documents || file.documents.length === 0) {
@@ -592,8 +591,15 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
     }
     file.documents.forEach((doc, docIndex) => {
       const fields = doc.fields || {};
-      // 🔧 CRITICAL: Use docIndex as the PDF page number (0-based indexing)
-      const pdfPageIndex = docIndex;
+      // Prefer Instabase's real page number (normalize to 0-based)
+      let pdfPageIndex = null;
+      if (typeof doc.page_num === 'number') {
+        pdfPageIndex = doc.page_num - 1; // Instabase is usually 1-based
+      } else if (doc.page_range && typeof doc.page_range.start === 'number') {
+        pdfPageIndex = doc.page_range.start - 1;
+      } else {
+        pdfPageIndex = docIndex; // fallback
+      }
       let invoiceNumber = fields['0']?.value;
       if (invoiceNumber && invoiceNumber !== 'unknown' && invoiceNumber !== 'none' && invoiceNumber !== '') {
         const cleanInvoiceNumber = String(invoiceNumber).trim();
@@ -601,7 +607,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
           documentGroups[cleanInvoiceNumber] = {
             invoice_number: cleanInvoiceNumber,
             pages: [],
-            pageIndices: [], // Track PDF page indices for extraction
+            pageIndices: [],
             fileName: file.original_file_name,
             masterPage: null
           };
@@ -609,13 +615,13 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
         const pageData = {
           fileIndex,
           docIndex,
-          pdfPageIndex, // 🔧 NEW: Explicit PDF page index
+          pdfPageIndex,
           fields,
           fileName: file.original_file_name,
           invoiceNumber: cleanInvoiceNumber
         };
         documentGroups[cleanInvoiceNumber].pages.push(pageData);
-        documentGroups[cleanInvoiceNumber].pageIndices.push(pdfPageIndex); // 🔧 FIXED: Use consistent index
+        documentGroups[cleanInvoiceNumber].pageIndices.push(pdfPageIndex);
         if (!documentGroups[cleanInvoiceNumber].masterPage) {
           documentGroups[cleanInvoiceNumber].masterPage = pageData;
         }
@@ -623,7 +629,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
           requestId,
           invoiceNumber: cleanInvoiceNumber,
           docIndex: docIndex,
-          pdfPageIndex: pdfPageIndex, // 🔧 NEW: Log the actual PDF page index
+          pdfPageIndex: pdfPageIndex,
           fileName: file.original_file_name
         });
       } else {
@@ -631,7 +637,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
           requestId,
           fileIndex,
           docIndex,
-          pdfPageIndex: docIndex,
+          pdfPageIndex: pdfPageIndex,
           availableFields: Object.keys(fields)
         });
       }
@@ -646,7 +652,6 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
       pageIndices: documentGroups[invoiceNum].pageIndices
     }))
   });
-  // 🔧 FIXED: No double-filtering, use original pageIndices
   const resultGroups = [];
   Object.keys(documentGroups).forEach(invoiceNumber => {
     const group = documentGroups[invoiceNumber];
@@ -655,7 +660,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
         requestId,
         invoiceNumber,
         pageCount: group.pages.length,
-        pageIndices: group.pageIndices // 🔧 FIXED: Use original pageIndices
+        pageIndices: group.pageIndices
       });
       const reconstructedDocument = reconstructSingleInvoiceDocument(
         group.pages, 
@@ -665,8 +670,9 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
         invoiceNumber
       );
       if (reconstructedDocument) {
-        // 🔧 FIXED: Use the original pageIndices without modification
-        reconstructedDocument.pageIndices = group.pageIndices;
+        // Sort and dedupe page indices for this invoice
+        reconstructedDocument.pageIndices = Array.from(new Set(group.pageIndices)).filter(i => i >= 0).sort((a, b) => a - b);
+        reconstructedDocument.fileName = group.fileName;
         reconstructedDocument.debugInfo = {
           originalFileName: group.fileName,
           pageMapping: group.pages.map(p => ({
@@ -1035,7 +1041,8 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         documentType: doc.document_type,
         invoiceNumber: doc.invoice_number,
         itemCount: doc.items?.length || 0,
-        pageIndices: doc.pageIndices
+        pageIndices: doc.pageIndices,
+        fileName: doc.fileName
       });
       
       const formatDate = (dateStr) => {
@@ -1046,7 +1053,7 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
           let date;
           if (typeof dateStr === 'string') {
             const cleanDate = dateStr.trim();
-            if (cleanDate.match(/^\d{4}-\d{2}-\d{2}$/)) {
+            if (cleanDate.match(/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/)) {
               return cleanDate;
             }
             date = new Date(cleanDate);
@@ -1105,22 +1112,30 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         invoiceNumber: doc.invoice_number
       });
       
-      // 🔧 FIXED: Upload invoice-specific PDF file
+      // Use the correct buffer for this invoice's file
       if (originalFiles && originalFiles.length > 0 && doc.pageIndices && doc.pageIndices.length > 0) {
         const fileColumn = columns.find(col => col.type === 'file');
         if (fileColumn) {
           try {
-            // Create a PDF with only the pages for this specific invoice
+            // Find the buffer for this doc's file
+            const bufferForThisDoc = originalFiles.find(f => f.name === doc.fileName)?.buffer;
+            if (!bufferForThisDoc) {
+              log('error', 'PDF_BUFFER_NOT_FOUND_FOR_DOC', {
+                requestId,
+                fileName: doc.fileName,
+                availableFiles: originalFiles.map(f => f.name)
+              });
+              continue;
+            }
+            // Sort page indices before extraction
+            const sortedPageIndices = Array.from(new Set(doc.pageIndices)).filter(i => i >= 0).sort((a, b) => a - b);
             const invoiceSpecificPdf = await createInvoiceSpecificPDF(
-              originalFiles[0].buffer, 
+              bufferForThisDoc, 
               doc.invoice_number, 
-              doc.pageIndices, 
+              sortedPageIndices, 
               requestId
             );
-            
-            // Generate a specific filename for this invoice
             const invoiceFileName = `Invoice_${doc.invoice_number}.pdf`;
-            
             await uploadPdfToMondayItem(
               createdItemId, 
               invoiceSpecificPdf, 
@@ -1128,15 +1143,13 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
               fileColumn.id, 
               requestId
             );
-            
             log('info', 'INVOICE_SPECIFIC_PDF_UPLOADED', {
               requestId,
               itemId: createdItemId,
               invoiceNumber: doc.invoice_number,
               fileName: invoiceFileName,
-              pageIndices: doc.pageIndices
+              pageIndices: sortedPageIndices
             });
-            
           } catch (uploadError) {
             log('error', 'PDF_UPLOAD_FAILED', {
               requestId,
