@@ -1934,7 +1934,7 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
     // Get the item with the formula column (item ID as number, not string)
     const itemQuery = `
       query {
-        items(ids: [${createdItemId}]) {
+        items(ids: [${+createdItemId}]) {
           id
           name
           column_values {
