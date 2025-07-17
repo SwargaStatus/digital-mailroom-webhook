@@ -1049,6 +1049,64 @@ function extractLineItemsFromPage(page, requestId, pageIndex) {
   return processedItems;
 }
 
+// 🔧 NEW: Extraction mathematical validation
+function validateExtractionAccuracy(doc, requestId) {
+  const tolerance = 0.05; // 5% tolerance for rounding differences
+  let calculatedLineTotal = 0;
+  if (doc.items && doc.items.length > 0) {
+    calculatedLineTotal = doc.items.reduce((sum, item) => {
+      return sum + (item.quantity * item.unit_cost);
+    }, 0);
+  }
+  const expectedTotal = calculatedLineTotal + (doc.tax_amount || 0);
+  const actualTotal = doc.total_amount || 0;
+  const difference = Math.abs(expectedTotal - actualTotal);
+  const percentageDiff = actualTotal > 0 ? (difference / actualTotal) : 1;
+  const validationResult = {
+    isValid: percentageDiff <= tolerance,
+    calculatedLineTotal: calculatedLineTotal,
+    expectedTotal: expectedTotal,
+    actualTotal: actualTotal,
+    difference: difference,
+    percentageDiff: percentageDiff,
+    toleranceThreshold: tolerance,
+    lineItemCount: doc.items?.length || 0,
+    pageCount: doc.originalPageCount || 1,
+    requiresRetry: percentageDiff > tolerance && doc.originalPageCount > 2
+  };
+  log(validationResult.isValid ? 'info' : 'warn', 'EXTRACTION_VALIDATION', {
+    requestId,
+    invoiceNumber: doc.invoice_number,
+    ...validationResult
+  });
+  return validationResult;
+}
+
+// 🔧 NEW: Extraction failure logging
+async function logExtractionFailure(doc, validationResult, originalFiles, requestId, instabaseRunId) {
+  const failureDetails = {
+    timestamp: new Date().toISOString(),
+    requestId: requestId,
+    instabaseRunId: instabaseRunId,
+    invoiceNumber: doc.invoice_number,
+    documentType: doc.document_type,
+    supplier: doc.supplier_name,
+    actualTotal: doc.total_amount,
+    calculatedTotal: validationResult.expectedTotal,
+    taxAmount: doc.tax_amount,
+    difference: validationResult.difference,
+    percentageError: (validationResult.percentageDiff * 100).toFixed(2),
+    pageCount: doc.originalPageCount,
+    lineItemsExtracted: doc.items?.length || 0,
+    fileName: doc.fileName,
+    pageIndices: doc.pageIndices,
+    failureReason: 'MATHEMATICAL_VALIDATION_FAILED',
+    retryEligible: validationResult.requiresRetry
+  };
+  log('error', 'EXTRACTION_FAILURE_LOGGED', failureDetails);
+  return failureDetails;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 7️⃣  ENHANCED MONDAY ITEMS CREATION WITH FIXED SOURCE ID & SUBITEM INDEXING
 // ----------------------------------------------------------------------------
@@ -1264,202 +1322,264 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
   }
 }
 
-// 🔧 ENHANCED: Subitem creation with better error handling and timeouts
-async function createSubitemsForLineItems(parentItemId, items, columns, requestId) {
-  try {
-    log('info', 'SUBITEM_CREATION_START', { requestId, parentItemId, lineItemCount: items.length });
-    const subitemsColumn = columns.find(c => c.type === 'subtasks');
-    if (!subitemsColumn) {
-      log('error', 'NO_SUBTASKS_COLUMN_FOUND', { requestId });
-      return;
-    }
-    let settings = {};
+// 🔧 NEW: Retry handler for failed extractions
+async function handleExtractionRetries(failedGroups, sourceItemId, originalFiles, requestId) {
+  log('info', 'STARTING_EXTRACTION_RETRIES', {
+    requestId,
+    failedGroupCount: failedGroups.length
+  });
+  for (const { doc, failureDetails, validation } of failedGroups) {
     try {
-      settings = JSON.parse(subitemsColumn.settings_str || '{}');
-    } catch (e) {
-      log('error', 'SETTINGS_PARSE_ERROR', { requestId, error: e.message });
+      log('info', 'PROCESSING_RETRY_FOR_INVOICE', {
+        requestId,
+        invoiceNumber: doc.invoice_number,
+        originalPageCount: doc.originalPageCount,
+        failureReason: failureDetails.failureReason
+      });
+      // STEP 1: Create individual page PDFs for retry
+      const retryFiles = await createSplitPagePDFs(doc, originalFiles, requestId);
+      if (retryFiles.length === 0) {
+        log('error', 'NO_RETRY_FILES_CREATED', {
+          requestId,
+          invoiceNumber: doc.invoice_number
+        });
+        continue;
+      }
+      // STEP 2: Process split pages with Instabase
+      const { files: retryExtracted, runId: retryRunId } = await processFilesWithInstabase(retryFiles, requestId);
+      // STEP 3: Extract line items from retry results
+      const retryLineItems = await extractLineItemsFromRetryResults(retryExtracted, requestId);
+      // STEP 4: Validate retry results
+      const retryDoc = {
+        ...doc,
+        items: retryLineItems,
+        retryAttempt: true,
+        originalRunId: failureDetails.instabaseRunId,
+        retryRunId: retryRunId
+      };
+      const retryValidation = validateExtractionAccuracy(retryDoc, requestId);
+      if (retryValidation.isValid) {
+        log('info', 'RETRY_SUCCESSFUL', {
+          requestId,
+          invoiceNumber: doc.invoice_number,
+          originalLineItems: doc.items?.length || 0,
+          retryLineItems: retryLineItems.length,
+          originalTotal: validation.calculatedLineTotal,
+          retryTotal: retryValidation.calculatedLineTotal
+        });
+        // STEP 5: Create/Update Monday item with correct data
+        await createMondayExtractedItems([retryDoc], sourceItemId, originalFiles, requestId, retryRunId);
+      } else {
+        log('error', 'RETRY_ALSO_FAILED', {
+          requestId,
+          invoiceNumber: doc.invoice_number,
+          retryValidation
+        });
+        // Create item with error status for manual review
+        await createFailedExtractionItem(doc, failureDetails, retryValidation, sourceItemId, originalFiles, requestId);
+      }
+    } catch (retryError) {
+      log('error', 'RETRY_PROCESSING_ERROR', {
+        requestId,
+        invoiceNumber: doc.invoice_number,
+        error: retryError.message
+      });
+      // Create item with error status
+      await createFailedExtractionItem(doc, failureDetails, validation, sourceItemId, originalFiles, requestId);
+    }
+  }
+}
+
+// 🔧 NEW: Create individual page PDFs for retry
+async function createSplitPagePDFs(doc, originalFiles, requestId) {
+  try {
+    log('info', 'CREATING_SPLIT_PAGE_PDFS', {
+      requestId,
+      invoiceNumber: doc.invoice_number,
+      pageIndices: doc.pageIndices,
+      fileName: doc.fileName
+    });
+    const sourceFile = originalFiles.find(f => f.name === doc.fileName);
+    if (!sourceFile) {
+      throw new Error(`Source file not found: ${doc.fileName}`);
+    }
+    const originalPdf = await PDFDocument.load(sourceFile.buffer);
+    const splitFiles = [];
+    for (let i = 0; i < doc.pageIndices.length; i++) {
+      const pageIndex = doc.pageIndices[i];
+      const newPdf = await PDFDocument.create();
+      const [copiedPage] = await newPdf.copyPages(originalPdf, [pageIndex]);
+      newPdf.addPage(copiedPage);
+      const pdfBytes = await newPdf.save();
+      const fileName = `${doc.invoice_number}_page_${pageIndex + 1}_retry.pdf`;
+      splitFiles.push({
+        name: fileName,
+        buffer: Buffer.from(pdfBytes),
+        public_url: null,
+        pageIndex: pageIndex,
+        invoiceNumber: doc.invoice_number
+      });
+      log('info', 'SPLIT_PAGE_CREATED', {
+        requestId,
+        invoiceNumber: doc.invoice_number,
+        pageIndex: pageIndex,
+        fileName: fileName,
+        size: pdfBytes.length
+      });
+    }
+    return splitFiles;
+  } catch (error) {
+    log('error', 'SPLIT_PDF_CREATION_FAILED', {
+      requestId,
+      invoiceNumber: doc.invoice_number,
+      error: error.message
+    });
+    return [];
+  }
+}
+
+// 🔧 NEW: Extract line items from retry processing results
+async function extractLineItemsFromRetryResults(retryExtracted, requestId) {
+  const allRetryLineItems = [];
+  if (!retryExtracted || retryExtracted.length === 0) {
+    log('warn', 'NO_RETRY_RESULTS_TO_PROCESS', { requestId });
+    return allRetryLineItems;
+  }
+  retryExtracted.forEach((file, fileIndex) => {
+    log('info', 'PROCESSING_RETRY_FILE', {
+      requestId,
+      fileIndex,
+      fileName: file.original_file_name,
+      documentCount: file.documents?.length || 0
+    });
+    if (!file.documents || file.documents.length === 0) {
       return;
     }
-    const subitemBoardId = Array.isArray(settings.boardIds)
-      ? settings.boardIds[0]
-      : settings.linked_board_id;
-    if (!subitemBoardId) {
-      log('error', 'MISSING_SUBITEM_BOARD_ID', { requestId, settings });
-      return;
-    }
-    // Fetch subitem board columns
-    const colsQuery = `
+    file.documents.forEach((doc, docIndex) => {
+      const pageItems = extractLineItemsFromPage({
+        fields: doc.fields || {},
+        fileName: file.original_file_name,
+        invoiceNumber: file.original_file_name.split('_')[0]
+      }, requestId, docIndex);
+      if (pageItems.length > 0) {
+        allRetryLineItems.push(...pageItems);
+        log('info', 'RETRY_LINE_ITEMS_FOUND', {
+          requestId,
+          fileName: file.original_file_name,
+          itemCount: pageItems.length
+        });
+      }
+    });
+  });
+  allRetryLineItems.sort((a, b) => {
+    const aNum = parseFloat(a.line_number) || 0;
+    const bNum = parseFloat(b.line_number) || 0;
+    return aNum - bNum;
+  });
+  log('info', 'RETRY_LINE_ITEMS_EXTRACTED', {
+    requestId,
+    totalItems: allRetryLineItems.length
+  });
+  return allRetryLineItems;
+}
+
+// 🔧 NEW: Create Monday item for failed extractions requiring manual review
+async function createFailedExtractionItem(doc, failureDetails, validation, sourceItemId, originalFiles, requestId) {
+  try {
+    log('info', 'CREATING_FAILED_EXTRACTION_ITEM', {
+      requestId,
+      invoiceNumber: doc.invoice_number
+    });
+    const boardQuery = `
       query {
-        boards(ids: [${subitemBoardId}]) {
-          columns { id title type }
+        boards(ids: [${MONDAY_CONFIG.extractedDocsBoardId}]) {
+          columns { id title type settings_str }
         }
       }
     `;
-    const colsResponse = await axios.post('https://api.monday.com/v2', { query: colsQuery }, {
-      headers: { Authorization: `Bearer ${MONDAY_CONFIG.apiKey}` }
+    const boardResponse = await axios.post('https://api.monday.com/v2', { query: boardQuery }, {
+      headers: { 'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}` }
     });
-    const subitemColumns = colsResponse.data.data.boards[0].columns;
-    // 🔧 ENHANCED: Batch creation with error recovery
-    let successCount = 0;
-    let failureCount = 0;
-    const batchSize = 5; // Process in smaller batches
-    for (let i = 0; i < items.length; i += batchSize) {
-      const batch = items.slice(i, i + batchSize);
-      log('info', 'PROCESSING_SUBITEM_BATCH', {
-        requestId,
-        batchStart: i,
-        batchSize: batch.length,
-        totalItems: items.length
-      });
-      for (const item of batch) {
-        try {
-          const { line_number, item_number, quantity, unit_cost, description, source_page, po_number } = item;
-          const columnValues = {};
-          const actualLineNumber = line_number || `${items.indexOf(item) + 1}`;
-          subitemColumns.forEach(col => {
-            const title = col.title.trim().toLowerCase();
-            if (title.includes('line number') || title.includes('line #') || title.includes('subitem') || title === 'index') {
-              if (col.type === 'numbers') {
-                const numericLineNumber = parseFloat(actualLineNumber);
-                columnValues[col.id] = isNaN(numericLineNumber) ? (items.indexOf(item) + 1) : numericLineNumber;
-              } else {
-                columnValues[col.id] = actualLineNumber;
-              }
-            } else if (title === 'item number' || title.includes('item num')) {
-              columnValues[col.id] = item_number || '';
-            } else if (title === 'quantity' || title === 'qty') {
-              if (col.type === 'numbers') {
-                columnValues[col.id] = quantity || 0;
-              } else {
-                columnValues[col.id] = String(quantity || 0);
-              }
-            } else if (title === 'unit cost' || title.includes('unit cost')) {
-              if (col.type === 'numbers') {
-                columnValues[col.id] = unit_cost || 0;
-              } else {
-                columnValues[col.id] = String(unit_cost || 0);
-              }
-            } else if (title === 'description' || title.includes('desc')) {
-              columnValues[col.id] = description || '';
-            } else if (title.includes('source page') || title.includes('page')) {
-              columnValues[col.id] = source_page || '';
-            } else if (title.includes('po number') || title === 'po' || title.includes('purchase order')) {
-              columnValues[col.id] = po_number || '';
-            }
-          });
-          const subitemName = `Line ${actualLineNumber}`;
-          const escapedName = subitemName.replace(/"/g, '\"');
-          const columnValuesJson = JSON.stringify(columnValues);
-          const mutation = `
-            mutation {
-              create_subitem(
-                parent_item_id: ${parentItemId}
-                item_name: "${escapedName}"
-                column_values: ${JSON.stringify(columnValuesJson)}
-              ) { 
-                id 
-                name
-              }
-            }
-          `;
-          // 🔧 ENHANCED: Extended timeout for subitem creation
-          const response = await axios.post('https://api.monday.com/v2', { query: mutation }, {
-            headers: {
-              Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
-              'Content-Type': 'application/json',
-              'API-Version': '2024-04'
-            },
-            timeout: 30000 // 🔧 INCREASED: 30 second timeout
-          });
-          if (response.data.errors) {
-            log('error', 'SUBITEM_CREATION_ERROR', { 
-              requestId, 
-              lineNumber: actualLineNumber, 
-              errors: response.data.errors 
-            });
-            // 🔧 ENHANCED: Retry with simple creation on error
-            const simpleQuery = `
-              mutation {
-                create_subitem(
-                  parent_item_id: ${parentItemId}
-                  item_name: "${escapedName}"
-                ) { 
-                  id 
-                  name
-                }
-              }
-            `;
-            try {
-              const retryResponse = await axios.post('https://api.monday.com/v2', { query: simpleQuery }, {
-                headers: {
-                  Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
-                  'Content-Type': 'application/json',
-                  'API-Version': '2024-04'
-                },
-                timeout: 30000
-              });
-              if (retryResponse.data.errors) {
-                failureCount++;
-                log('error', 'SUBITEM_RETRY_FAILED', {
-                  requestId,
-                  lineNumber: actualLineNumber,
-                  errors: retryResponse.data.errors
-                });
-              } else {
-                successCount++;
-                log('info', 'SUBITEM_RETRY_SUCCESS', {
-                  requestId,
-                  lineNumber: actualLineNumber,
-                  subitemId: retryResponse.data.data.create_subitem.id
-                });
-              }
-            } catch (retryError) {
-              failureCount++;
-              log('error', 'SUBITEM_RETRY_EXCEPTION', {
-                requestId,
-                lineNumber: actualLineNumber,
-                error: retryError.message
-              });
-            }
-          } else {
-            successCount++;
-            log('info', 'SUBITEM_CREATED_SUCCESS', { 
-              requestId, 
-              lineNumber: actualLineNumber, 
-              subitemId: response.data.data.create_subitem.id,
-              poNumber: po_number
-            });
-          }
-        } catch (itemError) {
-          failureCount++;
-          log('error', 'SUBITEM_CREATION_EXCEPTION', {
-            requestId,
-            itemIndex: items.indexOf(item),
-            error: itemError.message
-          });
-        }
-        // 🔧 ENHANCED: Longer delay between requests to avoid rate limits
-        await new Promise(resolve => setTimeout(resolve, 500));
+    const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
+    const columnValues = buildColumnValues(columns, doc, (dateStr) => {
+      if (!dateStr) return '';
+      try {
+        return new Date(dateStr).toISOString().split('T')[0];
+      } catch (e) {
+        return '';
       }
-      // 🔧 ENHANCED: Longer delay between batches
-      if (i + batchSize < items.length) {
-        log('info', 'BATCH_COMPLETE_WAITING', { requestId, completedItems: i + batchSize, totalItems: items.length });
-        await new Promise(resolve => setTimeout(resolve, 2000));
+    }, failureDetails.instabaseRunId);
+    const statusColumn = columns.find(col => col.title.toLowerCase().includes('status'));
+    if (statusColumn && statusColumn.type === 'status') {
+      try {
+        const settings = JSON.parse(statusColumn.settings_str);
+        const errorLabel = Object.entries(settings.labels || {}).find(([_, label]) => 
+          label && (label.toLowerCase().includes('error') || label.toLowerCase().includes('review'))
+        );
+        if (errorLabel) {
+          columnValues[statusColumn.id] = { "index": parseInt(errorLabel[0]) };
+        }
+      } catch (e) {}
+    }
+    const notesColumn = columns.find(col => 
+      col.title.toLowerCase().includes('notes') && 
+      (col.type === 'text' || col.type === 'long_text')
+    );
+    if (notesColumn) {
+      columnValues[notesColumn.id] = `EXTRACTION FAILED - Requires Manual Review\n` +
+        `Original Run ID: ${failureDetails.instabaseRunId}\n` +
+        `Error: ${failureDetails.percentageError}% difference between calculated and actual totals\n` +
+        `Calculated: $${failureDetails.calculatedTotal.toFixed(2)}\n` +
+        `Actual: $${failureDetails.actualTotal.toFixed(2)}\n` +
+        `Pages: ${failureDetails.pageCount}\n` +
+        `Line Items Found: ${failureDetails.lineItemsExtracted}`;
+    }
+    const mutation = `
+      mutation {
+        create_item(
+          board_id: ${MONDAY_CONFIG.extractedDocsBoardId}
+          item_name: "FAILED: ${doc.invoice_number || 'Unknown'}"
+          column_values: ${JSON.stringify(JSON.stringify(columnValues))}
+        ) {
+          id
+          name
+        }
+      }
+    `;
+    const response = await axios.post('https://api.monday.com/v2', { query: mutation }, {
+      headers: { 'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}` }
+    });
+    if (response.data.errors) {
+      log('error', 'FAILED_ITEM_CREATION_ERROR', {
+        requestId,
+        errors: response.data.errors
+      });
+    } else {
+      const createdItemId = response.data.data.create_item.id;
+      log('info', 'FAILED_EXTRACTION_ITEM_CREATED', {
+        requestId,
+        itemId: createdItemId,
+        invoiceNumber: doc.invoice_number
+      });
+      const fileColumn = columns.find(col => col.type === 'file');
+      if (fileColumn && originalFiles && originalFiles.length > 0) {
+        const sourceFile = originalFiles.find(f => f.name === doc.fileName);
+        if (sourceFile) {
+          await uploadPdfToMondayItem(
+            createdItemId,
+            sourceFile.buffer,
+            `FAILED_${doc.fileName}`,
+            fileColumn.id,
+            requestId
+          );
+        }
       }
     }
-    log('info', 'ALL_SUBITEMS_PROCESSED', { 
-      requestId, 
-      parentItemId, 
-      totalLineItems: items.length,
-      successCount,
-      failureCount
-    });
   } catch (error) {
-    log('error', 'SUBITEM_CREATION_FAILED', {
+    log('error', 'FAILED_EXTRACTION_ITEM_CREATION_ERROR', {
       requestId,
-      parentItemId,
-      error: error.message,
-      stack: error.stack
+      invoiceNumber: doc.invoice_number,
+      error: error.message
     });
   }
 }
