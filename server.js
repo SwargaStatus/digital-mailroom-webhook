@@ -1929,9 +1929,7 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
       itemId: createdItemId,
       invoiceNumber: doc.invoice_number
     });
-    // Wait a moment for subitems to be fully created and formula to calculate
     await new Promise(resolve => setTimeout(resolve, 5000));
-    // Get the item with the formula column
     const itemQuery = `
       query {
         items(ids: [${createdItemId}]) {
@@ -1970,7 +1968,6 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
       });
       return;
     }
-    // Find the validation column
     const validationColumn = item.column_values.find(col => 
       col.title.toLowerCase().includes('items match total') || 
       col.title.toLowerCase().includes('match total') ||
@@ -1994,7 +1991,6 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
       validationText: validationText,
       validationValue: validationValue
     });
-    // Check if validation failed (looking for "No", "False", "❌", etc.)
     const validationFailed = validationText.includes('no') || 
                             validationText.includes('false') || 
                             validationText.includes('❌') || 
@@ -2008,12 +2004,10 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
         invoiceNumber: doc.invoice_number,
         validationText: validationText
       });
-      // Get additional details from other columns for failure logging
       const totalAmountColumn = item.column_values.find(col => 
         col.title.toLowerCase().includes('total amount')
       );
       const actualTotal = totalAmountColumn ? parseFloat(totalAmountColumn.text?.replace(/[^0-9.-]/g, '') || '0') : 0;
-      // Create failure details
       const failureDetails = {
         timestamp: new Date().toISOString(),
         requestId: requestId,
@@ -2031,11 +2025,8 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
         retryEligible: true,
         mondayItemId: createdItemId
       };
-      // Log the failure
       log('error', 'MONDAY_VALIDATION_FAILURE_LOGGED', failureDetails);
-      // Update the item status to show it's being retried
       await updateMondayItemForRetry(createdItemId, 'Retrying - Validation Failed', requestId);
-      // Trigger retry process
       await handleSingleDocumentRetry(doc, failureDetails, originalFiles, requestId, createdItemId);
     } else {
       log('info', 'MONDAY_VALIDATION_PASSED', {
@@ -2058,7 +2049,6 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
 // 🔧 NEW: Update Monday item status for retry
 async function updateMondayItemForRetry(itemId, statusText, requestId) {
   try {
-    // Find a status or text column to update
     const boardQuery = `
       query {
         boards(ids: [${MONDAY_CONFIG.extractedDocsBoardId}]) {
@@ -2080,19 +2070,16 @@ async function updateMondayItemForRetry(itemId, statusText, requestId) {
       }
     });
     const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
-    // Try to find a status column with "Retrying" or "Processing" option
     const statusColumn = columns.find(col => col.type === 'status');
     const notesColumn = columns.find(col => 
       col.title.toLowerCase().includes('notes') && 
       (col.type === 'text' || col.type === 'long_text')
     );
     const columnValues = {};
-    // Update notes column with retry information
     if (notesColumn) {
       const timestamp = new Date().toISOString();
       columnValues[notesColumn.id] = `${timestamp}: ${statusText} - Monday validation failed, initiating retry process.`;
     }
-    // Update status if we can find appropriate status
     if (statusColumn) {
       try {
         const settings = JSON.parse(statusColumn.settings_str || '{}');
@@ -2151,7 +2138,6 @@ async function handleSingleDocumentRetry(doc, failureDetails, originalFiles, req
       invoiceNumber: doc.invoice_number,
       originalItemId: originalItemId
     });
-    // STEP 1: Create individual page PDFs for retry
     const retryFiles = await createSplitPagePDFs(doc, originalFiles, requestId);
     if (retryFiles.length === 0) {
       log('error', 'NO_RETRY_FILES_CREATED_FOR_SINGLE_DOC', {
@@ -2161,11 +2147,8 @@ async function handleSingleDocumentRetry(doc, failureDetails, originalFiles, req
       await updateMondayItemForRetry(originalItemId, 'Retry Failed - Could not split PDF', requestId);
       return;
     }
-    // STEP 2: Process split pages with Instabase
     const { files: retryExtracted, runId: retryRunId } = await processFilesWithInstabase(retryFiles, requestId);
-    // STEP 3: Extract line items from retry results
     const retryLineItems = await extractLineItemsFromRetryResults(retryExtracted, requestId);
-    // STEP 4: Create retry document
     const retryDoc = {
       ...doc,
       items: retryLineItems,
@@ -2181,9 +2164,7 @@ async function handleSingleDocumentRetry(doc, failureDetails, originalFiles, req
       retryLineItems: retryLineItems.length,
       retryRunId: retryRunId
     });
-    // STEP 5: Create new Monday item with retry results
     await createMondayExtractedItems([retryDoc], originalItemId, originalFiles, requestId, retryRunId);
-    // STEP 6: Update original item to indicate retry was created
     await updateMondayItemForRetry(originalItemId, `Retry Completed - New extraction created with Run ID: ${retryRunId}`, requestId);
     log('info', 'SINGLE_DOCUMENT_RETRY_COMPLETE', {
       requestId,
