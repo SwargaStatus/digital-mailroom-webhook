@@ -1301,7 +1301,7 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
             // Schedule validation check after a delay to allow formula to calculate
             setTimeout(async () => {
               await checkMondayValidationAndRetry(createdItemId, doc, originalFiles, requestId, instabaseRunId);
-            }, 8000); // 8 second delay to allow formula calculation
+            }, 15000); // Increased to 15 seconds
           }
           
         } catch (subitemError) {
@@ -1927,14 +1927,15 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
     log('info', 'CHECKING_MONDAY_VALIDATION', {
       requestId,
       itemId: createdItemId,
-      invoiceNumber: doc.invoice_number
+      invoiceNumber: doc.invoice_number,
+      instabaseRunId: instabaseRunId
     });
-    // Wait a moment for subitems to be fully created and formula to calculate
-    await new Promise(resolve => setTimeout(resolve, 5000));
-    // Get the item with the formula column (item ID as-is, no +)
+    // Wait longer for subitems to be fully created and formula to calculate
+    await new Promise(resolve => setTimeout(resolve, 15000)); // Increased to 15 seconds
+    // 🔧 FIXED: Get item by the actual Monday item ID with proper string format
     const itemQuery = `
       query {
-        items(ids: [${createdItemId}]) {
+        items(ids: ["${createdItemId}"]) {
           id
           name
           column_values {
@@ -1946,6 +1947,13 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
         }
       }
     `;
+    log('info', 'MONDAY_VALIDATION_QUERY_DETAILS', {
+      requestId,
+      query: itemQuery,
+      createdItemId: createdItemId,
+      createdItemIdType: typeof createdItemId,
+      instabaseRunId: instabaseRunId
+    });
     const itemResponse = await axios.post('https://api.monday.com/v2', {
       query: itemQuery
     }, {
@@ -1953,6 +1961,14 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
         'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
         'Content-Type': 'application/json'
       }
+    });
+    log('info', 'MONDAY_ITEM_FETCH_RESPONSE', {
+      requestId,
+      itemId: createdItemId,
+      hasErrors: !!itemResponse.data.errors,
+      errors: itemResponse.data.errors,
+      hasData: !!itemResponse.data.data,
+      itemsFound: itemResponse.data.data?.items?.length || 0
     });
     if (itemResponse.data.errors) {
       log('error', 'MONDAY_ITEM_FETCH_ERROR', {
@@ -1966,14 +1982,27 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
     if (!item) {
       log('error', 'MONDAY_ITEM_NOT_FOUND', {
         requestId,
-        itemId: createdItemId
+        itemId: createdItemId,
+        responseData: itemResponse.data.data
       });
       return;
     }
+    log('info', 'MONDAY_ITEM_FOUND_FOR_VALIDATION', {
+      requestId,
+      itemId: createdItemId,
+      itemName: item.name,
+      columnCount: item.column_values?.length || 0,
+      availableColumns: item.column_values?.map(col => ({
+        title: col.title,
+        hasText: !!col.text,
+        hasValue: !!col.value
+      })) || []
+    });
     const validationColumn = item.column_values.find(col => 
       col.title.toLowerCase().includes('items match total') || 
       col.title.toLowerCase().includes('match total') ||
-      col.title.toLowerCase().includes('validation')
+      col.title.toLowerCase().includes('validation') ||
+      col.title.toLowerCase().includes('formula')
     );
     if (!validationColumn) {
       log('warn', 'VALIDATION_COLUMN_NOT_FOUND', {
@@ -1991,20 +2020,26 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
       invoiceNumber: doc.invoice_number,
       columnTitle: validationColumn.title,
       validationText: validationText,
-      validationValue: validationValue
+      validationValue: validationValue,
+      rawColumnData: {
+        text: validationColumn.text,
+        value: validationColumn.value
+      }
     });
     const validationFailed = validationText.includes('no') || 
                             validationText.includes('false') || 
                             validationText.includes('❌') || 
                             validationText.includes('fail') ||
                             validationValue === 'false' ||
-                            validationValue === '0';
+                            validationValue === '0' ||
+                            validationText.includes('mismatch');
     if (validationFailed) {
       log('warn', 'MONDAY_VALIDATION_FAILED_TRIGGERING_RETRY', {
         requestId,
         itemId: createdItemId,
         invoiceNumber: doc.invoice_number,
-        validationText: validationText
+        validationText: validationText,
+        validationValue: validationValue
       });
       const totalAmountColumn = item.column_values.find(col => 
         col.title.toLowerCase().includes('total amount')
@@ -2035,7 +2070,8 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
         requestId,
         itemId: createdItemId,
         invoiceNumber: doc.invoice_number,
-        validationText: validationText
+        validationText: validationText,
+        validationValue: validationValue
       });
     }
   } catch (error) {
@@ -2043,7 +2079,8 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
       requestId,
       itemId: createdItemId,
       invoiceNumber: doc.invoice_number,
-      error: error.message
+      error: error.message,
+      stack: error.stack
     });
   }
 }
