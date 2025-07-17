@@ -1,4 +1,3 @@
-
 // Digital Mailroom Webhook — FINAL VERSION with Updated Field Mapping + Line Number Support
 // -----------------------------------------------------------------------------
 // This version works with the updated Instabase field mapping (page type field removed)
@@ -189,7 +188,6 @@ async function processWebhookData(body, requestId) {
     const { files: extracted, originalFiles, runId } = await processFilesWithInstabase(pdfFiles, requestId);
     const groups = groupPagesByInvoiceNumber(extracted, requestId);
     
-    // 🔧 DEBUG: Log the groups after processing to verify items are found
     log('info', 'GROUPS_AFTER_PROCESSING', {
       requestId,
       groupCount: groups.length,
@@ -201,69 +199,18 @@ async function processWebhookData(body, requestId) {
       }))
     });
     
-    // 🔧 NEW: Validate each document and handle retries
-    const validatedGroups = [];
-    const failedGroups = [];
-
-    for (const doc of groups) {
-      const validation = validateExtractionAccuracy(doc, requestId);
-      
-      // 🔧 ENHANCED: More detailed logging
-      log('info', 'DOCUMENT_VALIDATION_RESULT', {
-        requestId,
-        invoiceNumber: doc.invoice_number,
-        isValid: validation.isValid,
-        requiresRetry: validation.requiresRetry,
-        calculatedTotal: validation.calculatedLineTotal,
-        actualTotal: validation.actualTotal,
-        percentageDiff: validation.percentageDiff,
-        lineItemCount: validation.lineItemCount,
-        pageCount: validation.pageCount
-      });
-      
-      if (validation.isValid) {
-        log('info', 'DOCUMENT_ACCEPTED_FOR_PROCESSING', {
-          requestId,
-          invoiceNumber: doc.invoice_number,
-          lineItemCount: validation.lineItemCount
-        });
-        validatedGroups.push(doc);
-      } else if (validation.requiresRetry) {
-        log('warn', 'DOCUMENT_MARKED_FOR_RETRY', {
-          requestId,
-          invoiceNumber: doc.invoice_number,
-          reason: 'Mathematical validation failed and meets retry criteria'
-        });
-        const failureDetails = await logExtractionFailure(doc, validation, originalFiles, requestId, runId);
-        failedGroups.push({ doc, failureDetails, validation });
-      } else {
-        // Minor discrepancy, accept but log warning
-        log('warn', 'MINOR_EXTRACTION_DISCREPANCY_ACCEPTED', {
-          requestId,
-          invoiceNumber: doc.invoice_number,
-          percentageDiff: validation.percentageDiff,
-          reason: 'Below retry threshold'
-        });
-        validatedGroups.push(doc);
-      }
-    }
-
-    // Process successful extractions immediately
-    if (validatedGroups.length > 0) {
-      await createMondayExtractedItems(validatedGroups, itemId, originalFiles, requestId, runId);
-    }
-
-    // 🔧 NEW: Handle failed extractions with retry
-    if (failedGroups.length > 0) {
-      await handleExtractionRetries(failedGroups, itemId, originalFiles, requestId);
+    // 🔧 SIMPLIFIED: No more validation here - just create all items
+    // Monday's formula validation will handle retry logic after subitems are created
+    if (groups.length > 0) {
+      await createMondayExtractedItems(groups, itemId, originalFiles, requestId, runId);
     }
 
     log('info', 'PROCESSING_COMPLETE', { 
       requestId, 
       itemId, 
-      successfulExtractions: validatedGroups.length,
-      failedExtractions: failedGroups.length
+      extractedDocuments: groups.length
     });
+    
     await updateMondayItemStatusToDone(ev.pulseId, ev.boardId, requestId, runId);
   } catch (err) {
     log('error', 'BACKGROUND_PROCESSING_FAILED', { 
