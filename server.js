@@ -572,68 +572,62 @@ async function processFilesWithInstabase(files, requestId) {
   }
 }
 
-// 🔧 FIXED: Grouping function with detailed page index handling and logging
+// 🔧 NEW: Enhanced grouping function with proper page tracking
 function groupPagesByInvoiceNumber(extractedFiles, requestId) {
   log('info', 'GROUPING_START', { 
     requestId, 
     inputFiles: extractedFiles?.length || 0 
   });
+  
   const documentGroups = {};
+  
   if (!extractedFiles || extractedFiles.length === 0) {
     log('warn', 'NO_FILES_TO_GROUP', { requestId });
     return [];
   }
+  
+  // 🔧 FIXED: We'll use Instabase's page_numbers instead of tracking ourselves
+  
   extractedFiles.forEach((file, fileIndex) => {
-    log('info', 'PROCESSING_FILE', { requestId, fileIndex, fileName: file.original_file_name });
+    log('info', 'PROCESSING_FILE', { 
+      requestId, 
+      fileIndex, 
+      fileName: file.original_file_name,
+      documentCount: file.documents?.length || 0
+    });
+    
     if (!file.documents || file.documents.length === 0) {
       log('warn', 'NO_DOCUMENTS_IN_FILE', { requestId, fileIndex });
       return;
     }
+    
     file.documents.forEach((doc, docIndex) => {
       const fields = doc.fields || {};
-      // 🔧 ENHANCED: Better page number handling with detailed logging
-      let pdfPageIndex = null;
-      if (typeof doc.page_num === 'number') {
-        pdfPageIndex = Math.max(0, doc.page_num - 1); // Ensure non-negative, convert 1-based to 0-based
-        log('info', 'PAGE_INDEX_FROM_PAGE_NUM', {
-          requestId,
-          fileIndex,
-          docIndex,
-          originalPageNum: doc.page_num,
-          calculatedIndex: pdfPageIndex
-        });
-      } else if (doc.page_range && typeof doc.page_range.start === 'number') {
-        pdfPageIndex = Math.max(0, doc.page_range.start - 1);
-        log('info', 'PAGE_INDEX_FROM_PAGE_RANGE', {
-          requestId,
-          fileIndex,
-          docIndex,
-          pageRangeStart: doc.page_range.start,
-          calculatedIndex: pdfPageIndex
-        });
-      } else {
-        pdfPageIndex = docIndex; // fallback to document index
-        log('info', 'PAGE_INDEX_FALLBACK', {
-          requestId,
-          fileIndex,
-          docIndex,
-          fallbackIndex: pdfPageIndex
-        });
-      }
-      // Validate the page index
-      if (pdfPageIndex < 0) {
-        log('warn', 'NEGATIVE_PAGE_INDEX_CORRECTED', {
-          requestId,
-          fileIndex,
-          docIndex,
-          originalIndex: pdfPageIndex,
-          correctedIndex: 0
-        });
-        pdfPageIndex = 0;
-      }
+      
+      // 🔧 FIXED: Use Instabase's actual page_numbers field
+      const instabasePageNumbers = doc.page_numbers || [];
+      
+      // Convert 1-based Instabase page numbers to 0-based PDF indices
+      const pdfPageIndices = instabasePageNumbers.map(pageNum => pageNum - 1);
+      
+      log('info', 'PROCESSING_DOCUMENT', {
+        requestId,
+        fileIndex,
+        docIndex,
+        instabasePageNumbers: instabasePageNumbers,
+        convertedPdfIndices: pdfPageIndices,
+        fileName: file.original_file_name
+      });
+      
+      // Extract invoice number
       let invoiceNumber = fields['0']?.value;
-      if (invoiceNumber && invoiceNumber !== 'unknown' && invoiceNumber !== 'none' && invoiceNumber !== '') {
+      if (invoiceNumber && 
+          invoiceNumber !== 'unknown' && 
+          invoiceNumber !== 'none' && 
+          invoiceNumber !== '') {
+        
         const cleanInvoiceNumber = String(invoiceNumber).trim();
+        
         if (!documentGroups[cleanInvoiceNumber]) {
           documentGroups[cleanInvoiceNumber] = {
             invoice_number: cleanInvoiceNumber,
@@ -643,24 +637,30 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
             masterPage: null
           };
         }
+        
         const pageData = {
           fileIndex,
           docIndex,
-          pdfPageIndex,
+          pdfPageIndices: pdfPageIndices, // 🔧 Store all page indices for this document
           fields,
           fileName: file.original_file_name,
           invoiceNumber: cleanInvoiceNumber
         };
+        
         documentGroups[cleanInvoiceNumber].pages.push(pageData);
-        documentGroups[cleanInvoiceNumber].pageIndices.push(pdfPageIndex);
+        // 🔧 Add all page indices for this document
+        documentGroups[cleanInvoiceNumber].pageIndices.push(...pdfPageIndices);
+        
         if (!documentGroups[cleanInvoiceNumber].masterPage) {
           documentGroups[cleanInvoiceNumber].masterPage = pageData;
         }
+        
         log('info', 'PAGE_GROUPED_BY_INVOICE', {
           requestId,
           invoiceNumber: cleanInvoiceNumber,
           docIndex: docIndex,
-          pdfPageIndex: pdfPageIndex,
+          instabasePageNumbers: instabasePageNumbers,
+          pdfPageIndices: pdfPageIndices,
           fileName: file.original_file_name
         });
       } else {
@@ -668,31 +668,34 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
           requestId,
           fileIndex,
           docIndex,
-          pdfPageIndex: pdfPageIndex,
+          instabasePageNumbers: instabasePageNumbers,
+          pdfPageIndices: pdfPageIndices,
           availableFields: Object.keys(fields)
         });
       }
+      // 🔧 Remove the absolutePageIndex increment since we're using Instabase page numbers
+      // absolutePageIndex++;
     });
   });
-  log('info', 'INVOICES_GROUPED', {
+  
+  // 🔧 ENHANCED: Detailed logging for debugging
+  log('info', 'INVOICES_GROUPED_DETAILED', {
     requestId,
     invoiceNumbers: Object.keys(documentGroups),
     groupsByInvoice: Object.keys(documentGroups).map(invoiceNum => ({
       invoiceNumber: invoiceNum,
       pageCount: documentGroups[invoiceNum].pages.length,
-      pageIndices: documentGroups[invoiceNum].pageIndices
+      pageIndices: documentGroups[invoiceNum].pageIndices,
+      fileName: documentGroups[invoiceNum].fileName
     }))
   });
+  
+  // Convert to result format
   const resultGroups = [];
   Object.keys(documentGroups).forEach(invoiceNumber => {
     const group = documentGroups[invoiceNumber];
     if (group.masterPage && group.pages.length > 0) {
-      log('info', 'RECONSTRUCTING_INVOICE', {
-        requestId,
-        invoiceNumber,
-        pageCount: group.pages.length,
-        pageIndices: group.pageIndices
-      });
+      
       const reconstructedDocument = reconstructSingleInvoiceDocument(
         group.pages, 
         group.masterPage, 
@@ -700,22 +703,36 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
         group.fileName,
         invoiceNumber
       );
+      
       if (reconstructedDocument) {
-        // Sort and dedupe page indices for this invoice
-        reconstructedDocument.pageIndices = Array.from(new Set(group.pageIndices)).filter(i => i >= 0).sort((a, b) => a - b);
+        // 🔧 CRITICAL: Sort and dedupe page indices
+        reconstructedDocument.pageIndices = Array.from(new Set(group.pageIndices))
+          .filter(i => i >= 0)
+          .sort((a, b) => a - b);
+        
         reconstructedDocument.fileName = group.fileName;
         reconstructedDocument.debugInfo = {
           originalFileName: group.fileName,
           pageMapping: group.pages.map(p => ({
             invoiceNumber: p.invoiceNumber,
             docIndex: p.docIndex,
-            pdfPageIndex: p.pdfPageIndex
+            pdfPageIndices: p.pdfPageIndices
           }))
         };
+        
+        log('info', 'INVOICE_RECONSTRUCTION_COMPLETE', {
+          requestId,
+          invoiceNumber,
+          pageIndices: reconstructedDocument.pageIndices,
+          pageCount: reconstructedDocument.pageIndices.length,
+          debugInfo: reconstructedDocument.debugInfo
+        });
+        
         resultGroups.push(reconstructedDocument);
       }
     }
   });
+  
   return resultGroups;
 }
 
