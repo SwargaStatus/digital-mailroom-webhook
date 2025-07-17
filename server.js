@@ -208,9 +208,32 @@ async function processWebhookData(body, requestId) {
     for (const doc of groups) {
       const validation = validateExtractionAccuracy(doc, requestId);
       
+      // 🔧 ENHANCED: More detailed logging
+      log('info', 'DOCUMENT_VALIDATION_RESULT', {
+        requestId,
+        invoiceNumber: doc.invoice_number,
+        isValid: validation.isValid,
+        requiresRetry: validation.requiresRetry,
+        calculatedTotal: validation.calculatedLineTotal,
+        actualTotal: validation.actualTotal,
+        percentageDiff: validation.percentageDiff,
+        lineItemCount: validation.lineItemCount,
+        pageCount: validation.pageCount
+      });
+      
       if (validation.isValid) {
+        log('info', 'DOCUMENT_ACCEPTED_FOR_PROCESSING', {
+          requestId,
+          invoiceNumber: doc.invoice_number,
+          lineItemCount: validation.lineItemCount
+        });
         validatedGroups.push(doc);
       } else if (validation.requiresRetry) {
+        log('warn', 'DOCUMENT_MARKED_FOR_RETRY', {
+          requestId,
+          invoiceNumber: doc.invoice_number,
+          reason: 'Mathematical validation failed and meets retry criteria'
+        });
         const failureDetails = await logExtractionFailure(doc, validation, originalFiles, requestId, runId);
         failedGroups.push({ doc, failureDetails, validation });
       } else {
@@ -218,7 +241,8 @@ async function processWebhookData(body, requestId) {
         log('warn', 'MINOR_EXTRACTION_DISCREPANCY_ACCEPTED', {
           requestId,
           invoiceNumber: doc.invoice_number,
-          percentageDiff: validation.percentageDiff
+          percentageDiff: validation.percentageDiff,
+          reason: 'Below retry threshold'
         });
         validatedGroups.push(doc);
       }
@@ -508,9 +532,22 @@ async function processFilesWithInstabase(files, requestId) {
     // Upload files to batch
     for (const f of files) {
       log('info', 'UPLOADING_FILE', { requestId, fileName: f.name });
-      const { data } = await axios.get(f.public_url, { responseType:'arraybuffer' });
-      const buffer = Buffer.from(data);
-      
+      let buffer;
+      let data;
+      // 🔧 FIXED: Handle both URL files and direct buffer files
+      if (f.public_url) {
+        // Regular file from Monday.com
+        const response = await axios.get(f.public_url, { responseType:'arraybuffer' });
+        data = response.data;
+        buffer = Buffer.from(data);
+      } else if (f.buffer) {
+        // Split file with direct buffer
+        buffer = f.buffer;
+        data = f.buffer;
+      } else {
+        log('error', 'NO_FILE_DATA_FOUND', { requestId, fileName: f.name });
+        continue;
+      }
       originalFiles.push({ name: f.name, buffer: buffer });
       
       await axios.put(`${INSTABASE_CONFIG.baseUrl}/api/v2/batches/${batchId}/files/${f.name}`,
@@ -1099,7 +1136,7 @@ function validateExtractionAccuracy(doc, requestId) {
   const difference = Math.abs(expectedTotal - actualTotal);
   const percentageDiff = actualTotal > 0 ? (difference / actualTotal) : 1;
   const validationResult = {
-    isValid: percentageDiff <= tolerance,
+    isValid: percentageDiff <= tolerance || actualTotal === 0, // 🔧 FIXED: Allow zero totals
     calculatedLineTotal: calculatedLineTotal,
     expectedTotal: expectedTotal,
     actualTotal: actualTotal,
@@ -1108,7 +1145,7 @@ function validateExtractionAccuracy(doc, requestId) {
     toleranceThreshold: tolerance,
     lineItemCount: doc.items?.length || 0,
     pageCount: doc.originalPageCount || 1,
-    requiresRetry: percentageDiff > tolerance && doc.originalPageCount > 2
+    requiresRetry: percentageDiff > tolerance && doc.originalPageCount > 3 && actualTotal > 100 // 🔧 FIXED: Only retry if >3 pages AND significant total
   };
   log(validationResult.isValid ? 'info' : 'warn', 'EXTRACTION_VALIDATION', {
     requestId,
