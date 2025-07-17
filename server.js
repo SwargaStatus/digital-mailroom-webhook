@@ -1929,7 +1929,9 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
       itemId: createdItemId,
       invoiceNumber: doc.invoice_number
     });
+    // Wait a moment for subitems to be fully created and formula to calculate
     await new Promise(resolve => setTimeout(resolve, 5000));
+    // Get the item with the formula column (item ID as number, not string)
     const itemQuery = `
       query {
         items(ids: [${createdItemId}]) {
