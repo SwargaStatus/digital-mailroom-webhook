@@ -201,9 +201,45 @@ async function processWebhookData(body, requestId) {
       }))
     });
     
-    await createMondayExtractedItems(groups, itemId, originalFiles, requestId, runId);
-    
-    log('info', 'PROCESSING_COMPLETE', { requestId, itemId });
+    // 🔧 NEW: Validate each document and handle retries
+    const validatedGroups = [];
+    const failedGroups = [];
+
+    for (const doc of groups) {
+      const validation = validateExtractionAccuracy(doc, requestId);
+      
+      if (validation.isValid) {
+        validatedGroups.push(doc);
+      } else if (validation.requiresRetry) {
+        const failureDetails = await logExtractionFailure(doc, validation, originalFiles, requestId, runId);
+        failedGroups.push({ doc, failureDetails, validation });
+      } else {
+        // Minor discrepancy, accept but log warning
+        log('warn', 'MINOR_EXTRACTION_DISCREPANCY_ACCEPTED', {
+          requestId,
+          invoiceNumber: doc.invoice_number,
+          percentageDiff: validation.percentageDiff
+        });
+        validatedGroups.push(doc);
+      }
+    }
+
+    // Process successful extractions immediately
+    if (validatedGroups.length > 0) {
+      await createMondayExtractedItems(validatedGroups, itemId, originalFiles, requestId, runId);
+    }
+
+    // 🔧 NEW: Handle failed extractions with retry
+    if (failedGroups.length > 0) {
+      await handleExtractionRetries(failedGroups, itemId, originalFiles, requestId);
+    }
+
+    log('info', 'PROCESSING_COMPLETE', { 
+      requestId, 
+      itemId, 
+      successfulExtractions: validatedGroups.length,
+      failedExtractions: failedGroups.length
+    });
     await updateMondayItemStatusToDone(ev.pulseId, ev.boardId, requestId, runId);
   } catch (err) {
     log('error', 'BACKGROUND_PROCESSING_FAILED', { 
