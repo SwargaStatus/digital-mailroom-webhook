@@ -1168,7 +1168,8 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         invoiceNumber: doc.invoice_number,
         itemCount: doc.items?.length || 0,
         pageIndices: doc.pageIndices,
-        fileName: doc.fileName
+        fileName: doc.fileName,
+        isRetryAttempt: doc.retryAttempt || false  // 🔧 NEW: Track retry attempts
       });
       
       const formatDate = (dateStr) => {
@@ -1199,12 +1200,18 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
       
       const columnValues = buildColumnValues(columns, doc, formatDate, instabaseRunId);
       
+      // 🔧 NEW: Add retry indicator to item name if this is a retry
+      let itemName = instabaseRunId || 'RUN_PENDING';
+      if (doc.retryAttempt) {
+        itemName = `RETRY: ${doc.invoice_number} - ${instabaseRunId}`;
+      }
+      
       // Create the item
       const mutation = `
         mutation {
           create_item(
             board_id: ${MONDAY_CONFIG.extractedDocsBoardId}
-            item_name: "${instabaseRunId || 'RUN_PENDING'}"
+            item_name: "${itemName}"
             column_values: ${JSON.stringify(JSON.stringify(columnValues))}
           ) {
             id
@@ -1235,10 +1242,11 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         requestId,
         itemId: createdItemId,
         documentType: doc.document_type,
-        invoiceNumber: doc.invoice_number
+        invoiceNumber: doc.invoice_number,
+        isRetryAttempt: doc.retryAttempt || false
       });
       
-      // Use the correct buffer for this invoice's file
+      // Upload PDF (existing code - unchanged)
       if (originalFiles && originalFiles.length > 0 && doc.pageIndices && doc.pageIndices.length > 0) {
         const fileColumn = columns.find(col => col.type === 'file');
         if (fileColumn) {
@@ -1252,60 +1260,27 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
               });
               continue;
             }
-            // 🔧 ENHANCED: Better page index handling with validation
-            log('info', 'PREPARING_PDF_EXTRACTION', {
-              requestId,
-              invoiceNumber: doc.invoice_number,
-              rawPageIndices: doc.pageIndices,
-              fileName: doc.fileName,
-              debugInfo: doc.debugInfo
-            });
-            // Clean and validate page indices (convert from 1-based to 0-based if needed)
+            
             let cleanPageIndices = Array.from(new Set(doc.pageIndices))
               .filter(i => typeof i === 'number' && i >= 0)
-              .map(i => {
-                // If Instabase returns 1-based indices, convert to 0-based
-                // You might need to adjust this based on your Instabase setup
-                return i; // Keep as-is for now, but add logging to debug
-              })
               .sort((a, b) => a - b);
-            log('info', 'CLEANED_PAGE_INDICES', {
-              requestId,
-              invoiceNumber: doc.invoice_number,
-              cleanPageIndices,
-              originalCount: doc.pageIndices.length,
-              cleanedCount: cleanPageIndices.length
-            });
-            // Validate we have valid page indices
-            if (cleanPageIndices.length === 0) {
-              log('error', 'NO_VALID_PAGE_INDICES', {
-                requestId,
-                invoiceNumber: doc.invoice_number,
-                originalPageIndices: doc.pageIndices
-              });
-              continue; // Skip this document
+
+            if (cleanPageIndices.length > 0) {
+              const invoiceSpecificPdf = await createInvoiceSpecificPDF(
+                bufferForThisDoc, 
+                doc.invoice_number, 
+                cleanPageIndices, 
+                requestId
+              );
+              const invoiceFileName = `Invoice_${doc.invoice_number}${doc.retryAttempt ? '_RETRY' : ''}.pdf`;
+              await uploadPdfToMondayItem(
+                createdItemId, 
+                invoiceSpecificPdf, 
+                invoiceFileName, 
+                fileColumn.id, 
+                requestId
+              );
             }
-            const invoiceSpecificPdf = await createInvoiceSpecificPDF(
-              bufferForThisDoc, 
-              doc.invoice_number, 
-              cleanPageIndices, 
-              requestId
-            );
-            const invoiceFileName = `Invoice_${doc.invoice_number}.pdf`;
-            await uploadPdfToMondayItem(
-              createdItemId, 
-              invoiceSpecificPdf, 
-              invoiceFileName, 
-              fileColumn.id, 
-              requestId
-            );
-            log('info', 'INVOICE_SPECIFIC_PDF_UPLOADED', {
-              requestId,
-              itemId: createdItemId,
-              invoiceNumber: doc.invoice_number,
-              fileName: invoiceFileName,
-              pageIndices: cleanPageIndices
-            });
           } catch (uploadError) {
             log('error', 'PDF_UPLOAD_FAILED', {
               requestId,
@@ -1320,6 +1295,15 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
       if (subitemsColumn && doc.items && doc.items.length > 0) {
         try {
           await createSubitemsForLineItems(createdItemId, doc.items, columns, requestId);
+          
+          // 🔧 NEW: After subitems are created, check Monday's validation (only for non-retry items)
+          if (!doc.retryAttempt) {
+            // Schedule validation check after a delay to allow formula to calculate
+            setTimeout(async () => {
+              await checkMondayValidationAndRetry(createdItemId, doc, originalFiles, requestId, instabaseRunId);
+            }, 8000); // 8 second delay to allow formula calculation
+          }
+          
         } catch (subitemError) {
           log('error', 'SUBITEM_CREATION_FAILED', {
             requestId,
@@ -1936,3 +1920,284 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`📅 Started at: ${new Date().toISOString()}`);
   console.log(`🔧 Features: Updated field mapping, line number indexing, PO number tracking`);
 });
+
+// 🔧 NEW: Function to check Monday's formula validation and trigger retry if needed
+async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, requestId, instabaseRunId) {
+  try {
+    log('info', 'CHECKING_MONDAY_VALIDATION', {
+      requestId,
+      itemId: createdItemId,
+      invoiceNumber: doc.invoice_number
+    });
+    // Wait a moment for subitems to be fully created and formula to calculate
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    // Get the item with the formula column
+    const itemQuery = `
+      query {
+        items(ids: [${createdItemId}]) {
+          id
+          name
+          column_values {
+            id
+            title
+            text
+            value
+          }
+        }
+      }
+    `;
+    const itemResponse = await axios.post('https://api.monday.com/v2', {
+      query: itemQuery
+    }, {
+      headers: {
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    if (itemResponse.data.errors) {
+      log('error', 'MONDAY_ITEM_FETCH_ERROR', {
+        requestId,
+        itemId: createdItemId,
+        errors: itemResponse.data.errors
+      });
+      return;
+    }
+    const item = itemResponse.data.data?.items?.[0];
+    if (!item) {
+      log('error', 'MONDAY_ITEM_NOT_FOUND', {
+        requestId,
+        itemId: createdItemId
+      });
+      return;
+    }
+    // Find the validation column
+    const validationColumn = item.column_values.find(col => 
+      col.title.toLowerCase().includes('items match total') || 
+      col.title.toLowerCase().includes('match total') ||
+      col.title.toLowerCase().includes('validation')
+    );
+    if (!validationColumn) {
+      log('warn', 'VALIDATION_COLUMN_NOT_FOUND', {
+        requestId,
+        itemId: createdItemId,
+        availableColumns: item.column_values.map(col => col.title)
+      });
+      return;
+    }
+    const validationText = validationColumn.text?.toLowerCase() || '';
+    const validationValue = validationColumn.value || '';
+    log('info', 'MONDAY_VALIDATION_RESULT', {
+      requestId,
+      itemId: createdItemId,
+      invoiceNumber: doc.invoice_number,
+      columnTitle: validationColumn.title,
+      validationText: validationText,
+      validationValue: validationValue
+    });
+    // Check if validation failed (looking for "No", "False", "❌", etc.)
+    const validationFailed = validationText.includes('no') || 
+                            validationText.includes('false') || 
+                            validationText.includes('❌') || 
+                            validationText.includes('fail') ||
+                            validationValue === 'false' ||
+                            validationValue === '0';
+    if (validationFailed) {
+      log('warn', 'MONDAY_VALIDATION_FAILED_TRIGGERING_RETRY', {
+        requestId,
+        itemId: createdItemId,
+        invoiceNumber: doc.invoice_number,
+        validationText: validationText
+      });
+      // Get additional details from other columns for failure logging
+      const totalAmountColumn = item.column_values.find(col => 
+        col.title.toLowerCase().includes('total amount')
+      );
+      const actualTotal = totalAmountColumn ? parseFloat(totalAmountColumn.text?.replace(/[^0-9.-]/g, '') || '0') : 0;
+      // Create failure details
+      const failureDetails = {
+        timestamp: new Date().toISOString(),
+        requestId: requestId,
+        instabaseRunId: instabaseRunId,
+        invoiceNumber: doc.invoice_number,
+        documentType: doc.document_type,
+        supplier: doc.supplier_name,
+        actualTotal: actualTotal,
+        mondayValidationResult: validationText,
+        pageCount: doc.originalPageCount || 1,
+        lineItemsExtracted: doc.items?.length || 0,
+        fileName: doc.fileName,
+        pageIndices: doc.pageIndices,
+        failureReason: 'MONDAY_FORMULA_VALIDATION_FAILED',
+        retryEligible: true,
+        mondayItemId: createdItemId
+      };
+      // Log the failure
+      log('error', 'MONDAY_VALIDATION_FAILURE_LOGGED', failureDetails);
+      // Update the item status to show it's being retried
+      await updateMondayItemForRetry(createdItemId, 'Retrying - Validation Failed', requestId);
+      // Trigger retry process
+      await handleSingleDocumentRetry(doc, failureDetails, originalFiles, requestId, createdItemId);
+    } else {
+      log('info', 'MONDAY_VALIDATION_PASSED', {
+        requestId,
+        itemId: createdItemId,
+        invoiceNumber: doc.invoice_number,
+        validationText: validationText
+      });
+    }
+  } catch (error) {
+    log('error', 'MONDAY_VALIDATION_CHECK_FAILED', {
+      requestId,
+      itemId: createdItemId,
+      invoiceNumber: doc.invoice_number,
+      error: error.message
+    });
+  }
+}
+
+// 🔧 NEW: Update Monday item status for retry
+async function updateMondayItemForRetry(itemId, statusText, requestId) {
+  try {
+    // Find a status or text column to update
+    const boardQuery = `
+      query {
+        boards(ids: [${MONDAY_CONFIG.extractedDocsBoardId}]) {
+          columns {
+            id
+            title
+            type
+            settings_str
+          }
+        }
+      }
+    `;
+    const boardResponse = await axios.post('https://api.monday.com/v2', {
+      query: boardQuery
+    }, {
+      headers: {
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
+    // Try to find a status column with "Retrying" or "Processing" option
+    const statusColumn = columns.find(col => col.type === 'status');
+    const notesColumn = columns.find(col => 
+      col.title.toLowerCase().includes('notes') && 
+      (col.type === 'text' || col.type === 'long_text')
+    );
+    const columnValues = {};
+    // Update notes column with retry information
+    if (notesColumn) {
+      const timestamp = new Date().toISOString();
+      columnValues[notesColumn.id] = `${timestamp}: ${statusText} - Monday validation failed, initiating retry process.`;
+    }
+    // Update status if we can find appropriate status
+    if (statusColumn) {
+      try {
+        const settings = JSON.parse(statusColumn.settings_str || '{}');
+        const retryLabel = Object.entries(settings.labels || {}).find(([_, label]) => 
+          label && (
+            label.toLowerCase().includes('retry') || 
+            label.toLowerCase().includes('processing') ||
+            label.toLowerCase().includes('pending')
+          )
+        );
+        if (retryLabel) {
+          columnValues[statusColumn.id] = { "index": parseInt(retryLabel[0]) };
+        }
+      } catch (e) {
+        log('warn', 'STATUS_SETTINGS_PARSE_ERROR', { requestId, error: e.message });
+      }
+    }
+    if (Object.keys(columnValues).length > 0) {
+      const mutation = `
+        mutation {
+          change_multiple_column_values(
+            board_id: ${MONDAY_CONFIG.extractedDocsBoardId},
+            item_id: ${itemId},
+            column_values: ${JSON.stringify(JSON.stringify(columnValues))}
+          ) {
+            id
+          }
+        }
+      `;
+      await axios.post('https://api.monday.com/v2', { query: mutation }, {
+        headers: {
+          'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      log('info', 'RETRY_STATUS_UPDATED', {
+        requestId,
+        itemId,
+        updatedColumns: Object.keys(columnValues)
+      });
+    }
+  } catch (error) {
+    log('error', 'RETRY_STATUS_UPDATE_FAILED', {
+      requestId,
+      itemId,
+      error: error.message
+    });
+  }
+}
+
+// 🔧 NEW: Handle retry for a single document
+async function handleSingleDocumentRetry(doc, failureDetails, originalFiles, requestId, originalItemId) {
+  try {
+    log('info', 'STARTING_SINGLE_DOCUMENT_RETRY', {
+      requestId,
+      invoiceNumber: doc.invoice_number,
+      originalItemId: originalItemId
+    });
+    // STEP 1: Create individual page PDFs for retry
+    const retryFiles = await createSplitPagePDFs(doc, originalFiles, requestId);
+    if (retryFiles.length === 0) {
+      log('error', 'NO_RETRY_FILES_CREATED_FOR_SINGLE_DOC', {
+        requestId,
+        invoiceNumber: doc.invoice_number
+      });
+      await updateMondayItemForRetry(originalItemId, 'Retry Failed - Could not split PDF', requestId);
+      return;
+    }
+    // STEP 2: Process split pages with Instabase
+    const { files: retryExtracted, runId: retryRunId } = await processFilesWithInstabase(retryFiles, requestId);
+    // STEP 3: Extract line items from retry results
+    const retryLineItems = await extractLineItemsFromRetryResults(retryExtracted, requestId);
+    // STEP 4: Create retry document
+    const retryDoc = {
+      ...doc,
+      items: retryLineItems,
+      retryAttempt: true,
+      originalRunId: failureDetails.instabaseRunId,
+      retryRunId: retryRunId,
+      originalMondayItemId: originalItemId
+    };
+    log('info', 'RETRY_EXTRACTION_COMPLETE', {
+      requestId,
+      invoiceNumber: doc.invoice_number,
+      originalLineItems: doc.items?.length || 0,
+      retryLineItems: retryLineItems.length,
+      retryRunId: retryRunId
+    });
+    // STEP 5: Create new Monday item with retry results
+    await createMondayExtractedItems([retryDoc], originalItemId, originalFiles, requestId, retryRunId);
+    // STEP 6: Update original item to indicate retry was created
+    await updateMondayItemForRetry(originalItemId, `Retry Completed - New extraction created with Run ID: ${retryRunId}`, requestId);
+    log('info', 'SINGLE_DOCUMENT_RETRY_COMPLETE', {
+      requestId,
+      invoiceNumber: doc.invoice_number,
+      originalItemId: originalItemId,
+      retryRunId: retryRunId
+    });
+  } catch (retryError) {
+    log('error', 'SINGLE_DOCUMENT_RETRY_FAILED', {
+      requestId,
+      invoiceNumber: doc.invoice_number,
+      originalItemId: originalItemId,
+      error: retryError.message
+    });
+    await updateMondayItemForRetry(originalItemId, `Retry Failed - ${retryError.message}`, requestId);
+  }
+}
