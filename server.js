@@ -1931,10 +1931,10 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
     });
     // Wait a moment for subitems to be fully created and formula to calculate
     await new Promise(resolve => setTimeout(resolve, 5000));
-    // Get the item with the formula column (item ID as number, not string)
+    // Get the item with the formula column (item ID as-is, no +)
     const itemQuery = `
       query {
-        items(ids: [${+createdItemId}]) {
+        items(ids: [${createdItemId}]) {
           id
           name
           column_values {
