@@ -130,26 +130,449 @@ async function createInvoiceSpecificPDF(originalPdfBuffer, invoiceNumber, pageIn
   }
 }
 
-// Helper: Get page indices from Instabase doc metadata
-function getPageIndicesFromInstabaseDoc(doc) {
-  if (Array.isArray(doc.pages) && doc.pages.length > 0) {
-    return doc.pages.map(p => p - 1);
+// ─────────────────────────────────────────────────────────────────────────────
+// 2️⃣  WEBHOOK ENDPOINT
+// ----------------------------------------------------------------------------
+app.post('/webhook/monday-to-instabase', async (req, res) => {
+  const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  
+  try {
+    log('info', 'WEBHOOK_RECEIVED', { requestId, body: req.body });
+
+    // Monday "challenge" handshake
+    if (req.body.challenge) {
+      log('info', 'CHALLENGE_RESPONSE', { requestId, challenge: req.body.challenge });
+      return res.json({ challenge: req.body.challenge });
+    }
+
+    res.json({ success: true, received: new Date().toISOString(), requestId });
+
+    // fire‑and‑forget ⇢ background processing
+    processWebhookData(req.body, requestId);
+  } catch (err) {
+    log('error', 'WEBHOOK_ERROR', { requestId, error: err.message, stack: err.stack });
+    res.status(500).json({ error: err.message });
   }
-  if (doc.page_range && typeof doc.page_range.start === 'number' && typeof doc.page_range.end === 'number') {
-    const start = doc.page_range.start - 1;
-    const end = doc.page_range.end - 1;
-    return Array.from({length: end - start + 1}, (_, i) => start + i);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3️⃣  MAIN BACKGROUND FLOW
+// ----------------------------------------------------------------------------
+async function processWebhookData(body, requestId) {
+  try {
+    log('info', 'PROCESSING_START', { requestId, event: body.event });
+    
+    const ev = body.event;
+    if (!ev) {
+      log('warn', 'NO_EVENT_DATA', { requestId });
+      return;
+    }
+    
+    if (ev.columnId !== 'status' || ev.value?.label?.text !== 'Processing') {
+      log('info', 'IGNORED_EVENT', { 
+        requestId, 
+        columnId: ev.columnId, 
+        status: ev.value?.label?.text 
+      });
+      return;
+    }
+
+    const itemId = ev.pulseId;
+    log('info', 'PROCESSING_ITEM', { requestId, itemId, boardId: ev.boardId });
+    
+    const pdfFiles = await getMondayItemFilesWithPublicUrl(itemId, ev.boardId, requestId);
+    if (!pdfFiles.length) {
+      log('warn', 'NO_PDF_FILES', { requestId, itemId });
+      return;
+    }
+
+    const { files: extracted, originalFiles, runId } = await processFilesWithInstabase(pdfFiles, requestId);
+    const groups = groupPagesByInvoiceNumber(extracted, requestId);
+    
+    // 🔧 DEBUG: Log the groups after processing to verify items are found
+    log('info', 'GROUPS_AFTER_PROCESSING', {
+      requestId,
+      groupCount: groups.length,
+      groups: groups.map(g => ({
+        invoiceNumber: g.invoice_number,
+        itemCount: g.items?.length || 0,
+        isMultiPage: g.isMultiPageReconstruction || false,
+        pageCount: g.originalPageCount || 1
+      }))
+    });
+    
+    await createMondayExtractedItems(groups, itemId, originalFiles, requestId, runId);
+    
+    log('info', 'PROCESSING_COMPLETE', { requestId, itemId });
+    await updateMondayItemStatusToDone(ev.pulseId, ev.boardId, requestId, runId);
+  } catch (err) {
+    log('error', 'BACKGROUND_PROCESSING_FAILED', { 
+      requestId, 
+      error: err.message, 
+      stack: err.stack 
+    });
   }
-  if (typeof doc.page_num === 'number') {
-    return [doc.page_num - 1];
-  }
-  if (typeof doc.docIndex === 'number') {
-    return [doc.docIndex];
-  }
-  return [];
 }
 
-// Ensure groupPagesByInvoiceNumber is defined before processWebhookData
+// 🔧 FIXED: Status update with flexible column detection
+async function updateMondayItemStatusToDone(itemId, boardId, requestId, runId = null) {
+  const statusColumnId = "status";
+  const doneLabel = "Completed";
+  // 🔧 ENHANCED: Try multiple possible column names for processing notes
+  const possibleNotesColumnNames = [
+    "processing notes",
+    "notes", 
+    "processing note",
+    "run id",
+    "instabase run id",
+    "extraction notes",
+    "batch id"
+  ];
+  const boardQuery = `
+    query {
+      boards(ids: [${boardId}]) {
+        columns {
+          id
+          title
+          type
+          settings_str
+        }
+      }
+    }
+  `;
+  try {
+    const boardResponse = await axios.post('https://api.monday.com/v2', { query: boardQuery }, {
+      headers: {
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
+    // 🔧 ENHANCED: Log all available columns for debugging
+    log('info', 'AVAILABLE_BOARD_COLUMNS', {
+      requestId,
+      boardId,
+      columns: columns.map(col => ({ id: col.id, title: col.title, type: col.type }))
+    });
+    const statusColumn = columns.find(col => col.id === statusColumnId && col.type === 'status');
+    if (!statusColumn) {
+      log('error', 'STATUS_COLUMN_NOT_FOUND', { requestId, itemId, boardId });
+      return;
+    }
+    // Find processing notes column with flexible matching
+    let processingNotesColumn = null;
+    if (runId) {
+      processingNotesColumn = columns.find(col => {
+        const title = col.title.toLowerCase().trim();
+        return possibleNotesColumnNames.some(name => title.includes(name)) && 
+               (col.type === 'text' || col.type === 'long_text');
+      });
+      if (processingNotesColumn) {
+        log('info', 'PROCESSING_NOTES_COLUMN_FOUND', {
+          requestId,
+          columnId: processingNotesColumn.id,
+          columnTitle: processingNotesColumn.title,
+          columnType: processingNotesColumn.type
+        });
+      } else {
+        log('warn', 'PROCESSING_NOTES_COLUMN_NOT_FOUND', {
+          requestId,
+          searchedNames: possibleNotesColumnNames,
+          availableTextColumns: columns.filter(col => col.type === 'text' || col.type === 'long_text')
+            .map(col => col.title)
+        });
+      }
+    }
+    // Parse status column settings
+    let doneIndex = null;
+    try {
+      const settings = JSON.parse(statusColumn.settings_str);
+      if (settings.labels) {
+        for (const [index, label] of Object.entries(settings.labels)) {
+          if (label && label.trim().toLowerCase() === doneLabel.toLowerCase()) {
+            doneIndex = parseInt(index, 10);
+            break;
+          }
+        }
+      }
+    } catch (e) {
+      log('error', 'STATUS_COLUMN_SETTINGS_PARSE_ERROR', { requestId, error: e.message });
+      return;
+    }
+    if (doneIndex === null) {
+      log('error', 'DONE_LABEL_NOT_FOUND', { 
+        requestId, 
+        itemId, 
+        boardId, 
+        searchedFor: doneLabel,
+        availableLabels: JSON.parse(statusColumn.settings_str).labels 
+      });
+      return;
+    }
+    // Build column values
+    let columnValues = { 
+      [statusColumnId]: { "index": doneIndex }
+    };
+    if (runId && processingNotesColumn) {
+      columnValues[processingNotesColumn.id] = runId;
+    }
+    log('info', 'UPDATING_MONDAY_COLUMNS', {
+      requestId,
+      itemId,
+      boardId,
+      columnValues,
+      runId
+    });
+    // Update columns
+    const mutation = `
+      mutation {
+        change_multiple_column_values(
+          board_id: ${boardId},
+          item_id: ${itemId},
+          column_values: ${JSON.stringify(JSON.stringify(columnValues))}
+        ) {
+          id
+        }
+      }
+    `;
+    const response = await axios.post('https://api.monday.com/v2', { query: mutation }, {
+      headers: {
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    if (response.data.errors) {
+      log('error', 'STATUS_UPDATE_MUTATION_ERROR', { 
+        requestId, 
+        itemId, 
+        boardId, 
+        errors: response.data.errors 
+      });
+    } else {
+      log('info', 'STATUS_AND_NOTES_UPDATED_SUCCESS', { 
+        requestId, 
+        itemId, 
+        boardId, 
+        runId,
+        updatedColumns: Object.keys(columnValues)
+      });
+    }
+  } catch (error) {
+    log('error', 'STATUS_UPDATE_FAILED', { 
+      requestId, 
+      itemId, 
+      boardId, 
+      runId, 
+      error: error.message 
+    });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4️⃣  MONDAY HELPERS
+// ----------------------------------------------------------------------------
+async function getMondayItemFilesWithPublicUrl(itemId, boardId, requestId) {
+  try {
+    log('info', 'FETCHING_FILES', { requestId, itemId, boardId });
+    
+    const query = `query { items(ids:[${itemId}]){ assets{id name file_extension file_size public_url} }}`;
+    const { data } = await axios.post('https://api.monday.com/v2', { query }, {
+      headers: { Authorization: `Bearer ${MONDAY_CONFIG.apiKey}` }
+    });
+    
+    const assets = data.data.items[0].assets;
+    const pdfFiles = assets.filter(a => 
+      (/pdf$/i).test(a.file_extension) || (/\.pdf$/i).test(a.name)
+    ).map(a => ({ 
+      name: a.name, 
+      public_url: a.public_url, 
+      assetId: a.id 
+    }));
+    
+    log('info', 'FILES_FOUND', { requestId, fileCount: pdfFiles.length, files: pdfFiles.map(f => f.name) });
+    return pdfFiles;
+  } catch (error) {
+    log('error', 'FETCH_FILES_ERROR', { requestId, error: error.message });
+    throw error;
+  }
+}
+
+// 🔧 FIXED: PDF Upload function with correct Monday.com multipart format
+async function uploadPdfToMondayItem(itemId, buffer, filename, columnId, requestId) {
+  try {
+    log('info', 'PDF_UPLOAD_START', { requestId, itemId, filename, columnId, bufferSize: buffer.length });
+    
+    // Create the form data using Monday.com's exact specification
+    const form = new FormData();
+    
+    const query = `mutation($file: File!, $item_id: ID!, $column_id: String!) {
+      add_file_to_column(item_id: $item_id, column_id: $column_id, file: $file) {
+        id
+      }
+    }`;
+    
+    const variables = {
+      item_id: String(itemId),
+      column_id: columnId
+    };
+    
+    const map = {
+      "file": "variables.file"
+    };
+    
+    // Append in the exact order Monday.com expects
+    form.append('query', query);
+    form.append('variables', JSON.stringify(variables));
+    form.append('map', JSON.stringify(map));
+    form.append('file', buffer, {
+      filename: filename,
+      contentType: 'application/pdf'
+    });
+    
+    const response = await axios.post('https://api.monday.com/v2/file', form, {
+      headers: {
+        ...form.getHeaders(),
+        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
+        'API-Version': '2024-04'
+      },
+      timeout: 60000,
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity
+    });
+
+    if (response.data.errors) {
+      log('error', 'PDF_UPLOAD_ERROR', { requestId, errors: response.data.errors });
+      throw new Error(`PDF upload failed: ${JSON.stringify(response.data.errors)}`);
+    } else {
+      log('info', 'PDF_UPLOAD_SUCCESS', { requestId, fileId: response.data.data.add_file_to_column.id });
+      return response.data.data.add_file_to_column.id;
+    }
+  } catch (error) {
+    log('error', 'PDF_UPLOAD_EXCEPTION', { requestId, error: error.message });
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5️⃣  INSTABASE PROCESSING (FULL VERSION)
+// ----------------------------------------------------------------------------
+async function processFilesWithInstabase(files, requestId) {
+  try {
+    log('info', 'INSTABASE_START', { requestId, fileCount: files.length });
+    
+    // Create batch
+    const batchRes = await axios.post(`${INSTABASE_CONFIG.baseUrl}/api/v2/batches`,
+                                     { workspace:'nilesh.narendran_yahoo.com' },
+                                     { headers: INSTABASE_CONFIG.headers });
+    const batchId = batchRes.data.id;
+    log('info', 'BATCH_CREATED', { requestId, batchId });
+
+    const originalFiles = [];
+    
+    // Upload files to batch
+    for (const f of files) {
+      log('info', 'UPLOADING_FILE', { requestId, fileName: f.name });
+      const { data } = await axios.get(f.public_url, { responseType:'arraybuffer' });
+      const buffer = Buffer.from(data);
+      
+      originalFiles.push({ name: f.name, buffer: buffer });
+      
+      await axios.put(`${INSTABASE_CONFIG.baseUrl}/api/v2/batches/${batchId}/files/${f.name}`,
+                      data,
+                      { headers:{ ...INSTABASE_CONFIG.headers, 'Content-Type':'application/octet-stream' } });
+      log('info', 'FILE_UPLOADED', { requestId, fileName: f.name });
+    }
+
+    // Start processing run with enhanced error logging
+    log('info', 'STARTING_PROCESSING', { requestId, batchId });
+    
+    // 🔧 NEW: Log the exact URL and payload we're sending
+    const runUrl = `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/deployments/${INSTABASE_CONFIG.deploymentId}/runs`;
+    const runPayload = { batch_id: batchId };
+    
+    log('info', 'PROCESSING_REQUEST_DETAILS', {
+      requestId,
+      url: runUrl,
+      payload: runPayload,
+      headers: INSTABASE_CONFIG.headers,
+      deploymentId: INSTABASE_CONFIG.deploymentId
+    });
+    
+    let runResponse;
+    try {
+      runResponse = await axios.post(runUrl, runPayload, { headers: INSTABASE_CONFIG.headers });
+    } catch (runError) {
+      // 🔧 NEW: Enhanced error logging to see exactly what Instabase returns
+      log('error', 'PROCESSING_RUN_ERROR_DETAILS', {
+        requestId,
+        status: runError.response?.status,
+        statusText: runError.response?.statusText,
+        responseData: runError.response?.data,
+        responseHeaders: runError.response?.headers,
+        requestUrl: runUrl,
+        requestPayload: runPayload,
+        requestHeaders: INSTABASE_CONFIG.headers
+      });
+      
+      throw new Error(`Instabase processing run failed: ${runError.response?.status} - ${JSON.stringify(runError.response?.data)}`);
+    }
+    
+    const runId = runResponse.data.id;
+    log('info', 'RUN_STARTED', { requestId, runId });
+
+    // Poll for completion
+    let status = 'RUNNING';
+    let attempts = 0;
+    const maxAttempts = 60; // 5 minutes
+
+    while (status === 'RUNNING' || status === 'PENDING') {
+      if (attempts >= maxAttempts) {
+        throw new Error('Processing timeout after 5 minutes');
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 5000));
+
+      const statusResponse = await axios.get(
+        `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}`,
+        { headers: INSTABASE_CONFIG.headers }
+      );
+
+      status = statusResponse.data.status;
+      attempts++;
+      log('info', 'PROCESSING_STATUS', { requestId, status, attempt: attempts });
+
+      if (status === 'ERROR' || status === 'FAILED') {
+        throw new Error(`Instabase processing failed with status: ${status}`);
+      }
+    }
+
+    if (status !== 'COMPLETE') {
+      throw new Error(`Processing ended with unexpected status: ${status}`);
+    }
+
+    log('info', 'PROCESSING_COMPLETE', { requestId, runId });
+
+    // Get results
+    const resultsResponse = await axios.get(
+      `${INSTABASE_CONFIG.baseUrl}/api/v2/apps/runs/${runId}/results`,
+      { headers: INSTABASE_CONFIG.headers }
+    );
+
+    log('info', 'RESULTS_RECEIVED', { requestId, fileCount: resultsResponse.data.files?.length || 0 });
+    
+    return { 
+      files: resultsResponse.data.files, 
+      originalFiles: originalFiles,
+      runId: runId  // Return the run ID so we can link it
+    };
+    
+  } catch (error) {
+    log('error', 'INSTABASE_ERROR', { requestId, error: error.message });
+    throw error;
+  }
+}
+
+// 🔧 FIXED: Grouping function with detailed page index handling and logging
 function groupPagesByInvoiceNumber(extractedFiles, requestId) {
   log('info', 'GROUPING_START', { 
     requestId, 
@@ -168,7 +591,46 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
     }
     file.documents.forEach((doc, docIndex) => {
       const fields = doc.fields || {};
-      const pageIndices = getPageIndicesFromInstabaseDoc(doc);
+      // 🔧 ENHANCED: Better page number handling with detailed logging
+      let pdfPageIndex = null;
+      if (typeof doc.page_num === 'number') {
+        pdfPageIndex = Math.max(0, doc.page_num - 1); // Ensure non-negative, convert 1-based to 0-based
+        log('info', 'PAGE_INDEX_FROM_PAGE_NUM', {
+          requestId,
+          fileIndex,
+          docIndex,
+          originalPageNum: doc.page_num,
+          calculatedIndex: pdfPageIndex
+        });
+      } else if (doc.page_range && typeof doc.page_range.start === 'number') {
+        pdfPageIndex = Math.max(0, doc.page_range.start - 1);
+        log('info', 'PAGE_INDEX_FROM_PAGE_RANGE', {
+          requestId,
+          fileIndex,
+          docIndex,
+          pageRangeStart: doc.page_range.start,
+          calculatedIndex: pdfPageIndex
+        });
+      } else {
+        pdfPageIndex = docIndex; // fallback to document index
+        log('info', 'PAGE_INDEX_FALLBACK', {
+          requestId,
+          fileIndex,
+          docIndex,
+          fallbackIndex: pdfPageIndex
+        });
+      }
+      // Validate the page index
+      if (pdfPageIndex < 0) {
+        log('warn', 'NEGATIVE_PAGE_INDEX_CORRECTED', {
+          requestId,
+          fileIndex,
+          docIndex,
+          originalIndex: pdfPageIndex,
+          correctedIndex: 0
+        });
+        pdfPageIndex = 0;
+      }
       let invoiceNumber = fields['0']?.value;
       if (invoiceNumber && invoiceNumber !== 'unknown' && invoiceNumber !== 'none' && invoiceNumber !== '') {
         const cleanInvoiceNumber = String(invoiceNumber).trim();
@@ -184,13 +646,13 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
         const pageData = {
           fileIndex,
           docIndex,
-          pageIndices,
+          pdfPageIndex,
           fields,
           fileName: file.original_file_name,
           invoiceNumber: cleanInvoiceNumber
         };
         documentGroups[cleanInvoiceNumber].pages.push(pageData);
-        documentGroups[cleanInvoiceNumber].pageIndices.push(...pageIndices);
+        documentGroups[cleanInvoiceNumber].pageIndices.push(pdfPageIndex);
         if (!documentGroups[cleanInvoiceNumber].masterPage) {
           documentGroups[cleanInvoiceNumber].masterPage = pageData;
         }
@@ -198,7 +660,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
           requestId,
           invoiceNumber: cleanInvoiceNumber,
           docIndex: docIndex,
-          pageIndices: pageIndices,
+          pdfPageIndex: pdfPageIndex,
           fileName: file.original_file_name
         });
       } else {
@@ -206,7 +668,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
           requestId,
           fileIndex,
           docIndex,
-          pageIndices,
+          pdfPageIndex: pdfPageIndex,
           availableFields: Object.keys(fields)
         });
       }
@@ -239,6 +701,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
         invoiceNumber
       );
       if (reconstructedDocument) {
+        // Sort and dedupe page indices for this invoice
         reconstructedDocument.pageIndices = Array.from(new Set(group.pageIndices)).filter(i => i >= 0).sort((a, b) => a - b);
         reconstructedDocument.fileName = group.fileName;
         reconstructedDocument.debugInfo = {
@@ -246,7 +709,7 @@ function groupPagesByInvoiceNumber(extractedFiles, requestId) {
           pageMapping: group.pages.map(p => ({
             invoiceNumber: p.invoiceNumber,
             docIndex: p.docIndex,
-            pageIndices: p.pageIndices
+            pdfPageIndex: p.pdfPageIndex
           }))
         };
         resultGroups.push(reconstructedDocument);
@@ -575,6 +1038,7 @@ function extractLineItemsFromPage(page, requestId, pageIndex) {
 async function createMondayExtractedItems(documents, sourceItemId, originalFiles, requestId, instabaseRunId) {
   try {
     log('info', 'STAGE: Getting board structure', { requestId });
+    
     const boardQuery = `
       query {
         boards(ids: [${MONDAY_CONFIG.extractedDocsBoardId}]) {
@@ -589,6 +1053,7 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         }
       }
     `;
+    
     const boardResponse = await axios.post('https://api.monday.com/v2', {
       query: boardQuery
     }, {
@@ -597,9 +1062,10 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         'Content-Type': 'application/json'
       }
     });
+    
     const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
     const subitemsColumn = columns.find(col => col.type === 'subtasks');
-    const summaryTable = [];
+    
     for (const doc of documents) {
       log('info', 'CREATING_MONDAY_ITEM', {
         requestId,
@@ -609,6 +1075,7 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         pageIndices: doc.pageIndices,
         fileName: doc.fileName
       });
+      
       const formatDate = (dateStr) => {
         if (!dateStr || dateStr === 'Due Date' || dateStr === 'undefined' || dateStr === 'null') {
           return '';
@@ -624,15 +1091,20 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
           } else {
             date = new Date(dateStr);
           }
+          
           if (isNaN(date.getTime())) {
             return '';
           }
+          
           return date.toISOString().split('T')[0];
         } catch (e) {
           return '';
         }
       };
+      
       const columnValues = buildColumnValues(columns, doc, formatDate, instabaseRunId);
+      
+      // Create the item
       const mutation = `
         mutation {
           create_item(
@@ -645,6 +1117,7 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
           }
         }
       `;
+      
       const response = await axios.post('https://api.monday.com/v2', {
         query: mutation
       }, {
@@ -653,6 +1126,7 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
           'Content-Type': 'application/json'
         }
       });
+      
       if (response.data.errors) {
         log('error', 'ITEM_CREATION_FAILED', {
           requestId,
@@ -660,6 +1134,7 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         });
         continue;
       }
+      
       const createdItemId = response.data.data.create_item.id;
       log('info', 'ITEM_CREATED_SUCCESS', {
         requestId,
@@ -667,27 +1142,13 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         documentType: doc.document_type,
         invoiceNumber: doc.invoice_number
       });
+      
       // Use the correct buffer for this invoice's file
       if (originalFiles && originalFiles.length > 0 && doc.pageIndices && doc.pageIndices.length > 0) {
         const fileColumn = columns.find(col => col.type === 'file');
         if (fileColumn) {
           try {
-            // Try direct match first
-            let bufferForThisDoc = originalFiles.find(f => f.name === doc.fileName)?.buffer;
-            // If not found, try matching by base name (strip path and extension)
-            if (!bufferForThisDoc) {
-              const baseName = doc.fileName ? doc.fileName.split(/[\\/]/).pop().replace(/\.[^.]+$/, '') : '';
-              bufferForThisDoc = originalFiles.find(f => {
-                const fBase = f.name.split(/[\\/]/).pop().replace(/\.[^.]+$/, '');
-                return fBase === baseName;
-              })?.buffer;
-            }
-            log('info', 'PDF_EXTRACTION_DEBUG', {
-              requestId,
-              invoiceNumber: doc.invoice_number,
-              docFileName: doc.fileName,
-              availableOriginalFiles: originalFiles.map(f => f.name)
-            });
+            const bufferForThisDoc = originalFiles.find(f => f.name === doc.fileName)?.buffer;
             if (!bufferForThisDoc) {
               log('error', 'PDF_BUFFER_NOT_FOUND_FOR_DOC', {
                 requestId,
@@ -696,20 +1157,38 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
               });
               continue;
             }
-            // Use only Instabase-provided page indices, deduped and sorted
-            let cleanPageIndices = Array.from(new Set(doc.pageIndices)).filter(i => i >= 0).sort((a, b) => a - b);
-            log('info', 'PDF_PAGE_MAPPING', {
+            // 🔧 ENHANCED: Better page index handling with validation
+            log('info', 'PREPARING_PDF_EXTRACTION', {
+              requestId,
               invoiceNumber: doc.invoice_number,
-              instabasePages: doc.pageIndices,
-              pdfLibIndices: cleanPageIndices
+              rawPageIndices: doc.pageIndices,
+              fileName: doc.fileName,
+              debugInfo: doc.debugInfo
             });
+            // Clean and validate page indices (convert from 1-based to 0-based if needed)
+            let cleanPageIndices = Array.from(new Set(doc.pageIndices))
+              .filter(i => typeof i === 'number' && i >= 0)
+              .map(i => {
+                // If Instabase returns 1-based indices, convert to 0-based
+                // You might need to adjust this based on your Instabase setup
+                return i; // Keep as-is for now, but add logging to debug
+              })
+              .sort((a, b) => a - b);
+            log('info', 'CLEANED_PAGE_INDICES', {
+              requestId,
+              invoiceNumber: doc.invoice_number,
+              cleanPageIndices,
+              originalCount: doc.pageIndices.length,
+              cleanedCount: cleanPageIndices.length
+            });
+            // Validate we have valid page indices
             if (cleanPageIndices.length === 0) {
               log('error', 'NO_VALID_PAGE_INDICES', {
                 requestId,
                 invoiceNumber: doc.invoice_number,
                 originalPageIndices: doc.pageIndices
               });
-              continue;
+              continue; // Skip this document
             }
             const invoiceSpecificPdf = await createInvoiceSpecificPDF(
               bufferForThisDoc, 
@@ -732,13 +1211,6 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
               fileName: invoiceFileName,
               pageIndices: cleanPageIndices
             });
-            summaryTable.push({
-              invoiceNumber: doc.invoice_number,
-              fileName: doc.fileName,
-              usedFile: originalFiles.find(f => f.buffer === bufferForThisDoc)?.name,
-              pageIndices: cleanPageIndices,
-              mondayItemId: createdItemId
-            });
           } catch (uploadError) {
             log('error', 'PDF_UPLOAD_FAILED', {
               requestId,
@@ -748,6 +1220,8 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
           }
         }
       }
+      
+      // Create subitems if we have line items and subitems column exists
       if (subitemsColumn && doc.items && doc.items.length > 0) {
         try {
           await createSubitemsForLineItems(createdItemId, doc.items, columns, requestId);
@@ -760,8 +1234,9 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         }
       }
     }
+    
     log('info', 'ALL_ITEMS_PROCESSED', { requestId, documentCount: documents.length });
-    log('info', 'PDF_ATTACHMENT_SUMMARY', { requestId, summaryTable });
+    
   } catch (error) {
     log('error', 'CREATE_MONDAY_ITEMS_FAILED', {
       requestId,
@@ -1089,52 +1564,6 @@ app.post('/test/process-item/:id', async (req, res) => {
     });
   } catch (error) {
     log('error', 'TEST_PROCESSING_ERROR', { requestId, error: error.message });
-    res.status(500).json({ error: error.message, requestId });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 8️⃣b  WEBHOOK: MONDAY TO INSTABASE (PRODUCTION ENDPOINT)
-// ----------------------------------------------------------------------------
-app.post('/webhook/monday-to-instabase', async (req, res) => {
-  const requestId = `webhook_${Date.now()}`;
-  try {
-    log('info', 'WEBHOOK_PROCESSING_START', { requestId, body: req.body, query: req.query });
-    // Accept itemId from body, query, or fallback
-    const itemId = req.body?.itemId || req.query?.itemId || req.body?.id;
-    if (!itemId) {
-      log('error', 'NO_ITEM_ID_PROVIDED', { requestId, body: req.body, query: req.query });
-      return res.status(400).json({ success: false, error: 'Missing itemId in request', requestId });
-    }
-    // Download files from Monday.com
-    const files = await getMondayItemFilesWithPublicUrl(itemId, MONDAY_CONFIG.fileUploadsBoardId, requestId);
-    if (!files || files.length === 0) {
-      log('warn', 'NO_FILES_FOUND_FOR_ITEM', { requestId, itemId });
-      return res.status(404).json({ success: false, error: 'No PDF files found for item', itemId, requestId });
-    }
-    // Process with Instabase
-    const { files: extracted, originalFiles, runId } = await processFilesWithInstabase(files, requestId);
-    // Group by invoice number
-    const groups = groupPagesByInvoiceNumber(extracted, requestId);
-    // Create Monday.com extracted items
-    await createMondayExtractedItems(groups, itemId, originalFiles, requestId, runId);
-    res.json({
-      success: true,
-      message: 'Webhook processing completed',
-      requestId,
-      instabaseRunId: runId,
-      filesProcessed: files.length,
-      groupsCreated: groups.length,
-      itemsWithLineItems: groups.filter(g => g.items.length > 0).length,
-      reconstructionDetails: groups.map(g => ({
-        invoiceNumber: g.invoice_number,
-        lineItemCount: g.items?.length || 0,
-        totalAmount: g.total_amount,
-        lineNumbers: g.items?.map(item => item.line_number) || []
-      }))
-    });
-  } catch (error) {
-    log('error', 'WEBHOOK_PROCESSING_ERROR', { requestId, error: error.message });
     res.status(500).json({ error: error.message, requestId });
   }
 });
