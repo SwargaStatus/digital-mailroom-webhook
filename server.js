@@ -1395,6 +1395,205 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
   }
 }
 
+async function createSubitemsForLineItems(parentItemId, items, columns, requestId) {
+  try {
+    log('info', 'SUBITEM_CREATION_START', { requestId, parentItemId, lineItemCount: items.length });
+    const subitemsColumn = columns.find(c => c.type === 'subtasks');
+    if (!subitemsColumn) {
+      log('error', 'NO_SUBTASKS_COLUMN_FOUND', { requestId });
+      return;
+    }
+    let settings = {};
+    try {
+      settings = JSON.parse(subitemsColumn.settings_str || '{}');
+    } catch (e) {
+      log('error', 'SETTINGS_PARSE_ERROR', { requestId, error: e.message });
+      return;
+    }
+    const subitemBoardId = Array.isArray(settings.boardIds)
+      ? settings.boardIds[0]
+      : settings.linked_board_id;
+    if (!subitemBoardId) {
+      log('error', 'MISSING_SUBITEM_BOARD_ID', { requestId, settings });
+      return;
+    }
+    // Fetch subitem board columns
+    const colsQuery = `
+      query {
+        boards(ids: [${subitemBoardId}]) {
+          columns { id title type }
+        }
+      }
+    `;
+    const colsResponse = await axios.post('https://api.monday.com/v2', { query: colsQuery }, {
+      headers: { Authorization: `Bearer ${MONDAY_CONFIG.apiKey}` }
+    });
+    const subitemColumns = colsResponse.data.data.boards[0].columns;
+    // Process subitems in batches
+    let successCount = 0;
+    let failureCount = 0;
+    const batchSize = 5;
+    for (let i = 0; i < items.length; i += batchSize) {
+      const batch = items.slice(i, i + batchSize);
+      log('info', 'PROCESSING_SUBITEM_BATCH', {
+        requestId,
+        batchStart: i,
+        batchSize: batch.length,
+        totalItems: items.length
+      });
+      for (const item of batch) {
+        try {
+          const { line_number, item_number, quantity, unit_cost, description, source_page, po_number } = item;
+          const columnValues = {};
+          const actualLineNumber = line_number || `${items.indexOf(item) + 1}`;
+          // Map item data to subitem columns
+          subitemColumns.forEach(col => {
+            const title = col.title.trim().toLowerCase();
+            if (title.includes('line number') || title.includes('line #') || title.includes('subitem') || title === 'index') {
+              if (col.type === 'numbers') {
+                const numericLineNumber = parseFloat(actualLineNumber);
+                columnValues[col.id] = isNaN(numericLineNumber) ? (items.indexOf(item) + 1) : numericLineNumber;
+              } else {
+                columnValues[col.id] = actualLineNumber;
+              }
+            } else if (title === 'item number' || title.includes('item num')) {
+              columnValues[col.id] = item_number || '';
+            } else if (title === 'quantity' || title === 'qty') {
+              if (col.type === 'numbers') {
+                columnValues[col.id] = quantity || 0;
+              } else {
+                columnValues[col.id] = String(quantity || 0);
+              }
+            } else if (title === 'unit cost' || title.includes('unit cost')) {
+              if (col.type === 'numbers') {
+                columnValues[col.id] = unit_cost || 0;
+              } else {
+                columnValues[col.id] = String(unit_cost || 0);
+              }
+            } else if (title === 'description' || title.includes('desc')) {
+              columnValues[col.id] = description || '';
+            } else if (title.includes('source page') || title.includes('page')) {
+              columnValues[col.id] = source_page || '';
+            } else if (title.includes('po number') || title === 'po' || title.includes('purchase order')) {
+              columnValues[col.id] = po_number || '';
+            }
+          });
+          const subitemName = `Line ${actualLineNumber}`;
+          const escapedName = subitemName.replace(/"/g, '\"');
+          const columnValuesJson = JSON.stringify(columnValues);
+          const mutation = `
+            mutation {
+              create_subitem(
+                parent_item_id: ${parentItemId}
+                item_name: "${escapedName}"
+                column_values: ${JSON.stringify(columnValuesJson)}
+              ) { 
+                id 
+                name
+              }
+            }
+          `;
+          const response = await axios.post('https://api.monday.com/v2', { query: mutation }, {
+            headers: {
+              Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
+              'Content-Type': 'application/json',
+              'API-Version': '2024-04'
+            },
+            timeout: 30000
+          });
+          if (response.data.errors) {
+            log('error', 'SUBITEM_CREATION_ERROR', { 
+              requestId, 
+              lineNumber: actualLineNumber, 
+              errors: response.data.errors 
+            });
+            // Retry with simple creation on error
+            const simpleQuery = `
+              mutation {
+                create_subitem(
+                  parent_item_id: ${parentItemId}
+                  item_name: "${escapedName}"
+                ) { 
+                  id 
+                  name
+                }
+              }
+            `;
+            try {
+              const retryResponse = await axios.post('https://api.monday.com/v2', { query: simpleQuery }, {
+                headers: {
+                  Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
+                  'Content-Type': 'application/json',
+                  'API-Version': '2024-04'
+                },
+                timeout: 30000
+              });
+              if (retryResponse.data.errors) {
+                failureCount++;
+                log('error', 'SUBITEM_RETRY_FAILED', {
+                  requestId,
+                  lineNumber: actualLineNumber,
+                  errors: retryResponse.data.errors
+                });
+              } else {
+                successCount++;
+                log('info', 'SUBITEM_RETRY_SUCCESS', {
+                  requestId,
+                  lineNumber: actualLineNumber,
+                  subitemId: retryResponse.data.data.create_subitem.id
+                });
+              }
+            } catch (retryError) {
+              failureCount++;
+              log('error', 'SUBITEM_RETRY_EXCEPTION', {
+                requestId,
+                lineNumber: actualLineNumber,
+                error: retryError.message
+              });
+            }
+          } else {
+            successCount++;
+            log('info', 'SUBITEM_CREATED_SUCCESS', { 
+              requestId, 
+              lineNumber: actualLineNumber, 
+              subitemId: response.data.data.create_subitem.id,
+              poNumber: po_number
+            });
+          }
+        } catch (itemError) {
+          failureCount++;
+          log('error', 'SUBITEM_CREATION_EXCEPTION', {
+            requestId,
+            itemIndex: items.indexOf(item),
+            error: itemError.message
+          });
+        }
+        // Delay between requests to avoid rate limits
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      // Delay between batches
+      if (i + batchSize < items.length) {
+        log('info', 'BATCH_COMPLETE_WAITING', { requestId, completedItems: i + batchSize, totalItems: items.length });
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+    }
+    log('info', 'ALL_SUBITEMS_PROCESSED', { 
+      requestId, 
+      parentItemId, 
+      totalLineItems: items.length,
+      successCount,
+      failureCount
+    });
+  } catch (error) {
+    log('error', 'SUBITEM_CREATION_FAILED', {
+      requestId,
+      parentItemId,
+      error: error.message,
+      stack: error.stack
+    });
+  }
+}
+
 // 🔧 NEW: Retry handler for failed extractions
 async function handleExtractionRetries(failedGroups, sourceItemId, originalFiles, requestId) {
   log('info', 'STARTING_EXTRACTION_RETRIES', {
