@@ -1298,10 +1298,10 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
           
           // 🔧 NEW: After subitems are created, check Monday's validation (only for non-retry items)
           if (!doc.retryAttempt) {
-            // Schedule validation check after a delay to allow formula to calculate
+            // Schedule validation check after a longer delay to allow formula to calculate
             setTimeout(async () => {
               await checkMondayValidationAndRetry(createdItemId, doc, originalFiles, requestId, instabaseRunId);
-            }, 15000); // Increased to 15 seconds
+            }, 30000); // Increased to 30 seconds
           }
           
         } catch (subitemError) {
@@ -1924,129 +1924,87 @@ app.listen(PORT, '0.0.0.0', () => {
 // 🔧 BEST APPROACH: Find item by Document Number (Invoice Number) and validate
 async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, requestId, instabaseRunId) {
   try {
-    log('info', 'CHECKING_MONDAY_VALIDATION_BY_DOCUMENT_NUMBER', {
+    log('info', 'CHECKING_MONDAY_VALIDATION_DIRECT', {
       requestId,
-      originalCreatedItemId: createdItemId,
+      createdItemId,
       invoiceNumber: doc.invoice_number,
       instabaseRunId: instabaseRunId
     });
-    // Wait for subitems and formula calculation
-    await new Promise(resolve => setTimeout(resolve, 15000));
-    // 🔧 NEW: Search for our item by Document Number (Invoice Number)
-    const searchQuery = `
+    
+    // Wait longer for subitems and formula calculation
+    await new Promise(resolve => setTimeout(resolve, 25000)); // Increased to 25 seconds
+    
+    // 🔧 FIXED: Query the specific item we just created
+    const itemQuery = `
       query {
-        boards(ids: [${MONDAY_CONFIG.extractedDocsBoardId}]) {
-          items_page(limit: 50) {
-            items {
-              id
-              name
-              column_values {
-                id
-                title
-                text
-                value
-              }
-            }
+        items(ids: [${createdItemId}]) {
+          id
+          name
+          column_values {
+            id
+            title
+            text
+            value
+          }
+          subitems {
+            id
+            name
           }
         }
       }
     `;
-    log('info', 'SEARCHING_FOR_ITEM_BY_DOCUMENT_NUMBER', {
-      requestId,
-      invoiceNumber: doc.invoice_number,
-      instabaseRunId: instabaseRunId
-    });
-    const searchResponse = await axios.post('https://api.monday.com/v2', {
-      query: searchQuery
+    
+    const itemResponse = await axios.post('https://api.monday.com/v2', {
+      query: itemQuery
     }, {
       headers: {
         'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
         'Content-Type': 'application/json'
       }
     });
-    if (searchResponse.data.errors) {
-      log('error', 'SEARCH_QUERY_ERROR', {
+    
+    if (itemResponse.data.errors) {
+      log('error', 'ITEM_QUERY_ERROR', {
         requestId,
-        errors: searchResponse.data.errors
+        errors: itemResponse.data.errors
       });
       return;
     }
-    const allItems = searchResponse.data.data?.boards?.[0]?.items_page?.items || [];
-    log('info', 'SEARCH_RESULTS', {
-      requestId,
-      totalItemsFound: allItems.length,
-      searchingForInvoiceNumber: doc.invoice_number
-    });
-    // Find our item by matching the Document Number (Invoice Number)
-    let foundItem = null;
-    for (const item of allItems) {
-      const documentNumberColumn = item.column_values.find(col => 
-        (col.title.toLowerCase().includes('document number') || 
-         col.title.toLowerCase().includes('invoice number') ||
-         col.title.toLowerCase() === 'number') && 
-        col.text === doc.invoice_number
-      );
-      if (documentNumberColumn) {
-        foundItem = item;
-        break;
-      }
-    }
-    if (!foundItem) {
-      log('warn', 'ITEM_NOT_FOUND_BY_DOCUMENT_NUMBER', {
+    
+    const item = itemResponse.data.data?.items?.[0];
+    if (!item) {
+      log('error', 'ITEM_NOT_FOUND_FOR_VALIDATION', {
         requestId,
-        invoiceNumber: doc.invoice_number,
-        searchedItems: allItems.length,
-        availableDocumentNumbers: allItems.map(item => {
-          const docNumCol = item.column_values.find(col => 
-            col.title.toLowerCase().includes('document number') || 
-            col.title.toLowerCase().includes('invoice number') ||
-            col.title.toLowerCase() === 'number'
-          );
-          return docNumCol ? { title: docNumCol.title, text: docNumCol.text } : 'no_doc_num';
-        })
+        createdItemId,
+        invoiceNumber: doc.invoice_number
       });
       return;
     }
-    log('info', 'FOUND_ITEM_FOR_VALIDATION_BY_DOCUMENT_NUMBER', {
+    
+    log('info', 'ITEM_FOUND_FOR_VALIDATION', {
       requestId,
-      foundItemId: foundItem.id,
-      foundItemName: foundItem.name,
-      originalCreatedItemId: createdItemId,
-      invoiceNumber: doc.invoice_number,
-      instabaseRunId: instabaseRunId
+      itemId: item.id,
+      itemName: item.name,
+      subitemCount: item.subitems?.length || 0,
+      columnCount: item.column_values?.length || 0
     });
-    // Now check for validation column
-    const validationColumn = foundItem.column_values.find(col => 
-      col.title.toLowerCase().includes('items match total') || 
-      col.title.toLowerCase().includes('match total') ||
-      col.title.toLowerCase().includes('validation') ||
-      col.title.toLowerCase().includes('formula') ||
-      col.title.toLowerCase().includes('match') ||
-      col.title.toLowerCase().includes('valid')
-    );
+    
+    // 🔧 FIXED: Better validation column detection
+    const validationColumn = item.column_values.find(col => {
+      const title = col.title.toLowerCase();
+      return title.includes('match') || 
+             title.includes('valid') || 
+             title.includes('formula') ||
+             title.includes('total') ||
+             title.includes('check') ||
+             title.includes('sum');
+    });
+    
     if (!validationColumn) {
-      log('warn', 'VALIDATION_COLUMN_NOT_FOUND_IN_FOUND_ITEM', {
+      log('warn', 'VALIDATION_COLUMN_NOT_FOUND', {
         requestId,
-        foundItemId: foundItem.id,
-        invoiceNumber: doc.invoice_number,
-        availableColumns: foundItem.column_values.map(col => ({
-          title: col.title,
-          hasText: !!col.text,
-          hasValue: !!col.value,
-          text: col.text
-        }))
-      });
-      // 🔧 Try to find ANY column that might be a formula
-      const possibleFormulaColumns = foundItem.column_values.filter(col => 
-        col.title.toLowerCase().includes('total') ||
-        col.title.toLowerCase().includes('sum') ||
-        col.title.toLowerCase().includes('calc') ||
-        col.title.toLowerCase().includes('formula')
-      );
-      log('info', 'POSSIBLE_FORMULA_COLUMNS', {
-        requestId,
-        foundItemId: foundItem.id,
-        possibleColumns: possibleFormulaColumns.map(col => ({
+        itemId: item.id,
+        availableColumns: item.column_values.map(col => ({
           title: col.title,
           text: col.text,
           value: col.value
@@ -2054,40 +2012,40 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
       });
       return;
     }
+    
     const validationText = validationColumn.text?.toLowerCase() || '';
     const validationValue = validationColumn.value || '';
-    log('info', 'MONDAY_VALIDATION_RESULT_FROM_DOCUMENT_SEARCH', {
+    
+    log('info', 'VALIDATION_COLUMN_FOUND', {
       requestId,
-      foundItemId: foundItem.id,
-      invoiceNumber: doc.invoice_number,
+      itemId: item.id,
       columnTitle: validationColumn.title,
       validationText: validationText,
-      validationValue: validationValue,
-      rawColumnData: {
-        text: validationColumn.text,
-        value: validationColumn.value
-      }
+      validationValue: validationValue
     });
+    
+    // 🔧 FIXED: Improved validation failure detection
     const validationFailed = validationText.includes('no') || 
                             validationText.includes('false') || 
                             validationText.includes('❌') || 
                             validationText.includes('fail') ||
+                            validationText.includes('mismatch') ||
+                            validationText.includes('error') ||
                             validationValue === 'false' ||
                             validationValue === '0' ||
-                            validationText.includes('mismatch') ||
-                            validationText.includes('error');
+                            (!validationText && !validationValue); // Handle empty/null values
+    
     if (validationFailed) {
-      log('warn', 'MONDAY_VALIDATION_FAILED_TRIGGERING_RETRY', {
+      log('warn', 'VALIDATION_FAILED_TRIGGERING_RETRY', {
         requestId,
-        foundItemId: foundItem.id,
+        itemId: item.id,
         invoiceNumber: doc.invoice_number,
         validationText: validationText,
-        validationValue: validationValue
+        validationValue: validationValue,
+        subitemCount: item.subitems?.length || 0
       });
-      const totalAmountColumn = foundItem.column_values.find(col => 
-        col.title.toLowerCase().includes('total amount')
-      );
-      const actualTotal = totalAmountColumn ? parseFloat(totalAmountColumn.text?.replace(/[^0-9.-]/g, '') || '0') : 0;
+      
+      // Create failure details
       const failureDetails = {
         timestamp: new Date().toISOString(),
         requestId: requestId,
@@ -2095,35 +2053,40 @@ async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, 
         invoiceNumber: doc.invoice_number,
         documentType: doc.document_type,
         supplier: doc.supplier_name,
-        actualTotal: actualTotal,
         mondayValidationResult: validationText,
         pageCount: doc.originalPageCount || 1,
         lineItemsExtracted: doc.items?.length || 0,
+        subitemsCreated: item.subitems?.length || 0,
         fileName: doc.fileName,
         pageIndices: doc.pageIndices,
         failureReason: 'MONDAY_FORMULA_VALIDATION_FAILED',
         retryEligible: true,
-        mondayItemId: foundItem.id // Use the found item ID
+        mondayItemId: item.id
       };
-      log('error', 'MONDAY_VALIDATION_FAILURE_LOGGED', failureDetails);
-      await updateMondayItemForRetry(foundItem.id, 'Retrying - Validation Failed', requestId);
-      await handleSingleDocumentRetry(doc, failureDetails, originalFiles, requestId, foundItem.id);
+      
+      // Update status to retrying
+      await updateMondayItemForRetry(item.id, 'Retrying - Validation Failed', requestId);
+      
+      // Start retry process
+      await handleSingleDocumentRetry(doc, failureDetails, originalFiles, requestId, item.id);
+      
     } else {
-      log('info', 'MONDAY_VALIDATION_PASSED_FROM_DOCUMENT_SEARCH', {
+      log('info', 'VALIDATION_PASSED', {
         requestId,
-        foundItemId: foundItem.id,
+        itemId: item.id,
         invoiceNumber: doc.invoice_number,
         validationText: validationText,
-        validationValue: validationValue
+        validationValue: validationValue,
+        subitemCount: item.subitems?.length || 0
       });
     }
+    
   } catch (error) {
-    log('error', 'MONDAY_VALIDATION_CHECK_FAILED_DOCUMENT_SEARCH', {
+    log('error', 'VALIDATION_CHECK_FAILED', {
       requestId,
-      originalCreatedItemId: createdItemId,
+      createdItemId,
       invoiceNumber: doc.invoice_number,
-      error: error.message,
-      stack: error.stack
+      error: error.message
     });
   }
 }
