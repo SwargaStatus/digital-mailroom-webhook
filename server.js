@@ -1,3 +1,4 @@
+
 // Digital Mailroom Webhook — FINAL VERSION with Updated Field Mapping + Line Number Support
 // -----------------------------------------------------------------------------
 // This version works with the updated Instabase field mapping (page type field removed)
@@ -188,6 +189,7 @@ async function processWebhookData(body, requestId) {
     const { files: extracted, originalFiles, runId } = await processFilesWithInstabase(pdfFiles, requestId);
     const groups = groupPagesByInvoiceNumber(extracted, requestId);
     
+    // 🔧 DEBUG: Log the groups after processing to verify items are found
     log('info', 'GROUPS_AFTER_PROCESSING', {
       requestId,
       groupCount: groups.length,
@@ -199,18 +201,9 @@ async function processWebhookData(body, requestId) {
       }))
     });
     
-    // 🔧 SIMPLIFIED: No more validation here - just create all items
-    // Monday's formula validation will handle retry logic after subitems are created
-    if (groups.length > 0) {
-      await createMondayExtractedItems(groups, itemId, originalFiles, requestId, runId);
-    }
-
-    log('info', 'PROCESSING_COMPLETE', { 
-      requestId, 
-      itemId, 
-      extractedDocuments: groups.length
-    });
+    await createMondayExtractedItems(groups, itemId, originalFiles, requestId, runId);
     
+    log('info', 'PROCESSING_COMPLETE', { requestId, itemId });
     await updateMondayItemStatusToDone(ev.pulseId, ev.boardId, requestId, runId);
   } catch (err) {
     log('error', 'BACKGROUND_PROCESSING_FAILED', { 
@@ -479,22 +472,9 @@ async function processFilesWithInstabase(files, requestId) {
     // Upload files to batch
     for (const f of files) {
       log('info', 'UPLOADING_FILE', { requestId, fileName: f.name });
-      let buffer;
-      let data;
-      // 🔧 FIXED: Handle both URL files and direct buffer files
-      if (f.public_url) {
-        // Regular file from Monday.com
-        const response = await axios.get(f.public_url, { responseType:'arraybuffer' });
-        data = response.data;
-        buffer = Buffer.from(data);
-      } else if (f.buffer) {
-        // Split file with direct buffer
-        buffer = f.buffer;
-        data = f.buffer;
-      } else {
-        log('error', 'NO_FILE_DATA_FOUND', { requestId, fileName: f.name });
-        continue;
-      }
+      const { data } = await axios.get(f.public_url, { responseType:'arraybuffer' });
+      const buffer = Buffer.from(data);
+      
       originalFiles.push({ name: f.name, buffer: buffer });
       
       await axios.put(`${INSTABASE_CONFIG.baseUrl}/api/v2/batches/${batchId}/files/${f.name}`,
@@ -1069,64 +1049,6 @@ function extractLineItemsFromPage(page, requestId, pageIndex) {
   return processedItems;
 }
 
-// 🔧 NEW: Extraction mathematical validation
-function validateExtractionAccuracy(doc, requestId) {
-  const tolerance = 0.05; // 5% tolerance for rounding differences
-  let calculatedLineTotal = 0;
-  if (doc.items && doc.items.length > 0) {
-    calculatedLineTotal = doc.items.reduce((sum, item) => {
-      return sum + (item.quantity * item.unit_cost);
-    }, 0);
-  }
-  const expectedTotal = calculatedLineTotal + (doc.tax_amount || 0);
-  const actualTotal = doc.total_amount || 0;
-  const difference = Math.abs(expectedTotal - actualTotal);
-  const percentageDiff = actualTotal > 0 ? (difference / actualTotal) : 1;
-  const validationResult = {
-    isValid: percentageDiff <= tolerance || actualTotal === 0, // 🔧 FIXED: Allow zero totals
-    calculatedLineTotal: calculatedLineTotal,
-    expectedTotal: expectedTotal,
-    actualTotal: actualTotal,
-    difference: difference,
-    percentageDiff: percentageDiff,
-    toleranceThreshold: tolerance,
-    lineItemCount: doc.items?.length || 0,
-    pageCount: doc.originalPageCount || 1,
-    requiresRetry: percentageDiff > tolerance && doc.originalPageCount > 3 && actualTotal > 100 // 🔧 FIXED: Only retry if >3 pages AND significant total
-  };
-  log(validationResult.isValid ? 'info' : 'warn', 'EXTRACTION_VALIDATION', {
-    requestId,
-    invoiceNumber: doc.invoice_number,
-    ...validationResult
-  });
-  return validationResult;
-}
-
-// 🔧 NEW: Extraction failure logging
-async function logExtractionFailure(doc, validationResult, originalFiles, requestId, instabaseRunId) {
-  const failureDetails = {
-    timestamp: new Date().toISOString(),
-    requestId: requestId,
-    instabaseRunId: instabaseRunId,
-    invoiceNumber: doc.invoice_number,
-    documentType: doc.document_type,
-    supplier: doc.supplier_name,
-    actualTotal: doc.total_amount,
-    calculatedTotal: validationResult.expectedTotal,
-    taxAmount: doc.tax_amount,
-    difference: validationResult.difference,
-    percentageError: (validationResult.percentageDiff * 100).toFixed(2),
-    pageCount: doc.originalPageCount,
-    lineItemsExtracted: doc.items?.length || 0,
-    fileName: doc.fileName,
-    pageIndices: doc.pageIndices,
-    failureReason: 'MATHEMATICAL_VALIDATION_FAILED',
-    retryEligible: validationResult.requiresRetry
-  };
-  log('error', 'EXTRACTION_FAILURE_LOGGED', failureDetails);
-  return failureDetails;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // 7️⃣  ENHANCED MONDAY ITEMS CREATION WITH FIXED SOURCE ID & SUBITEM INDEXING
 // ----------------------------------------------------------------------------
@@ -1168,8 +1090,7 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         invoiceNumber: doc.invoice_number,
         itemCount: doc.items?.length || 0,
         pageIndices: doc.pageIndices,
-        fileName: doc.fileName,
-        isRetryAttempt: doc.retryAttempt || false  // 🔧 NEW: Track retry attempts
+        fileName: doc.fileName
       });
       
       const formatDate = (dateStr) => {
@@ -1200,18 +1121,12 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
       
       const columnValues = buildColumnValues(columns, doc, formatDate, instabaseRunId);
       
-      // 🔧 NEW: Add retry indicator to item name if this is a retry
-      let itemName = instabaseRunId || 'RUN_PENDING';
-      if (doc.retryAttempt) {
-        itemName = `RETRY: ${doc.invoice_number} - ${instabaseRunId}`;
-      }
-      
       // Create the item
       const mutation = `
         mutation {
           create_item(
             board_id: ${MONDAY_CONFIG.extractedDocsBoardId}
-            item_name: "${itemName}"
+            item_name: "${instabaseRunId || 'RUN_PENDING'}"
             column_values: ${JSON.stringify(JSON.stringify(columnValues))}
           ) {
             id
@@ -1242,11 +1157,10 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
         requestId,
         itemId: createdItemId,
         documentType: doc.document_type,
-        invoiceNumber: doc.invoice_number,
-        isRetryAttempt: doc.retryAttempt || false
+        invoiceNumber: doc.invoice_number
       });
       
-      // Upload PDF (existing code - unchanged)
+      // Use the correct buffer for this invoice's file
       if (originalFiles && originalFiles.length > 0 && doc.pageIndices && doc.pageIndices.length > 0) {
         const fileColumn = columns.find(col => col.type === 'file');
         if (fileColumn) {
@@ -1260,27 +1174,60 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
               });
               continue;
             }
-            
+            // 🔧 ENHANCED: Better page index handling with validation
+            log('info', 'PREPARING_PDF_EXTRACTION', {
+              requestId,
+              invoiceNumber: doc.invoice_number,
+              rawPageIndices: doc.pageIndices,
+              fileName: doc.fileName,
+              debugInfo: doc.debugInfo
+            });
+            // Clean and validate page indices (convert from 1-based to 0-based if needed)
             let cleanPageIndices = Array.from(new Set(doc.pageIndices))
               .filter(i => typeof i === 'number' && i >= 0)
+              .map(i => {
+                // If Instabase returns 1-based indices, convert to 0-based
+                // You might need to adjust this based on your Instabase setup
+                return i; // Keep as-is for now, but add logging to debug
+              })
               .sort((a, b) => a - b);
-
-            if (cleanPageIndices.length > 0) {
-              const invoiceSpecificPdf = await createInvoiceSpecificPDF(
-                bufferForThisDoc, 
-                doc.invoice_number, 
-                cleanPageIndices, 
-                requestId
-              );
-              const invoiceFileName = `Invoice_${doc.invoice_number}${doc.retryAttempt ? '_RETRY' : ''}.pdf`;
-              await uploadPdfToMondayItem(
-                createdItemId, 
-                invoiceSpecificPdf, 
-                invoiceFileName, 
-                fileColumn.id, 
-                requestId
-              );
+            log('info', 'CLEANED_PAGE_INDICES', {
+              requestId,
+              invoiceNumber: doc.invoice_number,
+              cleanPageIndices,
+              originalCount: doc.pageIndices.length,
+              cleanedCount: cleanPageIndices.length
+            });
+            // Validate we have valid page indices
+            if (cleanPageIndices.length === 0) {
+              log('error', 'NO_VALID_PAGE_INDICES', {
+                requestId,
+                invoiceNumber: doc.invoice_number,
+                originalPageIndices: doc.pageIndices
+              });
+              continue; // Skip this document
             }
+            const invoiceSpecificPdf = await createInvoiceSpecificPDF(
+              bufferForThisDoc, 
+              doc.invoice_number, 
+              cleanPageIndices, 
+              requestId
+            );
+            const invoiceFileName = `Invoice_${doc.invoice_number}.pdf`;
+            await uploadPdfToMondayItem(
+              createdItemId, 
+              invoiceSpecificPdf, 
+              invoiceFileName, 
+              fileColumn.id, 
+              requestId
+            );
+            log('info', 'INVOICE_SPECIFIC_PDF_UPLOADED', {
+              requestId,
+              itemId: createdItemId,
+              invoiceNumber: doc.invoice_number,
+              fileName: invoiceFileName,
+              pageIndices: cleanPageIndices
+            });
           } catch (uploadError) {
             log('error', 'PDF_UPLOAD_FAILED', {
               requestId,
@@ -1295,15 +1242,6 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
       if (subitemsColumn && doc.items && doc.items.length > 0) {
         try {
           await createSubitemsForLineItems(createdItemId, doc.items, columns, requestId);
-          
-          // 🔧 NEW: After subitems are created, check Monday's validation (only for non-retry items)
-          if (!doc.retryAttempt) {
-            // Schedule validation check after a longer delay to allow formula to calculate
-            setTimeout(async () => {
-              await checkMondayValidationAndRetry(createdItemId, doc, originalFiles, requestId, instabaseRunId);
-            }, 30000); // Increased to 30 seconds
-          }
-          
         } catch (subitemError) {
           log('error', 'SUBITEM_CREATION_FAILED', {
             requestId,
@@ -1326,6 +1264,7 @@ async function createMondayExtractedItems(documents, sourceItemId, originalFiles
   }
 }
 
+// 🔧 ENHANCED: Subitem creation with better error handling and timeouts
 async function createSubitemsForLineItems(parentItemId, items, columns, requestId) {
   try {
     log('info', 'SUBITEM_CREATION_START', { requestId, parentItemId, lineItemCount: items.length });
@@ -1360,10 +1299,10 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
       headers: { Authorization: `Bearer ${MONDAY_CONFIG.apiKey}` }
     });
     const subitemColumns = colsResponse.data.data.boards[0].columns;
-    // Process subitems in batches
+    // 🔧 ENHANCED: Batch creation with error recovery
     let successCount = 0;
     let failureCount = 0;
-    const batchSize = 5;
+    const batchSize = 5; // Process in smaller batches
     for (let i = 0; i < items.length; i += batchSize) {
       const batch = items.slice(i, i + batchSize);
       log('info', 'PROCESSING_SUBITEM_BATCH', {
@@ -1377,7 +1316,6 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
           const { line_number, item_number, quantity, unit_cost, description, source_page, po_number } = item;
           const columnValues = {};
           const actualLineNumber = line_number || `${items.indexOf(item) + 1}`;
-          // Map item data to subitem columns
           subitemColumns.forEach(col => {
             const title = col.title.trim().toLowerCase();
             if (title.includes('line number') || title.includes('line #') || title.includes('subitem') || title === 'index') {
@@ -1424,13 +1362,14 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
               }
             }
           `;
+          // 🔧 ENHANCED: Extended timeout for subitem creation
           const response = await axios.post('https://api.monday.com/v2', { query: mutation }, {
             headers: {
               Authorization: `Bearer ${MONDAY_CONFIG.apiKey}`,
               'Content-Type': 'application/json',
               'API-Version': '2024-04'
             },
-            timeout: 30000
+            timeout: 30000 // 🔧 INCREASED: 30 second timeout
           });
           if (response.data.errors) {
             log('error', 'SUBITEM_CREATION_ERROR', { 
@@ -1438,7 +1377,7 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
               lineNumber: actualLineNumber, 
               errors: response.data.errors 
             });
-            // Retry with simple creation on error
+            // 🔧 ENHANCED: Retry with simple creation on error
             const simpleQuery = `
               mutation {
                 create_subitem(
@@ -1499,10 +1438,10 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
             error: itemError.message
           });
         }
-        // Delay between requests to avoid rate limits
+        // 🔧 ENHANCED: Longer delay between requests to avoid rate limits
         await new Promise(resolve => setTimeout(resolve, 500));
       }
-      // Delay between batches
+      // 🔧 ENHANCED: Longer delay between batches
       if (i + batchSize < items.length) {
         log('info', 'BATCH_COMPLETE_WAITING', { requestId, completedItems: i + batchSize, totalItems: items.length });
         await new Promise(resolve => setTimeout(resolve, 2000));
@@ -1521,268 +1460,6 @@ async function createSubitemsForLineItems(parentItemId, items, columns, requestI
       parentItemId,
       error: error.message,
       stack: error.stack
-    });
-  }
-}
-
-// 🔧 NEW: Retry handler for failed extractions
-async function handleExtractionRetries(failedGroups, sourceItemId, originalFiles, requestId) {
-  log('info', 'STARTING_EXTRACTION_RETRIES', {
-    requestId,
-    failedGroupCount: failedGroups.length
-  });
-  for (const { doc, failureDetails, validation } of failedGroups) {
-    try {
-      log('info', 'PROCESSING_RETRY_FOR_INVOICE', {
-        requestId,
-        invoiceNumber: doc.invoice_number,
-        originalPageCount: doc.originalPageCount,
-        failureReason: failureDetails.failureReason
-      });
-      // STEP 1: Create individual page PDFs for retry
-      const retryFiles = await createSplitPagePDFs(doc, originalFiles, requestId);
-      if (retryFiles.length === 0) {
-        log('error', 'NO_RETRY_FILES_CREATED', {
-          requestId,
-          invoiceNumber: doc.invoice_number
-        });
-        continue;
-      }
-      // STEP 2: Process split pages with Instabase
-      const { files: retryExtracted, runId: retryRunId } = await processFilesWithInstabase(retryFiles, requestId);
-      // STEP 3: Extract line items from retry results
-      const retryLineItems = await extractLineItemsFromRetryResults(retryExtracted, requestId);
-      // STEP 4: Validate retry results
-      const retryDoc = {
-        ...doc,
-        items: retryLineItems,
-        retryAttempt: true,
-        originalRunId: failureDetails.instabaseRunId,
-        retryRunId: retryRunId
-      };
-      const retryValidation = validateExtractionAccuracy(retryDoc, requestId);
-      if (retryValidation.isValid) {
-        log('info', 'RETRY_SUCCESSFUL', {
-          requestId,
-          invoiceNumber: doc.invoice_number,
-          originalLineItems: doc.items?.length || 0,
-          retryLineItems: retryLineItems.length,
-          originalTotal: validation.calculatedLineTotal,
-          retryTotal: retryValidation.calculatedLineTotal
-        });
-        // STEP 5: Create/Update Monday item with correct data
-        await createMondayExtractedItems([retryDoc], sourceItemId, originalFiles, requestId, retryRunId);
-      } else {
-        log('error', 'RETRY_ALSO_FAILED', {
-          requestId,
-          invoiceNumber: doc.invoice_number,
-          retryValidation
-        });
-        // Create item with error status for manual review
-        await createFailedExtractionItem(doc, failureDetails, retryValidation, sourceItemId, originalFiles, requestId);
-      }
-    } catch (retryError) {
-      log('error', 'RETRY_PROCESSING_ERROR', {
-        requestId,
-        invoiceNumber: doc.invoice_number,
-        error: retryError.message
-      });
-      // Create item with error status
-      await createFailedExtractionItem(doc, failureDetails, validation, sourceItemId, originalFiles, requestId);
-    }
-  }
-}
-
-// 🔧 NEW: Create individual page PDFs for retry
-async function createSplitPagePDFs(doc, originalFiles, requestId) {
-  try {
-    log('info', 'CREATING_SPLIT_PAGE_PDFS', {
-      requestId,
-      invoiceNumber: doc.invoice_number,
-      pageIndices: doc.pageIndices,
-      fileName: doc.fileName
-    });
-    const sourceFile = originalFiles.find(f => f.name === doc.fileName);
-    if (!sourceFile) {
-      throw new Error(`Source file not found: ${doc.fileName}`);
-    }
-    const originalPdf = await PDFDocument.load(sourceFile.buffer);
-    const splitFiles = [];
-    for (let i = 0; i < doc.pageIndices.length; i++) {
-      const pageIndex = doc.pageIndices[i];
-      const newPdf = await PDFDocument.create();
-      const [copiedPage] = await newPdf.copyPages(originalPdf, [pageIndex]);
-      newPdf.addPage(copiedPage);
-      const pdfBytes = await newPdf.save();
-      const fileName = `${doc.invoice_number}_page_${pageIndex + 1}_retry.pdf`;
-      splitFiles.push({
-        name: fileName,
-        buffer: Buffer.from(pdfBytes),
-        public_url: null,
-        pageIndex: pageIndex,
-        invoiceNumber: doc.invoice_number
-      });
-      log('info', 'SPLIT_PAGE_CREATED', {
-        requestId,
-        invoiceNumber: doc.invoice_number,
-        pageIndex: pageIndex,
-        fileName: fileName,
-        size: pdfBytes.length
-      });
-    }
-    return splitFiles;
-  } catch (error) {
-    log('error', 'SPLIT_PDF_CREATION_FAILED', {
-      requestId,
-      invoiceNumber: doc.invoice_number,
-      error: error.message
-    });
-    return [];
-  }
-}
-
-// 🔧 NEW: Extract line items from retry processing results
-async function extractLineItemsFromRetryResults(retryExtracted, requestId) {
-  const allRetryLineItems = [];
-  if (!retryExtracted || retryExtracted.length === 0) {
-    log('warn', 'NO_RETRY_RESULTS_TO_PROCESS', { requestId });
-    return allRetryLineItems;
-  }
-  retryExtracted.forEach((file, fileIndex) => {
-    log('info', 'PROCESSING_RETRY_FILE', {
-      requestId,
-      fileIndex,
-      fileName: file.original_file_name,
-      documentCount: file.documents?.length || 0
-    });
-    if (!file.documents || file.documents.length === 0) {
-      return;
-    }
-    file.documents.forEach((doc, docIndex) => {
-      const pageItems = extractLineItemsFromPage({
-        fields: doc.fields || {},
-        fileName: file.original_file_name,
-        invoiceNumber: file.original_file_name.split('_')[0]
-      }, requestId, docIndex);
-      if (pageItems.length > 0) {
-        allRetryLineItems.push(...pageItems);
-        log('info', 'RETRY_LINE_ITEMS_FOUND', {
-          requestId,
-          fileName: file.original_file_name,
-          itemCount: pageItems.length
-        });
-      }
-    });
-  });
-  allRetryLineItems.sort((a, b) => {
-    const aNum = parseFloat(a.line_number) || 0;
-    const bNum = parseFloat(b.line_number) || 0;
-    return aNum - bNum;
-  });
-  log('info', 'RETRY_LINE_ITEMS_EXTRACTED', {
-    requestId,
-    totalItems: allRetryLineItems.length
-  });
-  return allRetryLineItems;
-}
-
-// 🔧 NEW: Create Monday item for failed extractions requiring manual review
-async function createFailedExtractionItem(doc, failureDetails, validation, sourceItemId, originalFiles, requestId) {
-  try {
-    log('info', 'CREATING_FAILED_EXTRACTION_ITEM', {
-      requestId,
-      invoiceNumber: doc.invoice_number
-    });
-    const boardQuery = `
-      query {
-        boards(ids: [${MONDAY_CONFIG.extractedDocsBoardId}]) {
-          columns { id title type settings_str }
-        }
-      }
-    `;
-    const boardResponse = await axios.post('https://api.monday.com/v2', { query: boardQuery }, {
-      headers: { 'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}` }
-    });
-    const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
-    const columnValues = buildColumnValues(columns, doc, (dateStr) => {
-      if (!dateStr) return '';
-      try {
-        return new Date(dateStr).toISOString().split('T')[0];
-      } catch (e) {
-        return '';
-      }
-    }, failureDetails.instabaseRunId);
-    const statusColumn = columns.find(col => col.title.toLowerCase().includes('status'));
-    if (statusColumn && statusColumn.type === 'status') {
-      try {
-        const settings = JSON.parse(statusColumn.settings_str);
-        const errorLabel = Object.entries(settings.labels || {}).find(([_, label]) => 
-          label && (label.toLowerCase().includes('error') || label.toLowerCase().includes('review'))
-        );
-        if (errorLabel) {
-          columnValues[statusColumn.id] = { "index": parseInt(errorLabel[0]) };
-        }
-      } catch (e) {}
-    }
-    const notesColumn = columns.find(col => 
-      col.title.toLowerCase().includes('notes') && 
-      (col.type === 'text' || col.type === 'long_text')
-    );
-    if (notesColumn) {
-      columnValues[notesColumn.id] = `EXTRACTION FAILED - Requires Manual Review\n` +
-        `Original Run ID: ${failureDetails.instabaseRunId}\n` +
-        `Error: ${failureDetails.percentageError}% difference between calculated and actual totals\n` +
-        `Calculated: $${failureDetails.calculatedTotal.toFixed(2)}\n` +
-        `Actual: $${failureDetails.actualTotal.toFixed(2)}\n` +
-        `Pages: ${failureDetails.pageCount}\n` +
-        `Line Items Found: ${failureDetails.lineItemsExtracted}`;
-    }
-    const mutation = `
-      mutation {
-        create_item(
-          board_id: ${MONDAY_CONFIG.extractedDocsBoardId}
-          item_name: "FAILED: ${doc.invoice_number || 'Unknown'}"
-          column_values: ${JSON.stringify(JSON.stringify(columnValues))}
-        ) {
-          id
-          name
-        }
-      }
-    `;
-    const response = await axios.post('https://api.monday.com/v2', { query: mutation }, {
-      headers: { 'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}` }
-    });
-    if (response.data.errors) {
-      log('error', 'FAILED_ITEM_CREATION_ERROR', {
-        requestId,
-        errors: response.data.errors
-      });
-    } else {
-      const createdItemId = response.data.data.create_item.id;
-      log('info', 'FAILED_EXTRACTION_ITEM_CREATED', {
-        requestId,
-        itemId: createdItemId,
-        invoiceNumber: doc.invoice_number
-      });
-      const fileColumn = columns.find(col => col.type === 'file');
-      if (fileColumn && originalFiles && originalFiles.length > 0) {
-        const sourceFile = originalFiles.find(f => f.name === doc.fileName);
-        if (sourceFile) {
-          await uploadPdfToMondayItem(
-            createdItemId,
-            sourceFile.buffer,
-            `FAILED_${doc.fileName}`,
-            fileColumn.id,
-            requestId
-          );
-        }
-      }
-    }
-  } catch (error) {
-    log('error', 'FAILED_EXTRACTION_ITEM_CREATION_ERROR', {
-      requestId,
-      invoiceNumber: doc.invoice_number,
-      error: error.message
     });
   }
 }
@@ -1920,310 +1597,3 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`📅 Started at: ${new Date().toISOString()}`);
   console.log(`🔧 Features: Updated field mapping, line number indexing, PO number tracking`);
 });
-
-// 🔧 BEST APPROACH: Find item by Document Number (Invoice Number) and validate
-async function checkMondayValidationAndRetry(createdItemId, doc, originalFiles, requestId, instabaseRunId) {
-  try {
-    log('info', 'CHECKING_MONDAY_VALIDATION_DIRECT', {
-      requestId,
-      createdItemId,
-      invoiceNumber: doc.invoice_number,
-      instabaseRunId: instabaseRunId
-    });
-    
-    // Wait longer for subitems and formula calculation
-    await new Promise(resolve => setTimeout(resolve, 25000)); // Increased to 25 seconds
-    
-    // 🔧 FIXED: Query the specific item we just created
-    const itemQuery = `
-      query {
-        items(ids: [${createdItemId}]) {
-          id
-          name
-          column_values {
-            id
-            title
-            text
-            value
-          }
-          subitems {
-            id
-            name
-          }
-        }
-      }
-    `;
-    
-    const itemResponse = await axios.post('https://api.monday.com/v2', {
-      query: itemQuery
-    }, {
-      headers: {
-        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
-        'Content-Type': 'application/json'
-      }
-    });
-    
-    if (itemResponse.data.errors) {
-      log('error', 'ITEM_QUERY_ERROR', {
-        requestId,
-        errors: itemResponse.data.errors
-      });
-      return;
-    }
-    
-    const item = itemResponse.data.data?.items?.[0];
-    if (!item) {
-      log('error', 'ITEM_NOT_FOUND_FOR_VALIDATION', {
-        requestId,
-        createdItemId,
-        invoiceNumber: doc.invoice_number
-      });
-      return;
-    }
-    
-    log('info', 'ITEM_FOUND_FOR_VALIDATION', {
-      requestId,
-      itemId: item.id,
-      itemName: item.name,
-      subitemCount: item.subitems?.length || 0,
-      columnCount: item.column_values?.length || 0
-    });
-    
-    // 🔧 FIXED: Better validation column detection
-    const validationColumn = item.column_values.find(col => {
-      const title = col.title.toLowerCase();
-      return title.includes('match') || 
-             title.includes('valid') || 
-             title.includes('formula') ||
-             title.includes('total') ||
-             title.includes('check') ||
-             title.includes('sum');
-    });
-    
-    if (!validationColumn) {
-      log('warn', 'VALIDATION_COLUMN_NOT_FOUND', {
-        requestId,
-        itemId: item.id,
-        availableColumns: item.column_values.map(col => ({
-          title: col.title,
-          text: col.text,
-          value: col.value
-        }))
-      });
-      return;
-    }
-    
-    const validationText = validationColumn.text?.toLowerCase() || '';
-    const validationValue = validationColumn.value || '';
-    
-    log('info', 'VALIDATION_COLUMN_FOUND', {
-      requestId,
-      itemId: item.id,
-      columnTitle: validationColumn.title,
-      validationText: validationText,
-      validationValue: validationValue
-    });
-    
-    // 🔧 FIXED: Improved validation failure detection
-    const validationFailed = validationText.includes('no') || 
-                            validationText.includes('false') || 
-                            validationText.includes('❌') || 
-                            validationText.includes('fail') ||
-                            validationText.includes('mismatch') ||
-                            validationText.includes('error') ||
-                            validationValue === 'false' ||
-                            validationValue === '0' ||
-                            (!validationText && !validationValue); // Handle empty/null values
-    
-    if (validationFailed) {
-      log('warn', 'VALIDATION_FAILED_TRIGGERING_RETRY', {
-        requestId,
-        itemId: item.id,
-        invoiceNumber: doc.invoice_number,
-        validationText: validationText,
-        validationValue: validationValue,
-        subitemCount: item.subitems?.length || 0
-      });
-      
-      // Create failure details
-      const failureDetails = {
-        timestamp: new Date().toISOString(),
-        requestId: requestId,
-        instabaseRunId: instabaseRunId,
-        invoiceNumber: doc.invoice_number,
-        documentType: doc.document_type,
-        supplier: doc.supplier_name,
-        mondayValidationResult: validationText,
-        pageCount: doc.originalPageCount || 1,
-        lineItemsExtracted: doc.items?.length || 0,
-        subitemsCreated: item.subitems?.length || 0,
-        fileName: doc.fileName,
-        pageIndices: doc.pageIndices,
-        failureReason: 'MONDAY_FORMULA_VALIDATION_FAILED',
-        retryEligible: true,
-        mondayItemId: item.id
-      };
-      
-      // Update status to retrying
-      await updateMondayItemForRetry(item.id, 'Retrying - Validation Failed', requestId);
-      
-      // Start retry process
-      await handleSingleDocumentRetry(doc, failureDetails, originalFiles, requestId, item.id);
-      
-    } else {
-      log('info', 'VALIDATION_PASSED', {
-        requestId,
-        itemId: item.id,
-        invoiceNumber: doc.invoice_number,
-        validationText: validationText,
-        validationValue: validationValue,
-        subitemCount: item.subitems?.length || 0
-      });
-    }
-    
-  } catch (error) {
-    log('error', 'VALIDATION_CHECK_FAILED', {
-      requestId,
-      createdItemId,
-      invoiceNumber: doc.invoice_number,
-      error: error.message
-    });
-  }
-}
-
-// 🔧 NEW: Update Monday item status for retry
-async function updateMondayItemForRetry(itemId, statusText, requestId) {
-  try {
-    const boardQuery = `
-      query {
-        boards(ids: [${MONDAY_CONFIG.extractedDocsBoardId}]) {
-          columns {
-            id
-            title
-            type
-            settings_str
-          }
-        }
-      }
-    `;
-    const boardResponse = await axios.post('https://api.monday.com/v2', {
-      query: boardQuery
-    }, {
-      headers: {
-        'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
-        'Content-Type': 'application/json'
-      }
-    });
-    const columns = boardResponse.data.data?.boards?.[0]?.columns || [];
-    const statusColumn = columns.find(col => col.type === 'status');
-    const notesColumn = columns.find(col => 
-      col.title.toLowerCase().includes('notes') && 
-      (col.type === 'text' || col.type === 'long_text')
-    );
-    const columnValues = {};
-    if (notesColumn) {
-      const timestamp = new Date().toISOString();
-      columnValues[notesColumn.id] = `${timestamp}: ${statusText} - Monday validation failed, initiating retry process.`;
-    }
-    if (statusColumn) {
-      try {
-        const settings = JSON.parse(statusColumn.settings_str || '{}');
-        const retryLabel = Object.entries(settings.labels || {}).find(([_, label]) => 
-          label && (
-            label.toLowerCase().includes('retry') || 
-            label.toLowerCase().includes('processing') ||
-            label.toLowerCase().includes('pending')
-          )
-        );
-        if (retryLabel) {
-          columnValues[statusColumn.id] = { "index": parseInt(retryLabel[0]) };
-        }
-      } catch (e) {
-        log('warn', 'STATUS_SETTINGS_PARSE_ERROR', { requestId, error: e.message });
-      }
-    }
-    if (Object.keys(columnValues).length > 0) {
-      const mutation = `
-        mutation {
-          change_multiple_column_values(
-            board_id: ${MONDAY_CONFIG.extractedDocsBoardId},
-            item_id: ${itemId},
-            column_values: ${JSON.stringify(JSON.stringify(columnValues))}
-          ) {
-            id
-          }
-        }
-      `;
-      await axios.post('https://api.monday.com/v2', { query: mutation }, {
-        headers: {
-          'Authorization': `Bearer ${MONDAY_CONFIG.apiKey}`,
-          'Content-Type': 'application/json'
-        }
-      });
-      log('info', 'RETRY_STATUS_UPDATED', {
-        requestId,
-        itemId,
-        updatedColumns: Object.keys(columnValues)
-      });
-    }
-  } catch (error) {
-    log('error', 'RETRY_STATUS_UPDATE_FAILED', {
-      requestId,
-      itemId,
-      error: error.message
-    });
-  }
-}
-
-// 🔧 NEW: Handle retry for a single document
-async function handleSingleDocumentRetry(doc, failureDetails, originalFiles, requestId, originalItemId) {
-  try {
-    log('info', 'STARTING_SINGLE_DOCUMENT_RETRY', {
-      requestId,
-      invoiceNumber: doc.invoice_number,
-      originalItemId: originalItemId
-    });
-    const retryFiles = await createSplitPagePDFs(doc, originalFiles, requestId);
-    if (retryFiles.length === 0) {
-      log('error', 'NO_RETRY_FILES_CREATED_FOR_SINGLE_DOC', {
-        requestId,
-        invoiceNumber: doc.invoice_number
-      });
-      await updateMondayItemForRetry(originalItemId, 'Retry Failed - Could not split PDF', requestId);
-      return;
-    }
-    const { files: retryExtracted, runId: retryRunId } = await processFilesWithInstabase(retryFiles, requestId);
-    const retryLineItems = await extractLineItemsFromRetryResults(retryExtracted, requestId);
-    const retryDoc = {
-      ...doc,
-      items: retryLineItems,
-      retryAttempt: true,
-      originalRunId: failureDetails.instabaseRunId,
-      retryRunId: retryRunId,
-      originalMondayItemId: originalItemId
-    };
-    log('info', 'RETRY_EXTRACTION_COMPLETE', {
-      requestId,
-      invoiceNumber: doc.invoice_number,
-      originalLineItems: doc.items?.length || 0,
-      retryLineItems: retryLineItems.length,
-      retryRunId: retryRunId
-    });
-    await createMondayExtractedItems([retryDoc], originalItemId, originalFiles, requestId, retryRunId);
-    await updateMondayItemForRetry(originalItemId, `Retry Completed - New extraction created with Run ID: ${retryRunId}`, requestId);
-    log('info', 'SINGLE_DOCUMENT_RETRY_COMPLETE', {
-      requestId,
-      invoiceNumber: doc.invoice_number,
-      originalItemId: originalItemId,
-      retryRunId: retryRunId
-    });
-  } catch (retryError) {
-    log('error', 'SINGLE_DOCUMENT_RETRY_FAILED', {
-      requestId,
-      invoiceNumber: doc.invoice_number,
-      originalItemId: originalItemId,
-      error: retryError.message
-    });
-    await updateMondayItemForRetry(originalItemId, `Retry Failed - ${retryError.message}`, requestId);
-  }
-}
